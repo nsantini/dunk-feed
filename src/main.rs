@@ -2,6 +2,7 @@
 //! config, and dispatches the subcommand. This is the only module that uses
 //! `anyhow`; every other module returns its own `thiserror` type.
 
+mod appview;
 mod cli;
 mod config;
 mod ingest;
