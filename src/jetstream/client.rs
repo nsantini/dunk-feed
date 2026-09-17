@@ -1,8 +1,6 @@
-//! Dictionary fetch and cache, URL build, and frame decode. Reconnect,
-//! backoff, resume and the `JetstreamClient` struct itself land over slice
-//! 3.0; this slice gives them `JetstreamError` in full and the two pure,
-//! testable pieces the reconnect loop calls: `subscribe_url` and
-//! `decode_frame`.
+//! Dictionary fetch and cache, URL build, frame decode, and the
+//! `JetstreamClient` connect/reconnect/resume loop that hands a caller
+//! typed [`Event`]s.
 //!
 //! The zstd dictionary is fetched once and cached on disk next to
 //! `cfg.db_path`, because re-preparing a 65,536-byte `DecoderDictionary`
@@ -11,14 +9,24 @@
 //! unreachable dictionary endpoint is not fatal: `Dictionary` is caught
 //! here, logged at `warn`, and the caller connects with no
 //! `zstdDictionary` parameter, so frames arrive as text (BC19).
+//!
+//! `JetstreamClient::next` hides every reconnect: on a closed socket or a
+//! transport error it backs off `1s, 2s, 4s, ... 60s` and resumes at
+//! `last_seq + 1` (TECH-DESIGN section 5.4's inclusive-resume rule), so the
+//! caller only ever sees the next `Event`, never the gap.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use futures_util::StreamExt;
 use thiserror::Error;
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use zstd::dict::DecoderDictionary;
 
 use crate::config::Config;
-use crate::jetstream::event::Frame;
+use crate::jetstream::event::{Event, Frame, Payload};
 
 /// The four collections this story cares about, TECH-DESIGN section 5.1.
 /// Held in this fixed order so `subscribe_url`'s query string is stable and
@@ -34,9 +42,9 @@ const DICT_ID_FILE: &str = "zstd-dict-id";
 const DICT_ID_HEADER: &str = "x-zstd-dictionary-id";
 
 /// Every way this module's work can fail. Every variant is caught inside
-/// `client.rs`'s own reconnect loop (slice 3.0), except a caller-fatal one;
-/// this story raises no caller-fatal variant. The caller sees one log line
-/// per skipped frame and one per reconnect (BC21), never this type itself.
+/// `JetstreamClient`'s own reconnect loop, except a caller-fatal one; this
+/// story raises no caller-fatal variant. The caller sees one log line per
+/// skipped frame and one per reconnect (BC21), never this type itself.
 #[derive(Debug, Error)]
 pub enum JetstreamError {
     /// The dictionary was neither cached nor fetchable: no cache on disk,
@@ -224,6 +232,182 @@ fn decompress(data: &[u8], dict: &DecoderDictionary<'static>) -> Result<Vec<u8>,
     Ok(out)
 }
 
+/// Turns one decoded [`Frame`] into the [`Event`] a caller of
+/// [`JetstreamClient::next`] sees, or `None` when the loop should read the
+/// next frame instead. A non-`"message"` envelope is ignored (BC1's loop
+/// half); a `#commit` advances `last_seq` and returns (BC2); a `#info`
+/// returns as-is, `last_seq` untouched, since an info frame carries no `seq`
+/// (BC3); `#identity`, `#account`, `#sync` and `Other` are consumed
+/// internally (BC4). Pure and free of I/O, so the loop it drives is
+/// testable with no socket in play.
+fn dispatch(frame: Frame, last_seq: &mut Option<u64>) -> Option<Event> {
+    if frame.kind != "message" {
+        return None;
+    }
+    match frame.payload {
+        Payload::Commit(commit) => {
+            *last_seq = Some(commit.seq);
+            Some(Event::Commit(commit))
+        }
+        Payload::Info { name, message } => Some(Event::Info { name, message }),
+        Payload::Identity {} | Payload::Account {} | Payload::Sync {} | Payload::Other => None,
+    }
+}
+
+/// The reconnect backoff for a given attempt, TECH-DESIGN section 5.1's
+/// "Approach": `1, 2, 4, 8, 16, 32` seconds, capped at `60` from attempt 6
+/// onward (BC13). `checked_shl` rather than a plain `<<` so an attempt count
+/// far past the cap saturates instead of overflowing or panicking.
+pub fn backoff_delay(attempt: u32) -> Duration {
+    let secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+    Duration::from_secs(secs.min(60))
+}
+
+/// The cursor a reconnect (or the first connect) should resume at,
+/// TECH-DESIGN section 5.4's inclusive-resume rule. `last_seq + 1` once an
+/// event has been seen, never `last_seq` itself (BC14); before that, the
+/// cursor `connect` was originally given, unchanged: `None` starts at the
+/// head (BC15), `Some(n)` resumes at the caller's own checkpoint (BC16).
+pub fn resume_cursor(last_seq: Option<u64>, initial: Option<u64>) -> Option<u64> {
+    match last_seq {
+        Some(seq) => Some(seq + 1),
+        None => initial,
+    }
+}
+
+/// A live Jetstream v2 connection. Owns the socket, the prepared
+/// dictionary (if one was in hand at connect), the last `seq` seen, and the
+/// reconnect attempt counter. `next()` is the only way a caller drives it:
+/// every reconnect, backoff and resume happens inside that call, so the
+/// caller only ever sees the next [`Event`].
+pub struct JetstreamClient {
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    jetstream_url: String,
+    dict: Option<Dictionary>,
+    initial_cursor: Option<u64>,
+    last_seq: Option<u64>,
+    attempt: u32,
+}
+
+impl JetstreamClient {
+    /// Connects to `cfg.jetstream_url`. Loads or fetches the zstd
+    /// dictionary first (BC17, BC18); a `Dictionary` failure is caught
+    /// here, logged at `warn`, and the connection proceeds with no
+    /// `zstdDictionary` parameter, so frames arrive as text (BC19).
+    /// `cursor` is the caller's own checkpoint, used verbatim until an
+    /// event is seen (BC15, BC16).
+    pub async fn connect(cfg: &Config, cursor: Option<u64>) -> Result<Self, JetstreamError> {
+        let dict = match Dictionary::load_or_fetch(cfg).await {
+            Ok(dict) => Some(dict),
+            Err(err) => {
+                tracing::warn!(error = %err, "jetstream: connecting with no dictionary");
+                None
+            }
+        };
+        let url = subscribe_url(&cfg.jetstream_url, dict.as_ref().map(|d| d.id.as_str()), cursor);
+        let (socket, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .map_err(|err| JetstreamError::Connect(err.to_string()))?;
+        Ok(Self {
+            socket,
+            jetstream_url: cfg.jetstream_url.clone(),
+            dict,
+            initial_cursor: cursor,
+            last_seq: None,
+            attempt: 0,
+        })
+    }
+
+    /// The `seq` of the last commit event returned, or `None` before the
+    /// first one.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.last_seq
+    }
+
+    /// Returns the next [`Event`], hiding every reconnect (BC12). A
+    /// non-`"message"` envelope, `#identity`/`#account`/`#sync`/`Other`
+    /// payloads, and a frame that fails to decode (BC8, BC9, logged at
+    /// `warn`) all loop rather than return. A ping, pong, or close-adjacent
+    /// message carries no payload and is ignored (BC24). A closed or
+    /// errored socket backs off and reconnects (BC12); this call never
+    /// gives up, so it never actually returns `Err` today, but keeps the
+    /// `Result` so a future caller-fatal `JetstreamError` variant (BC21)
+    /// can surface without a signature change.
+    pub async fn next(&mut self) -> Result<Event, JetstreamError> {
+        loop {
+            let event = match self.socket.next().await {
+                Some(Ok(Message::Binary(data))) => self.handle_frame(&data, true),
+                Some(Ok(Message::Text(data))) => self.handle_frame(data.as_bytes(), false),
+                Some(Ok(
+                    Message::Ping(_) | Message::Pong(_) | Message::Close(_) | Message::Frame(_),
+                )) => {
+                    None // BC24: no payload to decode.
+                }
+                Some(Err(err)) => {
+                    tracing::warn!(error = %err, "jetstream: socket error, reconnecting");
+                    self.reconnect().await;
+                    None
+                }
+                None => {
+                    tracing::warn!("jetstream: connection closed, reconnecting");
+                    self.reconnect().await;
+                    None
+                }
+            };
+            if let Some(event) = event {
+                return Ok(event);
+            }
+        }
+    }
+
+    /// Decodes one message into an [`Event`], or `None` when it should be
+    /// consumed internally. A decode failure warns and is otherwise
+    /// swallowed (BC8, BC9): the connection stays open.
+    fn handle_frame(&mut self, data: &[u8], binary: bool) -> Option<Event> {
+        match decode_frame(data, binary, self.dict.as_ref()) {
+            Ok(frame) => dispatch(frame, &mut self.last_seq),
+            Err(err) => {
+                tracing::warn!(error = %err, "jetstream: skipping frame");
+                None
+            }
+        }
+    }
+
+    /// Backs off, then reconnects with `cursor = resume_cursor(...)`
+    /// (BC14, BC15, BC16), retrying with the same backoff schedule until a
+    /// connection succeeds. Resets the attempt counter on success, so a
+    /// long-lived connection does not carry a stale attempt count into its
+    /// next disconnect.
+    async fn reconnect(&mut self) {
+        loop {
+            let delay = backoff_delay(self.attempt);
+            tracing::warn!(
+                attempt = self.attempt,
+                delay_secs = delay.as_secs(),
+                "jetstream: backing off before reconnect"
+            );
+            tokio::time::sleep(delay).await;
+            self.attempt = self.attempt.saturating_add(1);
+            let cursor = resume_cursor(self.last_seq, self.initial_cursor);
+            let url = subscribe_url(
+                &self.jetstream_url,
+                self.dict.as_ref().map(|d| d.id.as_str()),
+                cursor,
+            );
+            match tokio_tungstenite::connect_async(&url).await {
+                Ok((socket, _)) => {
+                    self.socket = socket;
+                    self.attempt = 0;
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "jetstream: reconnect attempt failed");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +549,98 @@ mod tests {
         let raw = br##"{"$type":"ping","payload":{"$type":"network.bsky.jetstream.subscribeEvents#identity","did":"did:plc:abc"}}"##;
         let frame = decode_frame(raw, false, None).expect("text message should decode");
         assert_eq!(frame.kind, "ping");
+    }
+
+    #[test]
+    fn ignores_non_commit_kinds() {
+        // AC2: `#identity`, `#account`, `#sync`, an unknown payload type,
+        // and a non-`"message"` envelope are all swallowed by `dispatch`,
+        // and none of them touch `last_seq` (BC1's loop half, BC4, BC5).
+        let mut last_seq = None;
+        let non_commit_payloads = [
+            r##"{"$type":"network.bsky.jetstream.subscribeEvents#identity","did":"did:plc:abc"}"##,
+            r##"{"$type":"network.bsky.jetstream.subscribeEvents#account","did":"did:plc:abc"}"##,
+            r##"{"$type":"network.bsky.jetstream.subscribeEvents#sync","did":"did:plc:abc"}"##,
+            r##"{"$type":"#futurething","foo":"bar"}"##,
+        ];
+        for payload in non_commit_payloads {
+            let raw = format!(r##"{{"$type":"message","payload":{payload}}}"##);
+            let frame: Frame = serde_json::from_str(&raw).unwrap();
+            assert_eq!(dispatch(frame, &mut last_seq), None);
+        }
+        assert_eq!(last_seq, None);
+
+        // A non-`"message"` envelope is ignored too, even wrapped around a
+        // payload kind that would otherwise be consumed internally.
+        let raw = r##"{"$type":"ping","payload":{"$type":"network.bsky.jetstream.subscribeEvents#identity","did":"did:plc:abc"}}"##;
+        let frame: Frame = serde_json::from_str(raw).unwrap();
+        assert_eq!(dispatch(frame, &mut last_seq), None);
+
+        // A `#commit` returns and advances `last_seq`; a `#info` returns
+        // too, but leaves `last_seq` untouched, since it carries no `seq`
+        // (BC3).
+        let raw = r##"{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","did":"did:plc:abc","seq":42,"time":"2026-09-18T00:00:00.000000Z","operation":"create","collection":"app.bsky.feed.post","rkey":"abc123","rev":"rev123"}}"##;
+        let frame: Frame = serde_json::from_str(raw).unwrap();
+        let event = dispatch(frame, &mut last_seq).expect("commit should return an event");
+        assert!(matches!(event, Event::Commit(_)));
+        assert_eq!(last_seq, Some(42));
+
+        let raw = r##"{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#info","name":"OutdatedCursor","message":"..."}}"##;
+        let frame: Frame = serde_json::from_str(raw).unwrap();
+        let event = dispatch(frame, &mut last_seq).expect("info should return an event");
+        assert!(matches!(event, Event::Info { .. }));
+        assert_eq!(last_seq, Some(42), "an info frame must not touch last_seq");
+    }
+
+    #[test]
+    fn backoff_caps_at_60s() {
+        // BC13: 1, 2, 4, 8, 16, 32, 60 seconds for attempts 0 through 6;
+        // 60 again from there on, never zero, never above 60, and no
+        // overflow at a large attempt.
+        let expected = [1, 2, 4, 8, 16, 32, 60];
+        for (attempt, &secs) in expected.iter().enumerate() {
+            assert_eq!(backoff_delay(attempt as u32).as_secs(), secs);
+        }
+        assert_eq!(backoff_delay(7).as_secs(), 60);
+        assert_eq!(backoff_delay(100).as_secs(), 60);
+        assert_eq!(backoff_delay(u32::MAX).as_secs(), 60);
+    }
+
+    #[test]
+    fn resume_uses_seq_plus_one() {
+        // BC14, BC15, BC16.
+        assert_eq!(resume_cursor(Some(5), None), Some(6));
+        assert_eq!(resume_cursor(Some(5), Some(99)), Some(6));
+        assert_eq!(resume_cursor(None, None), None);
+        assert_eq!(resume_cursor(None, Some(42)), Some(42));
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the live Jetstream v2 host; run by hand"]
+    async fn jetstream_live_connect() {
+        // AC8: a live connection decodes real frames from all four
+        // collections. The cursor is a unix-microsecond value below the
+        // retention floor (spec.md step 7), which starts the subscription
+        // near the current head rather than waiting on the full backlog.
+        let tmp = std::env::temp_dir().join(format!("jetstream-live-test-{}", std::process::id()));
+        let cfg = test_config(&tmp, "wss://jetstream.us-west.bsky.network");
+        let mut client = JetstreamClient::connect(&cfg, Some(1_600_000_000_000_000))
+            .await
+            .expect("live connect should succeed");
+
+        let mut seen = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while seen.len() < COLLECTIONS.len() && tokio::time::Instant::now() < deadline {
+            let event = tokio::time::timeout(Duration::from_secs(15), client.next())
+                .await
+                .expect("next() should not hang")
+                .expect("next() should not error");
+            if let Event::Commit(commit) = event {
+                seen.insert(commit.collection);
+            }
+        }
+        assert_eq!(seen.len(), COLLECTIONS.len(), "expected all four collections, saw {seen:?}");
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
