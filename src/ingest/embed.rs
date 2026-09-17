@@ -3,11 +3,12 @@
 //! path already holds for a `post` create. `validate` (story 03) and the
 //! Jetstream consumer (story 06) call this exact function.
 
+#![allow(dead_code)] // First caller is `dunk validate`, story 03.
+
 /// A validated `at://` URI: `at://<did>/app.bsky.feed.post/<rkey>`. The only
 /// place a URI is validated in this story; the App View client (`src/appview`)
 /// passes URIs through as `&str` instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // First caller is `dunk validate`, story 03.
 pub struct AtUri(String);
 
 impl AtUri {
@@ -15,7 +16,6 @@ impl AtUri {
     /// is wrong, the authority is not a `did:`, the collection is not
     /// `app.bsky.feed.post`, or the rkey is empty. A quote of a list or a
     /// feed generator is not a dunk pair.
-    #[allow(dead_code)] // First caller is `dunk validate`, story 03.
     pub fn parse(uri: &str) -> Option<Self> {
         let rest = uri.strip_prefix("at://")?;
         let mut parts = rest.splitn(3, '/');
@@ -37,14 +37,12 @@ impl AtUri {
     }
 
     /// The full `at://` string.
-    #[allow(dead_code)] // First caller is `dunk validate`, story 03.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// The authority segment, always a `did:`. Parsing succeeded, so this
     /// never fails.
-    #[allow(dead_code)] // First caller is `dunk validate`, story 03.
     pub fn did(&self) -> &str {
         self.0
             .strip_prefix("at://")
@@ -54,7 +52,6 @@ impl AtUri {
 
     /// The rkey segment, the last path component. Parsing succeeded, so this
     /// never fails.
-    #[allow(dead_code)] // First caller is `dunk validate`, story 03.
     pub fn rkey(&self) -> &str {
         self.0
             .strip_prefix("at://")
@@ -66,7 +63,6 @@ impl AtUri {
 /// Whether a post record embeds a quote of another post, TECH-DESIGN
 /// section 5.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // First caller is `dunk validate`, story 03.
 pub enum Embed {
     Quote { original_uri: AtUri },
     NotAQuote,
@@ -77,7 +73,6 @@ pub enum Embed {
 /// `external` and `gallery`, and a missing `embed` or `$type`, is
 /// `NotAQuote`. An unknown `$type` is not an error. A URI that is absent,
 /// empty, not a string, or fails `AtUri::parse` is also `NotAQuote`.
-#[allow(dead_code)] // First caller is `dunk validate`, story 03.
 pub fn detect(record: &serde_json::Value) -> Embed {
     let Some(embed) = record.get("embed") else {
         return Embed::NotAQuote;

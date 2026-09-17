@@ -165,6 +165,48 @@ fn nonneg_float_or_default(
     Ok(value)
 }
 
+/// Parses a `u32` variable via [`number_or_default`], then rejects `0`
+/// (BC23). `DUNK_K`, `DUNK_SCORER_INTERVAL_S` and `DUNK_REVERIFY_INTERVAL_S`
+/// each divide or gate a timer period, and `0` is never a working setting.
+fn positive_u32_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    let value = number_or_default(lookup, name, default)?;
+    if value == 0 {
+        return Err(ConfigError::Invalid {
+            name,
+            value: value.to_string(),
+            reason: "must be greater than zero".to_string(),
+        });
+    }
+    Ok(value)
+}
+
+/// Parses `DUNK_APPVIEW_RPS`, rejecting zero, negative and non-finite values
+/// (BC24) with the same reason string as the strictly-positive integers,
+/// rather than [`nonneg_float_or_default`]'s separate "not a finite number"
+/// and "must be >= 0" reasons, because zero is invalid here too.
+/// `AppViewClient::new` keeps its own `InvalidRate` check (BC15) as defence
+/// in depth, because it also takes a rate from a caller that did not come
+/// through `load`.
+fn positive_float_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: f64,
+) -> Result<f64, ConfigError> {
+    let value = number_or_default(lookup, name, default)?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(ConfigError::Invalid {
+            name,
+            value: value.to_string(),
+            reason: "must be greater than zero".to_string(),
+        });
+    }
+    Ok(value)
+}
+
 /// Splits `DUNK_DROP_LABELS` on `,`, trims each entry, and drops empty
 /// entries (BC10). Falls back to `default` when unset (BC9). An empty or
 /// whitespace-only value is malformed, the same rule as an empty number
@@ -208,13 +250,13 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         appview_url: string_or_default(&lookup, "DUNK_APPVIEW_URL", "https://public.api.bsky.app"),
         w_repost: nonneg_float_or_default(&lookup, "DUNK_W_REPOST", 2.0)?,
         w_reply: nonneg_float_or_default(&lookup, "DUNK_W_REPLY", 0.5)?,
-        k: number_or_default(&lookup, "DUNK_K", 5)?,
+        k: positive_u32_or_default(&lookup, "DUNK_K", 5)?,
         p: number_or_default(&lookup, "DUNK_P", 50)?,
         m: nonneg_float_or_default(&lookup, "DUNK_M", 1.25)?,
         candidate_ttl_h: number_or_default(&lookup, "DUNK_CANDIDATE_TTL_H", 48)?,
         feed_ttl_d: number_or_default(&lookup, "DUNK_FEED_TTL_D", 30)?,
-        scorer_interval_s: number_or_default(&lookup, "DUNK_SCORER_INTERVAL_S", 60)?,
-        reverify_interval_s: number_or_default(&lookup, "DUNK_REVERIFY_INTERVAL_S", 600)?,
+        scorer_interval_s: positive_u32_or_default(&lookup, "DUNK_SCORER_INTERVAL_S", 60)?,
+        reverify_interval_s: positive_u32_or_default(&lookup, "DUNK_REVERIFY_INTERVAL_S", 600)?,
         follower_floor: number_or_default(&lookup, "DUNK_FOLLOWER_FLOOR", 2000)?,
         drop_labels: drop_labels(
             &lookup,
@@ -222,7 +264,7 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
             "porn,sexual,graphic-media,nudity,!hide,!warn,spam",
         )?,
         prefilter_fraction: nonneg_float_or_default(&lookup, "DUNK_PREFILTER_FRACTION", 0.5)?,
-        appview_rps: nonneg_float_or_default(&lookup, "DUNK_APPVIEW_RPS", 1.0)?,
+        appview_rps: positive_float_or_default(&lookup, "DUNK_APPVIEW_RPS", 1.0)?,
         log: log_filter_or_default(&lookup, "DUNK_LOG", "info")?,
         bsky_handle: optional(&lookup, "BSKY_HANDLE"),
         bsky_app_password: optional(&lookup, "BSKY_APP_PASSWORD").map(Secret),
@@ -421,14 +463,77 @@ mod tests {
     #[test]
     fn infinite_weight_is_malformed() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_APPVIEW_RPS", "inf"));
+        pairs.push(("DUNK_W_REPOST", "inf"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_APPVIEW_RPS");
+                assert_eq!(name, "DUNK_W_REPOST");
                 assert_eq!(reason, "not a finite number");
             }
             other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_k_is_invalid() {
+        // BC23: DUNK_K is a divisor, so 0 is never a working setting.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_K", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "DUNK_K");
+                assert_eq!(reason, "must be greater than zero");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_scorer_interval_is_invalid() {
+        // BC23: DUNK_SCORER_INTERVAL_S is a timer period.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_SCORER_INTERVAL_S", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "DUNK_SCORER_INTERVAL_S");
+                assert_eq!(reason, "must be greater than zero");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_reverify_interval_is_invalid() {
+        // BC23: DUNK_REVERIFY_INTERVAL_S is a timer period.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_REVERIFY_INTERVAL_S", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "DUNK_REVERIFY_INTERVAL_S");
+                assert_eq!(reason, "must be greater than zero");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_negative_or_nonfinite_appview_rps_is_invalid() {
+        // BC24: DUNK_APPVIEW_RPS rejects zero, negative and non-finite
+        // values, all with the same reason string.
+        for bad in ["0", "-1.0", "nan", "inf"] {
+            let mut pairs = required_pair().to_vec();
+            pairs.push(("DUNK_APPVIEW_RPS", bad));
+            let err = load(env(&pairs)).unwrap_err();
+            match err {
+                ConfigError::Invalid { name, reason, .. } => {
+                    assert_eq!(name, "DUNK_APPVIEW_RPS");
+                    assert_eq!(reason, "must be greater than zero");
+                }
+                other => panic!("expected Invalid for {bad}, got {other:?}"),
+            }
         }
     }
 

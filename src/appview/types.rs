@@ -44,13 +44,13 @@ pub struct EmbedRecordViewRecord {
 }
 
 /// `postView.embed`, TECH-DESIGN section 8.2's table of `Q.embed` shapes.
-/// `Record` and `RecordWithMedia` carry a resolved post only when the App
-/// View's own `record.$type` is `#viewRecord`; every other `record.$type`
-/// (`#viewDetached`, `#viewBlocked`, `#viewNotFound`) and every other embed
-/// `$type` (`images`, `video`, `external`, or none at all) falls into
+/// `Record` and `RecordWithMedia` carry a resolved post when the App View's
+/// own `record.$type` is `#viewRecord`, and a named variant for
+/// `#viewNotFound`, `#viewBlocked` and `#viewDetached` (BC22); every other
+/// embed `$type` (`images`, `video`, `external`, or none at all) falls into
 /// `Other`, so this type never rejects a body for an embed shape (BC13).
-/// Story 07's `verify.rs` reads section 8.2's drop reasons from `Other`,
-/// not this client.
+/// Story 07's `verify.rs` reads section 8.2's drop reasons off
+/// `RecordViewInner`'s named variants and off `Other`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "$type")]
 pub enum EmbedView {
@@ -63,13 +63,21 @@ pub enum EmbedView {
 }
 
 /// The inner `record` of an `app.bsky.embed.record#view`. `#[serde(tag)]`
-/// dispatches on the inner `$type` too, so a `#viewDetached`, `#viewBlocked`
-/// or `#viewNotFound` decodes into `Other` rather than failing.
+/// dispatches on the inner `$type` too, so `#viewNotFound`, `#viewBlocked`
+/// and `#viewDetached` each decode into their own variant (BC22), so story
+/// 07 can map each to the drop reason TECH-DESIGN section 8.2 gives it.
+/// Every other inner `$type` still decodes into `Other`, never an error.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "$type")]
 pub enum RecordViewInner {
     #[serde(rename = "app.bsky.embed.record#viewRecord")]
     ViewRecord(EmbedRecordViewRecord),
+    #[serde(rename = "app.bsky.embed.record#viewNotFound")]
+    ViewNotFound { uri: String },
+    #[serde(rename = "app.bsky.embed.record#viewBlocked")]
+    ViewBlocked { uri: String },
+    #[serde(rename = "app.bsky.embed.record#viewDetached")]
+    ViewDetached { uri: String },
     #[serde(other)]
     Other,
 }
