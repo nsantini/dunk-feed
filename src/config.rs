@@ -3,6 +3,7 @@
 //! `.env.example`. `load` fails fast on a missing required variable or a
 //! malformed value; it never panics.
 
+use std::fmt;
 use std::str::FromStr;
 
 use thiserror::Error;
@@ -14,6 +15,26 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("invalid value for {name}: {value:?}: {reason}")]
     Invalid { name: &'static str, value: String, reason: String },
+}
+
+/// A secret read from the environment. `Debug` prints `[redacted]`, so a
+/// `tracing::info!(?config)` line can never leak it to the log stream.
+/// Call `expose` at the one place that sends it over the wire.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Returns the plain value. Use only when building the request that needs it.
+    #[allow(dead_code)] // First caller is `dunk publish`, story 09.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
 }
 
 /// Every environment variable from TECH-DESIGN section 4, parsed and typed.
@@ -41,7 +62,7 @@ pub struct Config {
     pub appview_rps: f64,
     pub log: String,
     pub bsky_handle: Option<String>,
-    pub bsky_app_password: Option<String>,
+    pub bsky_app_password: Option<Secret>,
 }
 
 /// Reads a required string variable. `Missing` if unset, and also `Missing`
@@ -204,7 +225,7 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         appview_rps: nonneg_float_or_default(&lookup, "DUNK_APPVIEW_RPS", 1.0)?,
         log: log_filter_or_default(&lookup, "DUNK_LOG", "info")?,
         bsky_handle: optional(&lookup, "BSKY_HANDLE"),
-        bsky_app_password: optional(&lookup, "BSKY_APP_PASSWORD"),
+        bsky_app_password: optional(&lookup, "BSKY_APP_PASSWORD").map(Secret),
     })
 }
 
@@ -351,7 +372,17 @@ mod tests {
         pairs.push(("BSKY_APP_PASSWORD", "secret"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.bsky_handle, Some("dunk.bsky.social".to_string()));
-        assert_eq!(config.bsky_app_password, Some("secret".to_string()));
+        assert_eq!(config.bsky_app_password.as_ref().map(Secret::expose), Some("secret"));
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_app_password() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("BSKY_APP_PASSWORD", "hunter2"));
+        let config = load(env(&pairs)).unwrap();
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("hunter2"));
+        assert!(printed.contains("[redacted]"));
     }
 
     #[test]

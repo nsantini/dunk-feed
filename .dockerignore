@@ -2,3 +2,8 @@ target/
 .git/
 tests/fixtures/
 docs/
+.env
+*.db
+*.db-wal
+*.db-shm
+.workflow/
