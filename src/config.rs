@@ -94,14 +94,28 @@ where
 }
 
 /// Splits `DUNK_DROP_LABELS` on `,`, trims each entry, and drops empty
-/// entries (BC10). Falls back to `default` when unset (BC9).
+/// entries (BC10). Falls back to `default` when unset (BC9). An empty or
+/// whitespace-only value is malformed, the same rule as an empty number
+/// (BC13): disabling every label guard is not a supported setting here.
 fn drop_labels(
     lookup: &impl Fn(&str) -> Option<String>,
     name: &'static str,
     default: &str,
-) -> Vec<String> {
-    let raw = lookup(name).unwrap_or_else(|| default.to_string());
-    raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()).map(str::to_string).collect()
+) -> Result<Vec<String>, ConfigError> {
+    let raw = string_or_default(lookup, name, default);
+    if raw.trim().is_empty() {
+        return Err(ConfigError::Invalid {
+            name,
+            value: raw,
+            reason: "empty or whitespace-only value".to_string(),
+        });
+    }
+    Ok(raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Loads the config from `lookup`, a variable-name-to-value function. Tests
@@ -134,7 +148,7 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
             &lookup,
             "DUNK_DROP_LABELS",
             "porn,sexual,graphic-media,nudity,!hide,!warn,spam",
-        ),
+        )?,
         prefilter_fraction: number_or_default(&lookup, "DUNK_PREFILTER_FRACTION", 0.5)?,
         appview_rps: number_or_default(&lookup, "DUNK_APPVIEW_RPS", 1.0)?,
         log: string_or_default(&lookup, "DUNK_LOG", "info"),
@@ -245,6 +259,17 @@ mod tests {
         pairs.push(("DUNK_DROP_LABELS", " porn, , spam ,nudity"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.drop_labels, vec!["porn", "spam", "nudity"]);
+    }
+
+    #[test]
+    fn empty_drop_labels_is_malformed() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_DROP_LABELS", "   "));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_DROP_LABELS"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

@@ -13,13 +13,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let lookup = |name: &str| std::env::var(name).ok();
-    let config = match config::load(lookup) {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("config error: {err}");
-            std::process::exit(1);
-        }
-    };
+    let config = config::load(lookup).map_err(|err| anyhow::anyhow!("config error: {err}"))?;
 
     tracing_subscriber::fmt().json().with_env_filter(EnvFilter::new(config.log)).init();
 
