@@ -153,22 +153,30 @@ impl Dictionary {
 
 /// Builds the dictionary endpoint URL from a `wss://` or `ws://` Jetstream
 /// base, swapping the scheme for `https://`/`http://`, TECH-DESIGN section
-/// 5.1.
+/// 5.1. This is the v2 `network.bsky.jetstream.getZstdDictionary` XRPC
+/// endpoint, verified live on 2026-09-18; the v1 `/subscribe/zstd-dictionary`
+/// path is rejected outright (TECH-DESIGN section 12, D4).
 fn dictionary_url(jetstream_url: &str) -> String {
     let base = jetstream_url.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
-    format!("{base}/subscribe/zstd-dictionary")
+    format!("{base}/xrpc/network.bsky.jetstream.getZstdDictionary")
 }
 
 /// Builds the `subscribeEvents` URL: the four collections in
-/// [`COLLECTIONS`] order, `kinds=commit`, `zstdDictionary=<id>` when
-/// `dict_id` is given, and `cursor=<cursor>` when `cursor` is given (BC22).
-/// Pure, so a test can assert the whole string with no network involved.
+/// [`COLLECTIONS`] order as repeated `collections` parameters, `kinds=commit`,
+/// `zstdDictionary=<id>` when `dict_id` is given, and `cursor=<cursor>` when
+/// `cursor` is given (BC22). This is the v2 XRPC path
+/// `/xrpc/network.bsky.jetstream.subscribeEvents`, verified live on
+/// 2026-09-18; the v1 `/subscribe` path and its `wantedCollections`
+/// parameter are rejected outright (TECH-DESIGN section 12, D4). Pure, so a
+/// test can assert the whole string with no network involved.
 pub fn subscribe_url(jetstream_url: &str, dict_id: Option<&str>, cursor: Option<u64>) -> String {
-    let mut url = format!("{jetstream_url}/subscribe?kinds=commit");
+    let mut url = format!("{jetstream_url}/xrpc/network.bsky.jetstream.subscribeEvents?");
     for collection in COLLECTIONS {
-        url.push_str("&wantedCollections=");
+        url.push_str("collections=");
         url.push_str(collection);
+        url.push('&');
     }
+    url.push_str("kinds=commit");
     if let Some(id) = dict_id {
         url.push_str("&zstdDictionary=");
         url.push_str(id);
@@ -284,14 +292,20 @@ mod tests {
 
     #[test]
     fn subscribe_url_holds_the_four_collections_in_order() {
+        // Asserted character for character against the v2 URL verified
+        // live on 2026-09-18 (see spec.md's "Answers from the engineer",
+        // step 7): the repeatable parameter is `collections`, never the v1
+        // `wantedCollections`, and the path is the XRPC
+        // `subscribeEvents` endpoint, never the v1 `/subscribe` path.
         let url = subscribe_url("wss://jetstream.us-west.bsky.network", Some("20260811"), Some(5));
         assert_eq!(
             url,
-            "wss://jetstream.us-west.bsky.network/subscribe?kinds=commit\
-             &wantedCollections=app.bsky.feed.post\
-             &wantedCollections=app.bsky.feed.like\
-             &wantedCollections=app.bsky.feed.repost\
-             &wantedCollections=app.bsky.feed.postgate\
+            "wss://jetstream.us-west.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents?\
+             collections=app.bsky.feed.post\
+             &collections=app.bsky.feed.like\
+             &collections=app.bsky.feed.repost\
+             &collections=app.bsky.feed.postgate\
+             &kinds=commit\
              &zstdDictionary=20260811&cursor=5"
         );
     }
@@ -301,6 +315,22 @@ mod tests {
         let url = subscribe_url("wss://jetstream.us-west.bsky.network", None, None);
         assert!(!url.contains("zstdDictionary"));
         assert!(!url.contains("cursor="));
+        assert!(!url.contains("wantedCollections"));
+    }
+
+    #[test]
+    fn dictionary_url_uses_the_v2_xrpc_path() {
+        // The v2 `getZstdDictionary` XRPC endpoint, verified live on
+        // 2026-09-18, reached by swapping the `wss://` scheme for
+        // `https://`. Never the v1 `/subscribe/zstd-dictionary` path.
+        assert_eq!(
+            dictionary_url("wss://jetstream.us-west.bsky.network"),
+            "https://jetstream.us-west.bsky.network/xrpc/network.bsky.jetstream.getZstdDictionary"
+        );
+        assert_eq!(
+            dictionary_url("ws://127.0.0.1:1"),
+            "http://127.0.0.1:1/xrpc/network.bsky.jetstream.getZstdDictionary"
+        );
     }
 
     #[test]
