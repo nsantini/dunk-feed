@@ -13,11 +13,7 @@ pub enum ConfigError {
     #[error("missing required environment variable {0}")]
     Missing(&'static str),
     #[error("invalid value for {name}: {value:?}: {reason}")]
-    Invalid {
-        name: &'static str,
-        value: String,
-        reason: String,
-    },
+    Invalid { name: &'static str, value: String, reason: String },
 }
 
 /// Every environment variable from TECH-DESIGN section 4, parsed and typed.
@@ -49,14 +45,21 @@ pub struct Config {
 }
 
 /// Reads a required string variable. `Missing` if unset.
-fn required(lookup: &impl Fn(&str) -> Option<String>, name: &'static str) -> Result<String, ConfigError> {
+fn required(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+) -> Result<String, ConfigError> {
     lookup(name).ok_or(ConfigError::Missing(name))
 }
 
 /// Reads an optional string variable, falling back to `default` when unset.
 /// An unrecognised variable elsewhere in the environment (BC8) is simply
 /// never looked up, so it cannot affect this or any other field.
-fn string_or_default(lookup: &impl Fn(&str) -> Option<String>, name: &'static str, default: &str) -> String {
+fn string_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: &str,
+) -> String {
     lookup(name).unwrap_or_else(|| default.to_string())
 }
 
@@ -79,11 +82,9 @@ where
 {
     match lookup(name) {
         None => Ok(default),
-        Some(value) if value.is_empty() => Err(ConfigError::Invalid {
-            name,
-            value,
-            reason: "empty value".to_string(),
-        }),
+        Some(value) if value.is_empty() => {
+            Err(ConfigError::Invalid { name, value, reason: "empty value".to_string() })
+        }
         Some(value) => value.parse::<T>().map_err(|err| ConfigError::Invalid {
             name,
             value: value.clone(),
@@ -94,13 +95,13 @@ where
 
 /// Splits `DUNK_DROP_LABELS` on `,`, trims each entry, and drops empty
 /// entries (BC10). Falls back to `default` when unset (BC9).
-fn drop_labels(lookup: &impl Fn(&str) -> Option<String>, name: &'static str, default: &str) -> Vec<String> {
+fn drop_labels(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: &str,
+) -> Vec<String> {
     let raw = lookup(name).unwrap_or_else(|| default.to_string());
-    raw.split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_string)
-        .collect()
+    raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()).map(str::to_string).collect()
 }
 
 /// Loads the config from `lookup`, a variable-name-to-value function. Tests
