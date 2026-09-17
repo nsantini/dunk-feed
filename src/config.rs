@@ -44,12 +44,18 @@ pub struct Config {
     pub bsky_app_password: Option<String>,
 }
 
-/// Reads a required string variable. `Missing` if unset.
+/// Reads a required string variable. `Missing` if unset, and also `Missing`
+/// if set to an empty or whitespace-only value (BC17): a half-filled copy of
+/// `.env.example`, which ships both required variables as bare `NAME=`, must
+/// fail the same way as an unset one, not pass with an empty value.
 fn required(
     lookup: &impl Fn(&str) -> Option<String>,
     name: &'static str,
 ) -> Result<String, ConfigError> {
-    lookup(name).ok_or(ConfigError::Missing(name))
+    match lookup(name) {
+        Some(value) if !value.trim().is_empty() => Ok(value),
+        _ => Err(ConfigError::Missing(name)),
+    }
 }
 
 /// Reads an optional string variable, falling back to `default` when unset.
@@ -230,6 +236,20 @@ mod tests {
     #[test]
     fn missing_publisher_did_fails() {
         let lookup = env(&[("DUNK_HOSTNAME", "feed.example.com")]);
+        let err = load(lookup).unwrap_err();
+        assert_eq!(err, ConfigError::Missing("DUNK_PUBLISHER_DID"));
+    }
+
+    #[test]
+    fn empty_required_var_is_missing() {
+        let lookup = env(&[("DUNK_HOSTNAME", ""), ("DUNK_PUBLISHER_DID", "did:plc:abc")]);
+        let err = load(lookup).unwrap_err();
+        assert_eq!(err, ConfigError::Missing("DUNK_HOSTNAME"));
+    }
+
+    #[test]
+    fn whitespace_required_var_is_missing() {
+        let lookup = env(&[("DUNK_HOSTNAME", "feed.example.com"), ("DUNK_PUBLISHER_DID", "   ")]);
         let err = load(lookup).unwrap_err();
         assert_eq!(err, ConfigError::Missing("DUNK_PUBLISHER_DID"));
     }
