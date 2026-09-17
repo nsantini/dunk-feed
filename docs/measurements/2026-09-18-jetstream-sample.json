@@ -1,0 +1,49 @@
+{
+ "elapsed_s": 430.1,
+ "counts": {
+  "events": 163772,
+  "bytes": 92306886,
+  "app.bsky.feed.repost:create": 22540,
+  "app.bsky.feed.like:create": 117469,
+  "kind:account": 129,
+  "app.bsky.feed.post:create": 19867,
+  "app.bsky.feed.like:delete": 1326,
+  "app.bsky.feed.post:delete": 1110,
+  "post:reply": 9724,
+  "quote:post": 1551,
+  "app.bsky.feed.postgate:create": 533,
+  "app.bsky.feed.repost:delete": 670,
+  "kind:identity": 116,
+  "quote:self": 214,
+  "quote:also_reply": 67,
+  "app.bsky.feed.post:update": 11,
+  "app.bsky.feed.postgate:update": 1
+ },
+ "bytes_by_collection": {
+  "app.bsky.feed.repost": 12348562,
+  "app.bsky.feed.like": 62431002,
+  "app.bsky.feed.post": 17197860,
+  "app.bsky.feed.postgate": 280056
+ },
+ "embed_types": {
+  "app.bsky.embed.external": 2757,
+  "app.bsky.embed.images": 2678,
+  "none": 12501,
+  "app.bsky.embed.recordWithMedia": 212,
+  "app.bsky.embed.record": 1344,
+  "app.bsky.embed.video": 336,
+  "app.bsky.embed.gallery": 38,
+  "app.bsky.embed.external#external": 1
+ },
+ "quote_targets": {
+  "app.bsky.feed.post": 1551,
+  "app.bsky.graph.starterpack": 4,
+  "app.bsky.feed.generator": 1
+ },
+ "postgate": {
+  "records": 534,
+  "detached_uris": 5,
+  "rule:postgate#disableRule": 533
+ },
+ "stream_span_s": 418.069075
+}

@@ -10,7 +10,7 @@
 
 Three probes ran on 2026-09-18 between 08:05 and 08:17 NZST (2026-09-17 20:05 to 20:17 UTC).
 
-1. **Jetstream sample.** One websocket to `jetstream2.us-east.bsky.network`, four collections (`post`, `like`, `repost`, `postgate`), no compression, 418 seconds of stream time, 163,772 events. Script: `sample_jetstream.py` (not kept in the repo).
+1. **Jetstream sample.** One websocket to `jetstream2.us-east.bsky.network`, four collections (`post`, `like`, `repost`, `postgate`), no compression, 418 seconds of stream time, 163,772 events. Script: `scripts/measure/sample_jetstream.py`. Raw output: `docs/measurements/2026-09-18-jetstream-sample.json`.
 2. **Hot feed probe.** `app.bsky.feed.getFeed` on Bluesky's `hot-classic` and `whats-hot` (Discover) feeds through `public.api.bsky.app`, unauthenticated, 200 to 300 posts each.
 3. **Dunk probe.** For quote posts found in `hot-classic`, fetched the original with `getPosts` and computed the PRD score with the default constants.
 
