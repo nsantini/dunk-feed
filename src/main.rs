@@ -13,7 +13,8 @@ use clap::Parser;
 use cli::Cli;
 use tracing_subscriber::EnvFilter;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let lookup = |name: &str| std::env::var(name).ok();
@@ -23,7 +24,9 @@ fn main() -> anyhow::Result<()> {
         .expect("config::load already validates DUNK_LOG with EnvFilter::try_new");
     tracing_subscriber::fmt().json().with_env_filter(filter).init();
 
-    cli.command.run();
+    cli::dispatch(&cli.command, &config)
+        .await
+        .map_err(|err| anyhow::anyhow!("validate error: {err}"))?;
 
     Ok(())
 }

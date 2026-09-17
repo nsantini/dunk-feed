@@ -1,8 +1,8 @@
 //! `dunk validate` phase 0 tool, TECH-DESIGN section 10. Every decision here
 //! is a pure function over values already in memory: seeding, the quote
-//! filter, scoring, and row ordering. Only `run` (wired by the next slice)
-//! touches the network or the filesystem, so this module's fixture tests
-//! cover the whole decision path with no network.
+//! filter, scoring, row ordering, and rendering. Only `run` touches the
+//! network or the filesystem, so this module's fixture tests cover the whole
+//! decision path with no network.
 //!
 //! `candidates` reuses `ingest::embed::detect` on the quote's own
 //! `post.record`, never a second detector, and `build_rows` reuses
@@ -11,14 +11,15 @@
 //! `Thresholds` `score::qualifies` uses, but separately, since the table
 //! prints each gate on its own (BC17, BC18), not only their conjunction.
 
-#![allow(dead_code)] // First caller is `dunk validate`'s CLI wiring, the next slice.
-
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use thiserror::Error;
 
 use crate::appview::types::{EmbedView, PostView, RecordViewInner};
+use crate::appview::{AppViewClient, AppViewError};
 use crate::ingest::embed::{self, AtUri, Embed};
 use crate::score::{self, Counts, Thresholds, Weights};
 
@@ -47,6 +48,8 @@ pub enum Reason {
     /// BC21: the quote's hydrated `postView.embed` names the original
     /// `#viewDetached`.
     OriginalDetached,
+    /// BC9: a `--seed-file` URI absent from the `getPosts` result map.
+    QuoteGone,
 }
 
 impl Reason {
@@ -58,6 +61,7 @@ impl Reason {
             Reason::OriginalNotFound => "original_not_found",
             Reason::OriginalBlocked => "original_blocked",
             Reason::OriginalDetached => "original_detached",
+            Reason::QuoteGone => "quote_gone",
         }
     }
 }
@@ -262,6 +266,253 @@ pub fn sort_rows(mut rows: Vec<Row>) -> Vec<Row> {
     rows
 }
 
+/// `dunk validate`'s own errors. `AGENTS.md` keeps `anyhow` in `main.rs`
+/// only, so every variant here carries enough context for `main.rs` to
+/// print one line and exit 1 (BC10, BC11, BC12) with no further lookup.
+#[derive(Debug, Error)]
+pub enum ValidateError {
+    /// BC10: `--seed-file` names a path that cannot be read.
+    #[error("failed to read seed file {path:?}: {source}")]
+    SeedFile { path: PathBuf, source: std::io::Error },
+    /// BC11: `--csv-path`'s parent directory is missing, or the write is
+    /// refused for any other reason.
+    #[error("failed to write CSV to {path:?}: {source}")]
+    CsvWrite { path: PathBuf, source: std::io::Error },
+    /// BC12: `get_feed` or `get_posts` spent every retry.
+    #[error("app view request failed: {0}")]
+    AppView(#[from] AppViewError),
+}
+
+/// Parses `--seed-file`'s contents into quote URIs, TECH-DESIGN section 10
+/// step 1. A blank line or one starting with `#` is skipped in silence
+/// (BC8). A non-blank line that does not parse as `AtUri::parse` is skipped
+/// with one warning line to stderr, and the run continues (BC6). An empty
+/// result, whether the file was empty or every line was skipped, signals
+/// the caller to fall back to `hot-classic` (BC7); this function does not
+/// print that fallback note itself, since it does not know which case it is
+/// until the caller decides.
+pub fn parse_seed_lines(contents: &str) -> Vec<AtUri> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match AtUri::parse(trimmed) {
+            Some(uri) => out.push(uri),
+            None => eprintln!(
+                "warning: seed file line {trimmed:?} is not a valid at:// post URI, skipping"
+            ),
+        }
+    }
+    out
+}
+
+/// Formats an optional score field the same way for the table and the CSV:
+/// two decimal places, or `-` when the row carries no score.
+fn fmt_score(value: Option<f64>) -> String {
+    match value {
+        Some(value) => format!("{value:.2}"),
+        None => "-".to_string(),
+    }
+}
+
+/// Formats an optional gate result the same way for the table and the CSV:
+/// `pass`, `fail`, or `-` when the row carries no score.
+fn fmt_gate(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "pass",
+        Some(false) => "fail",
+        None => "-",
+    }
+}
+
+/// One row's nine printed columns, shared by [`render_table`] and
+/// [`render_csv`] so the two can never drift apart (BC19): the two
+/// `bsky.app` links (BC23), `E(Q)`, `E(O)`, `D`, `rank`, the popularity gate
+/// (BC17), the margin gate (BC18), and the reason for an unscored row.
+fn row_fields(row: &Row) -> [String; 9] {
+    let quote_link = bsky_link(&row.quote_uri).unwrap_or_else(|| row.quote_uri.clone());
+    let original_link = bsky_link(&row.original_uri).unwrap_or_else(|| row.original_uri.clone());
+    [
+        quote_link,
+        original_link,
+        fmt_score(row.eq),
+        fmt_score(row.eo),
+        fmt_score(row.ratio),
+        fmt_score(row.rank),
+        fmt_gate(row.popularity_pass).to_string(),
+        fmt_gate(row.margin_pass).to_string(),
+        row.reason.map(|reason| reason.as_str()).unwrap_or("").to_string(),
+    ]
+}
+
+/// The header, shared by [`render_table`] and [`render_csv`], naming
+/// [`row_fields`]'s nine columns in order.
+const COLUMN_HEADERS: [&str; 9] =
+    ["quote", "original", "E(Q)", "E(O)", "D", "rank", "popularity", "margin", "reason"];
+
+/// Renders `rows` as a table for the engineer to read by hand, TECH-DESIGN
+/// section 10 step 4. One header line, then one line per row, in the order
+/// `rows` is already in: the caller sorts first with [`sort_rows`].
+pub fn render_table(rows: &[Row]) -> String {
+    let mut out = String::new();
+    out.push_str(&COLUMN_HEADERS.join("\t"));
+    out.push('\n');
+    for row in rows {
+        out.push_str(&row_fields(row).join("\t"));
+        out.push('\n');
+    }
+    out
+}
+
+/// Wraps `field` in `"..."` when it holds a `,`, a `"` or a newline,
+/// doubling each inner `"` (BC20). Hand-written: the spec's Non-goals rule
+/// out a CSV crate for one column set this small.
+fn csv_quote(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Renders `rows` as CSV, TECH-DESIGN section 10 step 4. The same rows, in
+/// the same order, as [`render_table`] (BC19), one header line, and no post
+/// text: [`Row`] never carries any.
+pub fn render_csv(rows: &[Row]) -> String {
+    let mut out = String::new();
+    out.push_str(&COLUMN_HEADERS.join(","));
+    out.push('\n');
+    for row in rows {
+        let fields = row_fields(row);
+        let quoted: Vec<String> = fields.iter().map(|field| csv_quote(field)).collect();
+        out.push_str(&quoted.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// Writes [`render_csv`]'s output to `path`. A missing parent directory or
+/// any other write failure becomes `ValidateError::CsvWrite` (BC11), never a
+/// panic.
+pub fn write_csv(rows: &[Row], path: &Path) -> Result<(), ValidateError> {
+    std::fs::write(path, render_csv(rows))
+        .map_err(|source| ValidateError::CsvWrite { path: path.to_path_buf(), source })
+}
+
+/// The row BC9 prints for a `--seed-file` URI absent from the `getPosts`
+/// result map: no score, reason `quote_gone`. `original_uri` is left blank:
+/// without the hydrated quote post, its own embed was never read, so the
+/// original is unknown too.
+fn quote_gone_row(uri: &AtUri) -> Row {
+    Row {
+        quote_uri: uri.as_str().to_string(),
+        quote_cid: String::new(),
+        original_uri: String::new(),
+        eq: None,
+        eo: None,
+        ratio: None,
+        rank: None,
+        popularity_pass: None,
+        margin_pass: None,
+        reason: Some(Reason::QuoteGone),
+    }
+}
+
+/// Pages `HOT_CLASSIC_FEED` up to `pages` times, TECH-DESIGN section 10 step
+/// 1 (BC13: `pages == 0` fetches nothing), stopping early when the App View
+/// returns no cursor.
+async fn page_hot_classic(
+    client: &AppViewClient,
+    pages: u32,
+) -> Result<Vec<PostView>, ValidateError> {
+    let mut posts = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..pages {
+        let page = client.get_feed(HOT_CLASSIC_FEED, cursor.as_deref()).await?;
+        posts.extend(page.feed.into_iter().map(|item| item.post));
+        cursor = page.cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(posts)
+}
+
+/// Runs the phase 0 tool end to end, TECH-DESIGN section 10. The only
+/// function in this module that touches the network or the filesystem.
+///
+/// `seed_file`, when it yields at least one URI, seeds from those quotes
+/// instead of `hot-classic`: each is fetched with one `get_posts` call, and
+/// a URI absent from the result becomes a [`quote_gone_row`] (BC9), never a
+/// silent drop. An empty or fully-skipped seed file falls back to paging
+/// `hot-classic`, with one note to stderr (BC7). With no seed file at all,
+/// `hot-classic` is paged up to `pages` times (BC13).
+///
+/// Every candidate's original is resolved with one more `get_posts` call,
+/// batched at 25 by `client` itself. The rows are scored, sorted, printed to
+/// stdout, and written to `csv_path`.
+pub async fn run(
+    client: &AppViewClient,
+    weights: &Weights,
+    thresholds: &Thresholds,
+    pages: u32,
+    seed_file: Option<&Path>,
+    csv_path: &Path,
+) -> Result<(), ValidateError> {
+    let now = Utc::now();
+
+    let seed_uris = match seed_file {
+        Some(path) => {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|source| ValidateError::SeedFile { path: path.to_path_buf(), source })?;
+            let uris = parse_seed_lines(&contents);
+            if uris.is_empty() {
+                eprintln!(
+                    "note: seed file {path:?} yielded no valid URIs, falling back to hot-classic"
+                );
+            }
+            uris
+        }
+        None => Vec::new(),
+    };
+
+    let (candidate_list, mut rows) = if seed_uris.is_empty() {
+        let posts = page_hot_classic(client, pages).await?;
+        (candidates(posts), Vec::new())
+    } else {
+        let uri_strings: Vec<String> =
+            seed_uris.iter().map(|uri| uri.as_str().to_string()).collect();
+        let fetched = client.get_posts(&uri_strings).await?;
+        let mut found = Vec::new();
+        let mut gone = Vec::new();
+        for uri in &seed_uris {
+            match fetched.get(uri.as_str()) {
+                Some(post) => found.push(post.clone()),
+                None => gone.push(quote_gone_row(uri)),
+            }
+        }
+        (candidates(found), gone)
+    };
+
+    let original_uris: Vec<String> = candidate_list
+        .iter()
+        .filter_map(|candidate| match candidate {
+            Candidate::Scoreable { original_uri, .. } => Some(original_uri.as_str().to_string()),
+            Candidate::SelfQuote { .. } => None,
+        })
+        .collect();
+    let originals = client.get_posts(&original_uris).await?;
+
+    rows.extend(build_rows(candidate_list, &originals, weights, thresholds, now));
+    let rows = sort_rows(rows);
+
+    print!("{}", render_table(&rows));
+    write_csv(&rows, csv_path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +574,57 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         "2026-01-02T00:00:00Z".parse().unwrap()
+    }
+
+    /// A client that never reaches the network in these tests: building it
+    /// does no I/O, and both tests that use it below only exercise paths
+    /// `run` returns from before any request goes out.
+    fn test_client() -> AppViewClient {
+        let lookup = |name: &str| match name {
+            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
+            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            _ => None,
+        };
+        let config = crate::config::load(lookup).expect("minimal config loads");
+        AppViewClient::new(&config).expect("the default rate builds a client")
+    }
+
+    #[tokio::test]
+    async fn unreadable_seed_file_is_a_validate_error() {
+        // BC10: `run` returns `ValidateError::SeedFile` before it ever
+        // reaches the network, since the seed file is read first.
+        let client = test_client();
+        let err = run(
+            &client,
+            &weights(),
+            &thresholds(),
+            0,
+            Some(Path::new("/nonexistent/dunk-validate-seed.txt")),
+            Path::new("/tmp/dunk-validate-should-not-be-written.csv"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ValidateError::SeedFile { .. }));
+    }
+
+    #[tokio::test]
+    async fn unwritable_csv_path_is_a_validate_error() {
+        // BC11: with `pages == 0` and no seed file, `candidates` and
+        // `get_posts(&[])` never reach the network (the client's own
+        // contract for an empty URI list), so this exercises only the CSV
+        // write failure.
+        let client = test_client();
+        let err = run(
+            &client,
+            &weights(),
+            &thresholds(),
+            0,
+            None,
+            Path::new("/nonexistent-dir/dunk-validate.csv"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ValidateError::CsvWrite { .. }));
     }
 
     #[test]
@@ -699,5 +1001,131 @@ mod tests {
         assert!(!result.is_empty());
         assert!(result.iter().any(|c| matches!(c, Candidate::Scoreable { .. })));
         assert!(result.iter().any(|c| matches!(c, Candidate::SelfQuote { .. })));
+    }
+
+    /// A minimal scored or unscored row, distinguished by `rkey`, which
+    /// [`csv_matches_table`] reads back out of the rendered link to check
+    /// ordering.
+    fn row_stub(rkey: &str, rank: Option<f64>) -> Row {
+        Row {
+            quote_uri: format!("at://did:plc:a/app.bsky.feed.post/{rkey}"),
+            quote_cid: rkey.to_string(),
+            original_uri: "at://did:plc:b/app.bsky.feed.post/original".to_string(),
+            eq: rank.map(|_| 10.0),
+            eo: rank.map(|_| 5.0),
+            ratio: rank,
+            rank,
+            popularity_pass: rank.map(|_| true),
+            margin_pass: rank.map(|_| true),
+            reason: if rank.is_none() { Some(Reason::OriginalGone) } else { None },
+        }
+    }
+
+    #[test]
+    fn skips_malformed_seed_line() {
+        // AC5, BC6: a malformed line is skipped, with the rest of the file
+        // still parsed.
+        let input = "at://did:plc:a/app.bsky.feed.post/good\n\
+                      not-a-uri\n\
+                      at://did:plc:b/app.bsky.feed.post/also-good\n";
+        let uris = parse_seed_lines(input);
+        assert_eq!(uris.len(), 2);
+        assert_eq!(uris[0].as_str(), "at://did:plc:a/app.bsky.feed.post/good");
+        assert_eq!(uris[1].as_str(), "at://did:plc:b/app.bsky.feed.post/also-good");
+    }
+
+    #[test]
+    fn skips_blank_and_comment_lines_in_silence() {
+        // BC8.
+        let input = "\n# a comment\n   \nat://did:plc:a/app.bsky.feed.post/good\n";
+        let uris = parse_seed_lines(input);
+        assert_eq!(uris.len(), 1);
+        assert_eq!(uris[0].as_str(), "at://did:plc:a/app.bsky.feed.post/good");
+    }
+
+    #[test]
+    fn empty_or_fully_skipped_seed_file_yields_no_uris() {
+        // BC7: `run` reads this as the signal to fall back to `hot-classic`.
+        assert!(parse_seed_lines("").is_empty());
+        assert!(parse_seed_lines("# only comments\n\n   \n").is_empty());
+    }
+
+    #[test]
+    fn quote_gone_row_carries_no_score() {
+        // BC9: a seed URI absent from `getPosts` becomes a row with reason
+        // `quote_gone`, never a silent drop.
+        let uri = AtUri::parse("at://did:plc:a/app.bsky.feed.post/gone").unwrap();
+        let row = quote_gone_row(&uri);
+        assert_eq!(row.quote_uri, "at://did:plc:a/app.bsky.feed.post/gone");
+        assert_eq!(row.reason, Some(Reason::QuoteGone));
+        assert_eq!(row.rank, None);
+    }
+
+    #[test]
+    fn csv_quoting_wraps_fields_that_need_it() {
+        // BC20.
+        assert_eq!(csv_quote("plain"), "plain");
+        assert_eq!(csv_quote("has,comma"), "\"has,comma\"");
+        assert_eq!(csv_quote("has\"quote"), "\"has\"\"quote\"");
+        assert_eq!(csv_quote("has\nnewline"), "\"has\nnewline\"");
+    }
+
+    #[test]
+    fn csv_matches_table() {
+        // AC4, BC19: the CSV's rows appear in the same order as the printed
+        // table, and the CSV carries no post text (there is none to carry:
+        // `Row` never holds any).
+        let rows = sort_rows(vec![
+            row_stub("low", Some(1.0)),
+            row_stub("high", Some(5.0)),
+            row_stub("unscored", None),
+        ]);
+        let table = render_table(&rows);
+        let csv = render_csv(&rows);
+
+        let rkey_of = |link: &str| link.rsplit('/').next().unwrap().to_string();
+        let table_rkeys: Vec<String> =
+            table.lines().skip(1).map(|line| rkey_of(line.split('\t').next().unwrap())).collect();
+        let csv_rkeys: Vec<String> =
+            csv.lines().skip(1).map(|line| rkey_of(line.split(',').next().unwrap())).collect();
+
+        assert_eq!(table_rkeys, vec!["high", "low", "unscored"]);
+        assert_eq!(csv_rkeys, table_rkeys);
+    }
+}
+
+/// Live tests against `https://public.api.bsky.app`, `#[ignore]`d so
+/// `cargo test --all-features` never touches the network, run by hand with
+/// `cargo test --all-features -- --ignored`. Mirrors `appview`'s own live
+/// tests, and the spec's own answer that `validate` needs no database: only
+/// `DUNK_HOSTNAME` and `DUNK_PUBLISHER_DID` are set.
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::appview::AppViewClient;
+
+    #[tokio::test]
+    #[ignore]
+    async fn validate_live_hot_classic() {
+        // AC9: a live run against `hot-classic` prints a table and writes a
+        // CSV with the expected header.
+        let lookup = |name: &str| match name {
+            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
+            "DUNK_PUBLISHER_DID" => Some("did:plc:z72i7hdynmk6r22z27h6tvur".to_string()),
+            _ => None,
+        };
+        let config = crate::config::load(lookup).expect("minimal config loads");
+        let client = AppViewClient::new(&config).expect("the default rate builds a client");
+        let weights = Weights::from(&config);
+        let thresholds = Thresholds::from(&config);
+        let csv_path = std::env::temp_dir().join("dunk-validate-live-test.csv");
+
+        run(&client, &weights, &thresholds, 1, None, &csv_path)
+            .await
+            .expect("live run against hot-classic");
+
+        let written = std::fs::read_to_string(&csv_path).expect("csv was written");
+        assert!(written.starts_with("quote,original,E(Q),E(O),D,rank,popularity,margin,reason"));
+        let _ = std::fs::remove_file(&csv_path);
     }
 }

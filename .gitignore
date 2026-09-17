@@ -13,3 +13,6 @@
 
 # OS
 .DS_Store
+
+# dunk validate's default CSV output
+/dunk-validate.csv
