@@ -1,9 +1,8 @@
 {
   "$type": "message",
-  "seq": 1274839500,
   "payload": {
-    "$type": "#info",
-    "name": "OutdatedCursor",
-    "message": "cursor 900000000 is older than the 36 hour lookback; resuming from the head"
+    "$type": "network.bsky.jetstream.subscribeEvents#info",
+    "message": "requested timestamp cursor below retention floor; starting at seq 25972147530",
+    "name": "OutdatedCursor"
   }
 }

@@ -1,24 +1,62 @@
 {
   "$type": "message",
-  "seq": 1274839201,
   "payload": {
-    "$type": "#commit",
-    "operation": "create",
+    "$type": "network.bsky.jetstream.subscribeEvents#commit",
+    "cid": "bafyreicnmmquad2zr3kc5ugs6o2jeio77t6bhfzabnstz7izps2o5nv4vy",
     "collection": "app.bsky.feed.post",
-    "cid": "bafyreiarkqkgkzjjdcmij5j2ehefscbp6jwjopibyaufs64fjw4kenibz4",
-    "time": "2026-09-18T14:02:11.483920Z",
+    "did": "did:plc:hzzwseuuw5eshd5bdt3uleo6",
+    "operation": "create",
     "record": {
       "$type": "app.bsky.feed.post",
-      "createdAt": "2026-09-18T14:02:11.483Z",
-      "text": "quoting this one",
+      "createdAt": "2026-09-17T23:29:14.619Z",
       "embed": {
-        "$type": "app.bsky.embed.record",
+        "$type": "app.bsky.embed.recordWithMedia",
+        "media": {
+          "$type": "app.bsky.embed.external",
+          "external": {
+            "description": "Visit Eltalite Illustration at Ko-fi for 15% discount off on sale",
+            "thumb": {
+              "$type": "blob",
+              "mimeType": "image/jpeg",
+              "ref": {
+                "$link": "bafkreiadjmt247y442jyt5hbmqorvf6wu4cmqsvxsrgiqqtaaaoco2zlli"
+              },
+              "size": 178011
+            },
+            "title": "15% discount off Eltalite Illustration's on sale",
+            "uri": "https://ko-fi.com/eltalite/link/FERRINUFF"
+          }
+        },
         "record": {
-          "uri": "at://did:plc:plcl43vt7d2ig7hif4zmyg6h/app.bsky.feed.post/3mv45xxdbx22k",
-          "cid": "bafyreiarkqkgkzjjdcmij5j2ehefscbp6jwjopibyaufs64fjw4kenibz4"
+          "$type": "app.bsky.embed.record",
+          "record": {
+            "cid": "bafyreififpkyznublfscdxvxmnpcppg4b2svib47xvxsmeppufiru74rte",
+            "uri": "at://did:plc:hzzwseuuw5eshd5bdt3uleo6/app.bsky.feed.post/3mu6ks2ljsk2q"
+          }
         }
       },
-      "langs": ["en"]
-    }
+      "facets": [
+        {
+          "features": [
+            {
+              "$type": "app.bsky.richtext.facet#link",
+              "uri": "https://ko-fi.com/eltalite/link/FERRINUFF"
+            }
+          ],
+          "index": {
+            "byteEnd": 135,
+            "byteStart": 110
+          }
+        }
+      ],
+      "langs": [
+        "en"
+      ],
+      "text": "I've given up on getting my ideal price for this, so she's now $175 USD! :3 Or about $148 with the discount.\n\nko-fi.com/eltalite/lin..."
+    },
+    "rev": "3mvqsnhmvci2e",
+    "rkey": "3mvqsnhyy5s2k",
+    "seq": 26036297537,
+    "time": "2026-09-17T23:29:14.756217Z"
   }
 }

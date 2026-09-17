@@ -1,10 +1,13 @@
 {
   "$type": "message",
-  "seq": 1274839412,
   "payload": {
-    "$type": "#commit",
-    "operation": "delete",
+    "$type": "network.bsky.jetstream.subscribeEvents#commit",
     "collection": "app.bsky.feed.post",
-    "time": "2026-09-18T14:02:22.771003Z"
+    "did": "did:plc:7prymsquujrjcjwxaqt6lx2s",
+    "operation": "delete",
+    "rev": "3mvqsnicwkz23",
+    "rkey": "3mvqsjzjig22z",
+    "seq": 26036297638,
+    "time": "2026-09-17T23:29:15.062752Z"
   }
 }

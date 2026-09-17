@@ -5,38 +5,43 @@
 //! Jetstream release is ignored, not an error. Only a genuinely malformed
 //! shape, such as an unknown `operation` string (BC8), is a decode error,
 //! and that error is `client.rs`'s to catch.
+//!
+//! The envelope holds exactly `$type` and `payload`: `seq`, `did`, `rkey`
+//! and `rev` live inside `payload`, verified against a live capture, not on
+//! the envelope as an earlier draft of this module assumed. `payload.$type`
+//! is the full name Jetstream sends, `network.bsky.jetstream.subscribeEvents#commit`
+//! and its siblings, not the short `#commit`.
 
 use chrono::{DateTime, FixedOffset};
 use serde::Deserialize;
 
-/// The outer envelope of one decoded frame,
-/// `{"$type":"message","seq":<u64>,"payload":{...}}`. A `kind` other than
-/// `"message"` still decodes (BC1): `client.rs` reads the next frame rather
-/// than treating it as an error.
+/// The outer envelope of one decoded frame, `{"$type":"message","payload":{...}}`.
+/// A `kind` other than `"message"` still decodes (BC1): `client.rs` reads
+/// the next frame rather than treating it as an error.
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Frame {
     #[serde(rename = "$type")]
     pub kind: String,
-    pub seq: u64,
     pub payload: Payload,
 }
 
-/// `payload.$type`, internally tagged. `Commit` and `Info` carry the data
-/// `client.rs` returns to the caller; `Identity`, `Account` and `Sync` are
-/// consumed internally (BC4); `Other` catches every payload kind this
-/// module does not name, including a future one (BC5).
+/// `payload.$type`, internally tagged with the full name Jetstream sends.
+/// `Commit` and `Info` carry the data `client.rs` returns to the caller;
+/// `Identity`, `Account` and `Sync` are consumed internally (BC4); `Other`
+/// catches every payload kind this module does not name, including a
+/// future one (BC5).
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(tag = "$type")]
 pub enum Payload {
-    #[serde(rename = "#commit")]
+    #[serde(rename = "network.bsky.jetstream.subscribeEvents#commit")]
     Commit(CommitEvent),
-    #[serde(rename = "#identity")]
+    #[serde(rename = "network.bsky.jetstream.subscribeEvents#identity")]
     Identity {},
-    #[serde(rename = "#account")]
+    #[serde(rename = "network.bsky.jetstream.subscribeEvents#account")]
     Account {},
-    #[serde(rename = "#sync")]
+    #[serde(rename = "network.bsky.jetstream.subscribeEvents#sync")]
     Sync {},
-    #[serde(rename = "#info")]
+    #[serde(rename = "network.bsky.jetstream.subscribeEvents#info")]
     Info { name: String, message: String },
     #[serde(other)]
     Other,
@@ -54,17 +59,23 @@ pub enum Operation {
     Delete,
 }
 
-/// A decoded `#commit` payload. `record` and `cid` are `None` on a delete,
-/// which carries neither (BC6). `time` is kept verbatim; `time_micros` and
-/// `time_secs` parse it lazily so an unparseable value (BC11) never fails
-/// decoding itself.
+/// A decoded `#commit` payload, all nine fields TECH-DESIGN section 5.1
+/// step 4 lists. `record` and `cid` are `None` on a delete, which carries
+/// neither (BC6). `time` is kept verbatim; `time_micros` and `time_secs`
+/// parse it lazily so an unparseable value (BC11) never fails decoding
+/// itself. Story 06 builds `at://{did}/{collection}/{rkey}` from `did`,
+/// `collection` and `rkey`, so none of the nine may be dropped.
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct CommitEvent {
+    pub did: String,
+    pub seq: u64,
+    pub time: String,
     pub operation: Operation,
     pub collection: String,
-    pub record: Option<serde_json::Value>,
+    pub rkey: String,
+    pub rev: String,
     pub cid: Option<String>,
-    pub time: String,
+    pub record: Option<serde_json::Value>,
 }
 
 impl CommitEvent {
@@ -115,6 +126,10 @@ mod tests {
             Payload::Commit(commit) => {
                 assert_eq!(commit.operation, Operation::Create);
                 assert_eq!(commit.collection, "app.bsky.feed.post");
+                assert!(!commit.did.is_empty());
+                assert!(!commit.rkey.is_empty());
+                assert!(!commit.rev.is_empty());
+                assert!(commit.seq > 0);
                 assert!(commit.record.is_some());
                 assert!(commit.cid.is_some());
             }
@@ -135,6 +150,30 @@ mod tests {
     }
 
     #[test]
+    fn commit_repost_decodes_as_create() {
+        let frame = decode("jetstream_commit_repost.json");
+        match frame.payload {
+            Payload::Commit(commit) => {
+                assert_eq!(commit.operation, Operation::Create);
+                assert_eq!(commit.collection, "app.bsky.feed.repost");
+            }
+            other => panic!("expected Payload::Commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_postgate_decodes_as_create() {
+        let frame = decode("jetstream_commit_postgate.json");
+        match frame.payload {
+            Payload::Commit(commit) => {
+                assert_eq!(commit.operation, Operation::Create);
+                assert_eq!(commit.collection, "app.bsky.feed.postgate");
+            }
+            other => panic!("expected Payload::Commit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn commit_delete_has_no_record_and_no_cid() {
         // BC6: a delete carries neither `record` nor `cid`.
         let frame = decode("jetstream_commit_delete.json");
@@ -143,6 +182,7 @@ mod tests {
                 assert_eq!(commit.operation, Operation::Delete);
                 assert_eq!(commit.record, None);
                 assert_eq!(commit.cid, None);
+                assert!(!commit.rkey.is_empty());
             }
             other => panic!("expected Payload::Commit, got {other:?}"),
         }
@@ -161,7 +201,7 @@ mod tests {
     fn unknown_payload_type_becomes_other() {
         // BC5: an unknown `payload.$type` decodes to `Payload::Other`,
         // never a serde error.
-        let raw = r##"{"$type":"message","seq":1,"payload":{"$type":"#futurething","foo":"bar"}}"##;
+        let raw = r##"{"$type":"message","payload":{"$type":"#futurething","foo":"bar"}}"##;
         let frame: Frame = serde_json::from_str(raw).unwrap();
         assert_eq!(frame.payload, Payload::Other);
     }
@@ -171,12 +211,12 @@ mod tests {
         // BC4: these are consumed internally by `client.rs`, but they must
         // still decode here rather than fall through to `Other`.
         for (kind, expected) in [
-            ("#identity", Payload::Identity {}),
-            ("#account", Payload::Account {}),
-            ("#sync", Payload::Sync {}),
+            ("network.bsky.jetstream.subscribeEvents#identity", Payload::Identity {}),
+            ("network.bsky.jetstream.subscribeEvents#account", Payload::Account {}),
+            ("network.bsky.jetstream.subscribeEvents#sync", Payload::Sync {}),
         ] {
             let raw = format!(
-                r##"{{"$type":"message","seq":1,"payload":{{"$type":"{kind}","did":"did:plc:abc"}}}}"##
+                r##"{{"$type":"message","payload":{{"$type":"{kind}","did":"did:plc:abc"}}}}"##
             );
             let frame: Frame = serde_json::from_str(&raw).unwrap();
             assert_eq!(frame.payload, expected);
@@ -187,8 +227,7 @@ mod tests {
     fn non_message_envelope_still_decodes() {
         // BC1: an envelope `$type` other than `"message"` is not an error;
         // `client.rs` reads the next frame instead.
-        let raw =
-            r##"{"$type":"ping","seq":1,"payload":{"$type":"#identity","did":"did:plc:abc"}}"##;
+        let raw = r##"{"$type":"ping","payload":{"$type":"network.bsky.jetstream.subscribeEvents#identity","did":"did:plc:abc"}}"##;
         let frame: Frame = serde_json::from_str(raw).unwrap();
         assert_eq!(frame.kind, "ping");
     }
@@ -198,7 +237,7 @@ mod tests {
         // BC7: `create`, `update` and `delete` each decode to the matching
         // `Operation` variant. The fixtures cover `create` and `delete`;
         // this covers `update`.
-        let raw = r##"{"$type":"message","seq":1,"payload":{"$type":"#commit","operation":"update","collection":"app.bsky.feed.post","time":"2026-09-18T00:00:00.000000Z"}}"##;
+        let raw = r##"{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","did":"did:plc:abc","seq":1,"time":"2026-09-18T00:00:00.000000Z","operation":"update","collection":"app.bsky.feed.post","rkey":"abc123","rev":"rev123"}}"##;
         let frame: Frame = serde_json::from_str(raw).unwrap();
         match frame.payload {
             Payload::Commit(commit) => assert_eq!(commit.operation, Operation::Update),
@@ -210,7 +249,7 @@ mod tests {
     fn unknown_operation_is_a_decode_error() {
         // BC8: unlike an unknown payload `$type`, an unknown `operation` is
         // a finite-set violation, not forward compatibility.
-        let raw = r##"{"$type":"message","seq":1,"payload":{"$type":"#commit","operation":"upsert","collection":"app.bsky.feed.post","time":"2026-09-18T00:00:00.000000Z"}}"##;
+        let raw = r##"{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","did":"did:plc:abc","seq":1,"time":"2026-09-18T00:00:00.000000Z","operation":"upsert","collection":"app.bsky.feed.post","rkey":"abc123","rev":"rev123"}}"##;
         let result: Result<Frame, _> = serde_json::from_str(raw);
         assert!(result.is_err());
     }
@@ -229,11 +268,15 @@ mod tests {
     fn unparseable_time_returns_none() {
         // BC11: decoding still succeeds; only the helpers return `None`.
         let commit = CommitEvent {
+            did: "did:plc:abc".to_string(),
+            seq: 1,
+            time: "not-a-timestamp".to_string(),
             operation: Operation::Create,
             collection: "app.bsky.feed.post".to_string(),
-            record: None,
+            rkey: "abc123".to_string(),
+            rev: "rev123".to_string(),
             cid: None,
-            time: "not-a-timestamp".to_string(),
+            record: None,
         };
         assert_eq!(commit.time_micros(), None);
         assert_eq!(commit.time_secs(), None);
