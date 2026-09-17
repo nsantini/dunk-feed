@@ -74,7 +74,7 @@ src/
     event.rs                 serde types for the v2 envelope and payloads
   ingest/
     mod.rs                   the task: event -> Op, batching, stats
-    embed.rs                 quote detection, pure
+    embed.rs                 quote detection, pure. Built in story 02, used by validate and ingest
     hotset.rs                HashSet<u64> of URI hashes, pure
   store/
     mod.rs                   Store handle, open, migrate
@@ -135,6 +135,7 @@ once at start and fails fast on a bad value.
 | `DUNK_SCORER_INTERVAL_S` | `60` | |
 | `DUNK_REVERIFY_INTERVAL_S` | `600` | Promoted pairs under 48 h old |
 | `DUNK_FOLLOWER_FLOOR` | `2000` | Guard, section 9. `0` disables |
+| `DUNK_DROP_LABELS` | `porn,sexual,graphic-media,nudity,!hide,!warn,spam` | Comma-separated label values that drop a pair. Section 9 |
 | `DUNK_PREFILTER_FRACTION` | `0.5` | Local `E` must reach `P * fraction` before an App View call |
 | `DUNK_APPVIEW_RPS` | `1.0` | Verifier rate limit |
 | `DUNK_LOG` | `info` | `tracing` filter |
@@ -517,11 +518,11 @@ PRD's phases with phase 0 first, as the PRD insists.
 | # | Story | PRD phase | Follows |
 |---|---|---|---|
 | 01 | Crate scaffold, config, CLI, gates green | — | — |
-| 02 | Score module and App View client | 0 | 01 |
+| 02 | Score module, quote detector, App View client | 0 | 01 |
 | 03 | `dunk validate` phase 0 tool | 0 | 02 |
 | 04 | Jetstream v2 client | 1 | 01 |
 | 05 | SQLite store, schema, writer, checkpoint | 1 | 01 |
-| 06 | Ingest task: embed, hot set, ops, stats | 1 | 04, 05 |
+| 06 | Ingest task: hot set, ops, stats | 1 | 02, 04, 05 |
 | 07 | Scorer task: select, verify, promote, expire, snapshot, caps | 1 | 02, 05, 06 |
 | 08 | HTTP serving: did, describe, skeleton, interactions, health | 2 | 07 |
 | 09 | `dunk publish` | 2 | 08 |
