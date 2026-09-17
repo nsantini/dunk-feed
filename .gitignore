@@ -1,0 +1,15 @@
+# Workflow plugin state (per PROTOCOL.md)
+.workflow/
+
+# Rust
+/target/
+
+# Local data and secrets
+/data/
+*.db
+*.db-wal
+*.db-shm
+.env
+
+# OS
+.DS_Store
