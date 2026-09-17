@@ -1,0 +1,10 @@
+{
+  "$type": "message",
+  "seq": 1274839412,
+  "payload": {
+    "$type": "#commit",
+    "operation": "delete",
+    "collection": "app.bsky.feed.post",
+    "time": "2026-09-18T14:02:22.771003Z"
+  }
+}

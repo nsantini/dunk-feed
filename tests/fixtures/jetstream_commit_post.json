@@ -1,0 +1,24 @@
+{
+  "$type": "message",
+  "seq": 1274839201,
+  "payload": {
+    "$type": "#commit",
+    "operation": "create",
+    "collection": "app.bsky.feed.post",
+    "cid": "bafyreiarkqkgkzjjdcmij5j2ehefscbp6jwjopibyaufs64fjw4kenibz4",
+    "time": "2026-09-18T14:02:11.483920Z",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "createdAt": "2026-09-18T14:02:11.483Z",
+      "text": "quoting this one",
+      "embed": {
+        "$type": "app.bsky.embed.record",
+        "record": {
+          "uri": "at://did:plc:plcl43vt7d2ig7hif4zmyg6h/app.bsky.feed.post/3mv45xxdbx22k",
+          "cid": "bafyreiarkqkgkzjjdcmij5j2ehefscbp6jwjopibyaufs64fjw4kenibz4"
+        }
+      },
+      "langs": ["en"]
+    }
+  }
+}

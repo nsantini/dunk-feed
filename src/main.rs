@@ -6,6 +6,7 @@ mod appview;
 mod cli;
 mod config;
 mod ingest;
+mod jetstream;
 mod score;
 mod validate;
 
