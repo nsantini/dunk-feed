@@ -194,9 +194,13 @@ mod tests {
         use crate::appview::types::{PostRecord, PostViewAuthor};
         let post = PostView {
             uri: "at://did:plc:abc/app.bsky.feed.post/xyz".to_string(),
+            cid: "bafyabc123".to_string(),
             author: PostViewAuthor { did: "did:plc:abc".to_string() },
             labels: vec![],
-            record: PostRecord { created_at: "2026-01-01T00:00:00Z".to_string() },
+            record: PostRecord {
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                rest: serde_json::json!({}),
+            },
             like_count: 10,
             repost_count: 2,
             reply_count: 1,

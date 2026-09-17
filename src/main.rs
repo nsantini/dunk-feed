@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod ingest;
 mod score;
+mod validate;
 
 use clap::Parser;
 use cli::Cli;

@@ -23,13 +23,19 @@ pub struct PostViewAuthor {
     pub did: String,
 }
 
-/// `postView.record`, TECH-DESIGN section 8.2's `record.createdAt`. The
-/// record's own `embed` is not read here; `postView.embed`, the App View's
-/// hydrated view, is what a guard walks instead.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// `postView.record`, TECH-DESIGN section 8.2's `record.createdAt`. `rest`
+/// keeps every other field of the record, `$type`, `embed`, `facets` and the
+/// rest, as one JSON object: `dunk validate` (story 03) passes it straight
+/// to `ingest::embed::detect`, which reads the record's own `embed`, not
+/// `postView.embed`, the App View's separate hydrated view a guard walks
+/// instead (story 07). `PostRecord` cannot derive `Eq`: `serde_json::Value`
+/// does not implement it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostRecord {
     pub created_at: String,
+    #[serde(flatten)]
+    pub rest: serde_json::Value,
 }
 
 /// The embedded post inside `app.bsky.embed.record#view` or the media
@@ -95,6 +101,7 @@ pub struct RecordWithMediaInner {
 #[serde(rename_all = "camelCase")]
 pub struct PostView {
     pub uri: String,
+    pub cid: String,
     pub author: PostViewAuthor,
     #[serde(default)]
     pub labels: Vec<Label>,
