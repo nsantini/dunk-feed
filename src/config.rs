@@ -93,6 +93,51 @@ where
     }
 }
 
+/// Validates `DUNK_LOG` with `EnvFilter::try_new`, falling back to `default`
+/// when unset (BC9). A malformed filter directive is invalid (BC14): it must
+/// never degrade silently to error-only logging, so it is rejected here
+/// rather than left for `tracing_subscriber` to swallow later.
+fn log_filter_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: &str,
+) -> Result<String, ConfigError> {
+    let raw = string_or_default(lookup, name, default);
+    tracing_subscriber::EnvFilter::try_new(&raw).map_err(|err| ConfigError::Invalid {
+        name,
+        value: raw.clone(),
+        reason: err.to_string(),
+    })?;
+    Ok(raw)
+}
+
+/// Parses an `f64` variable via [`number_or_default`], then rejects a
+/// non-finite value (BC15) or a negative one (BC16). Every `f64` field in
+/// `Config` uses this instead of `number_or_default` directly, because every
+/// one of them must be finite and non-negative.
+fn nonneg_float_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: f64,
+) -> Result<f64, ConfigError> {
+    let value = number_or_default(lookup, name, default)?;
+    if !value.is_finite() {
+        return Err(ConfigError::Invalid {
+            name,
+            value: value.to_string(),
+            reason: "not a finite number".to_string(),
+        });
+    }
+    if value < 0.0 {
+        return Err(ConfigError::Invalid {
+            name,
+            value: value.to_string(),
+            reason: "must be >= 0".to_string(),
+        });
+    }
+    Ok(value)
+}
+
 /// Splits `DUNK_DROP_LABELS` on `,`, trims each entry, and drops empty
 /// entries (BC10). Falls back to `default` when unset (BC9). An empty or
 /// whitespace-only value is malformed, the same rule as an empty number
@@ -134,11 +179,11 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
             "wss://jetstream.us-east.bsky.network",
         ),
         appview_url: string_or_default(&lookup, "DUNK_APPVIEW_URL", "https://public.api.bsky.app"),
-        w_repost: number_or_default(&lookup, "DUNK_W_REPOST", 2.0)?,
-        w_reply: number_or_default(&lookup, "DUNK_W_REPLY", 0.5)?,
+        w_repost: nonneg_float_or_default(&lookup, "DUNK_W_REPOST", 2.0)?,
+        w_reply: nonneg_float_or_default(&lookup, "DUNK_W_REPLY", 0.5)?,
         k: number_or_default(&lookup, "DUNK_K", 5)?,
         p: number_or_default(&lookup, "DUNK_P", 50)?,
-        m: number_or_default(&lookup, "DUNK_M", 1.25)?,
+        m: nonneg_float_or_default(&lookup, "DUNK_M", 1.25)?,
         candidate_ttl_h: number_or_default(&lookup, "DUNK_CANDIDATE_TTL_H", 48)?,
         feed_ttl_d: number_or_default(&lookup, "DUNK_FEED_TTL_D", 30)?,
         scorer_interval_s: number_or_default(&lookup, "DUNK_SCORER_INTERVAL_S", 60)?,
@@ -149,9 +194,9 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
             "DUNK_DROP_LABELS",
             "porn,sexual,graphic-media,nudity,!hide,!warn,spam",
         )?,
-        prefilter_fraction: number_or_default(&lookup, "DUNK_PREFILTER_FRACTION", 0.5)?,
-        appview_rps: number_or_default(&lookup, "DUNK_APPVIEW_RPS", 1.0)?,
-        log: string_or_default(&lookup, "DUNK_LOG", "info"),
+        prefilter_fraction: nonneg_float_or_default(&lookup, "DUNK_PREFILTER_FRACTION", 0.5)?,
+        appview_rps: nonneg_float_or_default(&lookup, "DUNK_APPVIEW_RPS", 1.0)?,
+        log: log_filter_or_default(&lookup, "DUNK_LOG", "info")?,
         bsky_handle: optional(&lookup, "BSKY_HANDLE"),
         bsky_app_password: optional(&lookup, "BSKY_APP_PASSWORD"),
     })
@@ -287,5 +332,66 @@ mod tests {
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.bsky_handle, Some("dunk.bsky.social".to_string()));
         assert_eq!(config.bsky_app_password, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn malformed_log_filter_fails() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_LOG", "target=notalevel"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_LOG"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_log_filter_is_accepted() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_LOG", "debug,dunk=trace"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.log, "debug,dunk=trace");
+    }
+
+    #[test]
+    fn nan_weight_is_malformed() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_W_REPOST", "nan"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "DUNK_W_REPOST");
+                assert_eq!(reason, "not a finite number");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn infinite_weight_is_malformed() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_APPVIEW_RPS", "inf"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "DUNK_APPVIEW_RPS");
+                assert_eq!(reason, "not a finite number");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_weight_is_malformed() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_M", "-1.0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "DUNK_M");
+                assert_eq!(reason, "must be >= 0");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 }

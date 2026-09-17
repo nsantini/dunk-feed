@@ -15,7 +15,9 @@ fn main() -> anyhow::Result<()> {
     let lookup = |name: &str| std::env::var(name).ok();
     let config = config::load(lookup).map_err(|err| anyhow::anyhow!("config error: {err}"))?;
 
-    tracing_subscriber::fmt().json().with_env_filter(EnvFilter::new(config.log)).init();
+    let filter = EnvFilter::try_new(&config.log)
+        .expect("config::load already validates DUNK_LOG with EnvFilter::try_new");
+    tracing_subscriber::fmt().json().with_env_filter(filter).init();
 
     cli.command.run();
 
