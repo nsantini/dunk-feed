@@ -1,4 +1,4 @@
-//! Typed client over the App View, TECH-DESIGN section 8. `hand-written
+//! Typed client over the App View, TECH-DESIGN section 8. Hand-written
 //! `serde` structs, not `atrium-api` (section 1 rejects it for its size).
 //! One `reqwest::Client`, rate limited, retried on 429 and 5xx with
 //! backoff, and batched at the sizes section 8.1 gives. `validate` (story
@@ -433,6 +433,9 @@ mod tests {
     fn detached_embed_decodes_into_the_catch_all_variant() {
         // BC13: a `record.$type` of `#viewDetached` is not `#viewRecord`,
         // so it decodes into `RecordViewInner::Other`, not an error.
+        // `getposts_view_detached.json` is hand-edited from a recorded
+        // `getPosts` body: no live post with a detached quote was found
+        // to record one directly.
         let decoded: GetPostsResponse =
             serde_json::from_str(GETPOSTS_VIEW_DETACHED).expect("fixture decodes");
         let post = &decoded.posts[0];
