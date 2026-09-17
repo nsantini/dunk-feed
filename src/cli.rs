@@ -165,4 +165,27 @@ mod tests {
         let err = Cli::try_parse_from(["dunk"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
     }
+
+    #[tokio::test]
+    async fn validate_with_zero_pages_makes_no_call() {
+        // Finding 5, BC13: `pages == 0` with no `--seed-file` makes no
+        // network call at all. `DUNK_APPVIEW_URL` points at a local address
+        // nothing listens on, so a call that did go out would fail or hang
+        // instead of returning `Ok`.
+        let lookup = |name: &str| match name {
+            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
+            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "DUNK_APPVIEW_URL" => Some("http://127.0.0.1:9".to_string()),
+            _ => None,
+        };
+        let config = crate::config::load(lookup).expect("minimal config loads");
+        let csv_path = std::env::temp_dir().join("dunk-validate-zero-pages-test.csv");
+        let command = Command::Validate { pages: 0, seed_file: None, csv_path: csv_path.clone() };
+
+        dispatch(&command, &config).await.expect("zero pages with no seed file makes no call");
+
+        let written = std::fs::read_to_string(&csv_path).expect("csv was written");
+        assert_eq!(written.lines().count(), 1); // header only, zero rows
+        let _ = std::fs::remove_file(&csv_path);
+    }
 }

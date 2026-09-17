@@ -73,11 +73,25 @@ pub fn ratio(eq: f64, eo: f64, k: f64) -> f64 {
     eq / (eo + k)
 }
 
-/// `max(eo, eq) >= P && D >= M`. Both boundaries are `>=`, not `>`, so a pair
-/// sitting exactly on the floor or the multiplier qualifies.
+/// The popularity gate: `max(eo, eq) >= P`. `>=`, not `>`, so a pair sitting
+/// exactly on the floor clears it. `validate` (story 03) calls this directly,
+/// instead of its own inline comparison, so the two never drift apart.
+pub fn clears_floor(eq: f64, eo: f64, thresholds: &Thresholds) -> bool {
+    eo.max(eq) >= thresholds.p
+}
+
+/// The margin gate: `D >= M`, `D` already computed by [`ratio`]. `>=`, not
+/// `>`, so a pair sitting exactly on the multiplier clears it. `validate`
+/// (story 03) calls this directly, instead of its own inline comparison, so
+/// the two never drift apart.
+pub fn clears_margin(d: f64, thresholds: &Thresholds) -> bool {
+    d >= thresholds.m
+}
+
+/// `max(eo, eq) >= P && D >= M`.
 pub fn qualifies(eq: f64, eo: f64, thresholds: &Thresholds) -> bool {
     let d = ratio(eq, eo, thresholds.k);
-    eo.max(eq) >= thresholds.p && d >= thresholds.m
+    clears_floor(eq, eo, thresholds) && clears_margin(d, thresholds)
 }
 
 /// `D * log10(1 + eq) / (age_hours + 2)^1.5`. Strictly decreasing in
@@ -141,6 +155,20 @@ mod tests {
         let t = thresholds(5.0, 50.0, 1.25);
         // eq well above p, but d well below m.
         assert!(!qualifies(50.0, 1000.0, &t));
+    }
+
+    #[test]
+    fn clears_floor_true_on_exact_boundary() {
+        let t = thresholds(5.0, 50.0, 1.25);
+        assert!(clears_floor(50.0, 0.0, &t));
+        assert!(!clears_floor(49.0, 49.0, &t));
+    }
+
+    #[test]
+    fn clears_margin_true_on_exact_boundary() {
+        let t = thresholds(5.0, 50.0, 1.25);
+        assert!(clears_margin(1.25, &t));
+        assert!(!clears_margin(1.249999, &t));
     }
 
     #[test]

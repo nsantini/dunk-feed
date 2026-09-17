@@ -30,24 +30,27 @@ pub const HOT_CLASSIC_FEED: &str =
     "at://did:plc:z72i7hdynmk6r22z27h6tvur/app.bsky.feed.generator/hot-classic";
 
 /// Why a row carries no score, printed in place of its numbers. Every
-/// variant maps to the exact reason string TECH-DESIGN section 10 and the
-/// spec's behaviour contracts name.
+/// variant maps to the exact reason string TECH-DESIGN section 8.3 and
+/// section 10, and the spec's behaviour contracts, name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     /// BC4: the quote and the original share one author.
     SelfQuote,
     /// BC5: the original is absent from the `getPosts` result map, and the
-    /// quote's own hydrated embed gives no more specific reason.
+    /// quote's own hydrated embed gives no more specific reason. BC21: also
+    /// the reason when the quote's hydrated `postView.embed` itself names
+    /// the original `#viewNotFound`.
     OriginalGone,
     /// BC21: the quote's hydrated `postView.embed` names the original
-    /// `#viewNotFound`.
-    OriginalNotFound,
-    /// BC21: the quote's hydrated `postView.embed` names the original
     /// `#viewBlocked`.
-    OriginalBlocked,
+    Blocked,
     /// BC21: the quote's hydrated `postView.embed` names the original
     /// `#viewDetached`.
-    OriginalDetached,
+    Detached,
+    /// BC24: the quote's hydrated `postView.embed` inner `$type` is present
+    /// but names none of `#viewRecord`, `#viewNotFound`, `#viewBlocked` or
+    /// `#viewDetached`.
+    NotAPost,
     /// BC9: a `--seed-file` URI absent from the `getPosts` result map.
     QuoteGone,
 }
@@ -58,9 +61,9 @@ impl Reason {
         match self {
             Reason::SelfQuote => "self_quote",
             Reason::OriginalGone => "original_gone",
-            Reason::OriginalNotFound => "original_not_found",
-            Reason::OriginalBlocked => "original_blocked",
-            Reason::OriginalDetached => "original_detached",
+            Reason::Blocked => "blocked",
+            Reason::Detached => "detached",
+            Reason::NotAPost => "not_a_post",
             Reason::QuoteGone => "quote_gone",
         }
     }
@@ -122,33 +125,67 @@ pub fn candidates(posts: Vec<PostView>) -> Vec<Candidate> {
     out
 }
 
-/// The reason BC21 assigns when the original is absent from `originals`:
-/// the quote's own hydrated `postView.embed` names why, when it can, and
-/// falls back to the generic `OriginalGone` (BC5) otherwise.
-fn reason_for_missing_original(quote: &PostView) -> Reason {
-    let inner = match &quote.embed {
+/// The quote's own hydrated `postView.embed` inner record view, when its
+/// outer `$type` is `app.bsky.embed.record#view` or
+/// `app.bsky.embed.recordWithMedia#view`. `None` when the hydrated embed is
+/// absent entirely or decoded as `EmbedView::Other`: BC25 falls through to
+/// the `getPosts` map in either case, since neither tells us anything about
+/// the original.
+fn inner_view(quote: &PostView) -> Option<&RecordViewInner> {
+    match &quote.embed {
         Some(EmbedView::Record { record }) => Some(record),
         Some(EmbedView::RecordWithMedia { record }) => Some(&record.record),
         _ => None,
-    };
-    match inner {
-        Some(RecordViewInner::ViewNotFound { .. }) => Reason::OriginalNotFound,
-        Some(RecordViewInner::ViewBlocked { .. }) => Reason::OriginalBlocked,
-        Some(RecordViewInner::ViewDetached { .. }) => Reason::OriginalDetached,
-        _ => Reason::OriginalGone,
     }
 }
 
-/// Builds one [`Row`] per candidate, TECH-DESIGN section 10 steps 3 and 4.
-/// A `SelfQuote` candidate never reaches `score.rs`: it is printed with
-/// [`Reason::SelfQuote`] and no score (BC4). A `Scoreable` candidate whose
-/// original is missing from `originals` is printed with the reason
-/// [`reason_for_missing_original`] gives, never dropped (BC5, BC21). A
-/// `Scoreable` candidate whose original is present scores through
-/// `score.rs`'s own `Counts`, `engagement`, `ratio` and `rank`, with
-/// `age_hours` clamped at zero (BC16) and the two gates (BC17, BC18) read
-/// off `thresholds` directly rather than through `score::qualifies`, which
-/// only returns their conjunction.
+/// The unscored row a `Scoreable` candidate's hydrated embed view assigns on
+/// its own, before any `getPosts` lookup happens (finding 1, BC21, BC24):
+/// `#viewDetached` is `detached`, `#viewBlocked` is `blocked`, and any other
+/// named `$type` `RecordViewInner::Other` decodes to is `not_a_post`.
+/// `#viewNotFound` and `#viewRecord` both return `None`: the former still
+/// needs the generic `original_gone` a missing map entry gives (BC5), and
+/// the latter must still be scored.
+fn reason_from_inner_view(inner: &RecordViewInner) -> Option<Reason> {
+    match inner {
+        RecordViewInner::ViewDetached { .. } => Some(Reason::Detached),
+        RecordViewInner::ViewBlocked { .. } => Some(Reason::Blocked),
+        RecordViewInner::Other => Some(Reason::NotAPost),
+        RecordViewInner::ViewNotFound { .. } | RecordViewInner::ViewRecord(_) => None,
+    }
+}
+
+/// An unscored [`Row`] for `quote`/`original_uri`, carrying `reason`.
+fn unscored_row(quote: &PostView, original_uri: &AtUri, reason: Reason) -> Row {
+    Row {
+        quote_uri: quote.uri.clone(),
+        quote_cid: quote.cid.clone(),
+        original_uri: original_uri.as_str().to_string(),
+        eq: None,
+        eo: None,
+        ratio: None,
+        rank: None,
+        popularity_pass: None,
+        margin_pass: None,
+        reason: Some(reason),
+    }
+}
+
+/// Builds one [`Row`] per candidate, TECH-DESIGN section 10 steps 3 and 4,
+/// and section 8.2 and 8.3 for the embed-view check. A `SelfQuote`
+/// candidate never reaches `score.rs`: it is printed with
+/// [`Reason::SelfQuote`] and no score (BC4). A `Scoreable` candidate's own
+/// hydrated `postView.embed` is read first, before any `getPosts` lookup
+/// (finding 1): a `#viewDetached` or `#viewBlocked` original, or an inner
+/// view that names neither a post nor an absence, is printed with its own
+/// reason and never scored, even when `originals` already holds that URI
+/// (BC21, BC24). Only `#viewNotFound`, a `#viewRecord`, or no inner view at
+/// all falls through to the `originals` lookup (BC25); a miss there is
+/// `original_gone` (BC5), and a hit scores through `score.rs`'s own
+/// `Counts`, `engagement`, `ratio` and `rank`, with `age_hours` clamped at
+/// zero (BC16) and the two gates (BC17, BC18) read off `thresholds` through
+/// `score::clears_floor` and `score::clears_margin` rather than through
+/// `score::qualifies`, which only returns their conjunction.
 pub fn build_rows(
     candidates: Vec<Candidate>,
     originals: &HashMap<String, PostView>,
@@ -159,19 +196,13 @@ pub fn build_rows(
     candidates
         .into_iter()
         .map(|candidate| match candidate {
-            Candidate::SelfQuote { quote, original_uri } => Row {
-                quote_uri: quote.uri.clone(),
-                quote_cid: quote.cid.clone(),
-                original_uri: original_uri.as_str().to_string(),
-                eq: None,
-                eo: None,
-                ratio: None,
-                rank: None,
-                popularity_pass: None,
-                margin_pass: None,
-                reason: Some(Reason::SelfQuote),
-            },
+            Candidate::SelfQuote { quote, original_uri } => {
+                unscored_row(&quote, &original_uri, Reason::SelfQuote)
+            }
             Candidate::Scoreable { quote, original_uri } => {
+                if let Some(reason) = inner_view(&quote).and_then(reason_from_inner_view) {
+                    return unscored_row(&quote, &original_uri, reason);
+                }
                 match originals.get(original_uri.as_str()) {
                     Some(original) => {
                         let eq = score::engagement(&Counts::from(&quote), weights);
@@ -187,26 +218,12 @@ pub fn build_rows(
                             eo: Some(eo),
                             ratio: Some(d),
                             rank: Some(rank),
-                            popularity_pass: Some(eo.max(eq) >= thresholds.p),
-                            margin_pass: Some(d >= thresholds.m),
+                            popularity_pass: Some(score::clears_floor(eq, eo, thresholds)),
+                            margin_pass: Some(score::clears_margin(d, thresholds)),
                             reason: None,
                         }
                     }
-                    None => {
-                        let reason = reason_for_missing_original(&quote);
-                        Row {
-                            quote_uri: quote.uri.clone(),
-                            quote_cid: quote.cid.clone(),
-                            original_uri: original_uri.as_str().to_string(),
-                            eq: None,
-                            eo: None,
-                            ratio: None,
-                            rank: None,
-                            popularity_pass: None,
-                            margin_pass: None,
-                            reason: Some(reason),
-                        }
-                    }
+                    None => unscored_row(&quote, &original_uri, Reason::OriginalGone),
                 }
             }
         })
@@ -420,6 +437,52 @@ fn quote_gone_row(uri: &AtUri) -> Row {
     }
 }
 
+/// Deduplicates `items`, keeping first-seen order (finding 3, BC26): sends
+/// each distinct URI to `get_posts` once, and, in the seed-file branch,
+/// prints one `quote_gone` row for a URI repeated in the seed file rather
+/// than one per repetition. `key` extracts the string `get_posts` matches
+/// on, since neither `String` nor `AtUri` needs to implement `Hash` for its
+/// own sake elsewhere in this module.
+fn dedup_first_seen<T>(items: Vec<T>, key: impl Fn(&T) -> String) -> Vec<T> {
+    let mut seen = HashSet::new();
+    items.into_iter().filter(|item| seen.insert(key(item))).collect()
+}
+
+/// The distinct original URIs `run` must resolve via `get_posts`, in
+/// first-seen order (finding 3): two quotes of one original are sent once,
+/// not twice.
+fn distinct_original_uris(candidates: &[Candidate]) -> Vec<String> {
+    let uris: Vec<String> = candidates
+        .iter()
+        .filter_map(|candidate| match candidate {
+            Candidate::Scoreable { original_uri, .. } => Some(original_uri.as_str().to_string()),
+            Candidate::SelfQuote { .. } => None,
+        })
+        .collect();
+    dedup_first_seen(uris, |uri| uri.clone())
+}
+
+/// Splits already-deduplicated `seed_uris` into resolved posts and
+/// [`quote_gone_row`]s (BC9), TECH-DESIGN section 10 step 1. Consumes
+/// `fetched` with `remove` rather than `get` plus `clone` (finding 3), since
+/// each entry is used at most once. Callers pass `seed_uris` through
+/// [`dedup_first_seen`] first (finding 3, BC26): a URI repeated here would
+/// be reported `quote_gone` once per repetition instead of once.
+fn resolve_seed_uris(
+    seed_uris: &[AtUri],
+    mut fetched: HashMap<String, PostView>,
+) -> (Vec<PostView>, Vec<Row>) {
+    let mut found = Vec::new();
+    let mut gone = Vec::new();
+    for uri in seed_uris {
+        match fetched.remove(uri.as_str()) {
+            Some(post) => found.push(post),
+            None => gone.push(quote_gone_row(uri)),
+        }
+    }
+    (found, gone)
+}
+
 /// Pages `HOT_CLASSIC_FEED` up to `pages` times, TECH-DESIGN section 10 step
 /// 1 (BC13: `pages == 0` fetches nothing), stopping early when the App View
 /// returns no cursor.
@@ -473,7 +536,7 @@ pub async fn run(
                     "note: seed file {path:?} yielded no valid URIs, falling back to hot-classic"
                 );
             }
-            uris
+            dedup_first_seen(uris, |uri| uri.as_str().to_string())
         }
         None => Vec::new(),
     };
@@ -485,24 +548,11 @@ pub async fn run(
         let uri_strings: Vec<String> =
             seed_uris.iter().map(|uri| uri.as_str().to_string()).collect();
         let fetched = client.get_posts(&uri_strings).await?;
-        let mut found = Vec::new();
-        let mut gone = Vec::new();
-        for uri in &seed_uris {
-            match fetched.get(uri.as_str()) {
-                Some(post) => found.push(post.clone()),
-                None => gone.push(quote_gone_row(uri)),
-            }
-        }
+        let (found, gone) = resolve_seed_uris(&seed_uris, fetched);
         (candidates(found), gone)
     };
 
-    let original_uris: Vec<String> = candidate_list
-        .iter()
-        .filter_map(|candidate| match candidate {
-            Candidate::Scoreable { original_uri, .. } => Some(original_uri.as_str().to_string()),
-            Candidate::SelfQuote { .. } => None,
-        })
-        .collect();
+    let original_uris = distinct_original_uris(&candidate_list);
     let originals = client.get_posts(&original_uris).await?;
 
     rows.extend(build_rows(candidate_list, &originals, weights, thresholds, now));
@@ -762,29 +812,73 @@ mod tests {
         assert_eq!(rows[0].rank, None);
     }
 
+    /// Builds a `Scoreable` candidate whose quote's hydrated `postView.embed`
+    /// is `{"$type": "app.bsky.embed.record#view", "record": {"$type":
+    /// variant_json, "uri": uri}}`, for the embed-view tests below.
+    fn quote_with_hydrated_variant(uri: &str, variant_json: &str) -> PostView {
+        let hydrated: EmbedView = serde_json::from_value(json!({
+            "$type": "app.bsky.embed.record#view",
+            "record": { "$type": variant_json, "uri": uri }
+        }))
+        .expect("hand-built hydrated embed decodes");
+        let mut quote =
+            post("at://did:plc:a/app.bsky.feed.post/1", "cid1", "did:plc:a", quote_embed(uri));
+        quote.embed = Some(hydrated);
+        quote
+    }
+
     #[test]
     fn missing_original_reads_the_hydrated_embed_reason() {
         // BC21: when the quote's own hydrated `postView.embed` names the
-        // original `#viewNotFound`, `#viewBlocked` or `#viewDetached`, that
-        // reason is used instead of the generic `original_gone`.
+        // original `#viewNotFound`, `#viewBlocked` or `#viewDetached`, and
+        // the original is absent from `originals`, `#viewNotFound` still
+        // reads as the generic `original_gone`; `#viewBlocked` and
+        // `#viewDetached` get their own reasons.
+        let uri = "at://did:plc:b/app.bsky.feed.post/original";
         for (variant_json, expected) in [
-            ("app.bsky.embed.record#viewNotFound", Reason::OriginalNotFound),
-            ("app.bsky.embed.record#viewBlocked", Reason::OriginalBlocked),
-            ("app.bsky.embed.record#viewDetached", Reason::OriginalDetached),
+            ("app.bsky.embed.record#viewNotFound", Reason::OriginalGone),
+            ("app.bsky.embed.record#viewBlocked", Reason::Blocked),
+            ("app.bsky.embed.record#viewDetached", Reason::Detached),
         ] {
-            let uri = "at://did:plc:b/app.bsky.feed.post/original";
-            let hydrated: EmbedView = serde_json::from_value(json!({
-                "$type": "app.bsky.embed.record#view",
-                "record": { "$type": variant_json, "uri": uri }
-            }))
-            .expect("hand-built hydrated embed decodes");
-            let mut quote =
-                post("at://did:plc:a/app.bsky.feed.post/1", "cid1", "did:plc:a", quote_embed(uri));
-            quote.embed = Some(hydrated);
+            let quote = quote_with_hydrated_variant(uri, variant_json);
             let rows = candidates(vec![quote]);
             let rows = build_rows(rows, &HashMap::new(), &weights(), &thresholds(), now());
             assert_eq!(rows[0].reason, Some(expected));
         }
+    }
+
+    #[test]
+    fn detached_quote_is_not_scored() {
+        // AC10, finding 1: a `#viewDetached` quote is printed with reason
+        // `detached` and no score, even when the original is present in
+        // `originals`: the embed-view check runs before the `getPosts`
+        // lookup, so a live original never rescues a detached quote.
+        let uri = "at://did:plc:b/app.bsky.feed.post/original";
+        let quote = quote_with_hydrated_variant(uri, "app.bsky.embed.record#viewDetached");
+        let original = post(uri, "cid-o", "did:plc:b", json!(null));
+        let mut originals = HashMap::new();
+        originals.insert(original.uri.clone(), original);
+
+        let rows =
+            build_rows(candidates(vec![quote]), &originals, &weights(), &thresholds(), now());
+        assert_eq!(rows[0].reason, Some(Reason::Detached));
+        assert_eq!(rows[0].rank, None);
+    }
+
+    #[test]
+    fn other_inner_view_is_not_a_post() {
+        // AC11, BC24: an inner `$type` that decodes to `RecordViewInner::Other`
+        // (neither `#viewRecord`, `#viewNotFound`, `#viewBlocked` nor
+        // `#viewDetached`) is printed with reason `not_a_post`, no score.
+        // The quote's own record embed still names a valid post URI, so
+        // `candidates` classifies it `Scoreable`; only the hydrated view's
+        // inner `$type` is the unexpected one.
+        let uri = "at://did:plc:b/app.bsky.feed.post/original";
+        let quote = quote_with_hydrated_variant(uri, "app.bsky.embed.record#viewUnexpected");
+        let rows = candidates(vec![quote]);
+        let rows = build_rows(rows, &HashMap::new(), &weights(), &thresholds(), now());
+        assert_eq!(rows[0].reason, Some(Reason::NotAPost));
+        assert_eq!(rows[0].rank, None);
     }
 
     #[test]
@@ -990,17 +1084,84 @@ mod tests {
 
     #[test]
     fn fixture_page_yields_candidates() {
-        // AC7: the recorded `hot_classic_page.json` fixture parses and
-        // yields at least one candidate, including at least one self quote,
-        // confirmed live in the page recorded for this fixture.
+        // AC7, finding 4: `hot_classic_page.json` is a 9-post recording
+        // trimmed from one real `getFeed(hot-classic)` page, kept to a
+        // plain record quote, a recordWithMedia quote, a self quote (also
+        // recordWithMedia), an images embed, an external embed, a video
+        // embed, a gallery embed, and a post with no embed at all. Of the
+        // 9, 4 are quotes: 3 `Scoreable` and 1 `SelfQuote`.
         let decoded: GetFeedResponse =
             serde_json::from_str(HOT_CLASSIC_PAGE).expect("fixture decodes as GetFeedResponse");
         let posts: Vec<PostView> = decoded.feed.into_iter().map(|item| item.post).collect();
-        assert!(!posts.is_empty());
+        assert_eq!(posts.len(), 9);
         let result = candidates(posts);
-        assert!(!result.is_empty());
-        assert!(result.iter().any(|c| matches!(c, Candidate::Scoreable { .. })));
-        assert!(result.iter().any(|c| matches!(c, Candidate::SelfQuote { .. })));
+        assert_eq!(result.len(), 4);
+        let scoreable = result.iter().filter(|c| matches!(c, Candidate::Scoreable { .. })).count();
+        let self_quote = result.iter().filter(|c| matches!(c, Candidate::SelfQuote { .. })).count();
+        assert_eq!(scoreable, 3);
+        assert_eq!(self_quote, 1);
+    }
+
+    #[test]
+    fn dedup_first_seen_keeps_first_occurrence() {
+        // Finding 3: a duplicate key keeps its first occurrence and drops
+        // the rest, same order as the input.
+        let result = dedup_first_seen(
+            vec!["a".to_string(), "b".to_string(), "a".to_string(), "c".to_string()],
+            |s| s.clone(),
+        );
+        assert_eq!(result, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn distinct_original_uris_deduplicates_two_quotes_of_one_original() {
+        // Finding 3: two `Scoreable` candidates quoting the same original
+        // are sent to `get_posts` as one URI, not two.
+        let original_uri = AtUri::parse("at://did:plc:b/app.bsky.feed.post/original").unwrap();
+        let quote_a = post(
+            "at://did:plc:a/app.bsky.feed.post/1",
+            "cid1",
+            "did:plc:a",
+            quote_embed(original_uri.as_str()),
+        );
+        let quote_b = post(
+            "at://did:plc:c/app.bsky.feed.post/2",
+            "cid2",
+            "did:plc:c",
+            quote_embed(original_uri.as_str()),
+        );
+        let list = candidates(vec![quote_a, quote_b]);
+        assert_eq!(list.len(), 2);
+        assert_eq!(distinct_original_uris(&list), vec![original_uri.as_str().to_string()]);
+    }
+
+    #[test]
+    fn resolve_seed_uris_reports_one_quote_gone_row_for_a_repeated_missing_uri() {
+        // Finding 3, BC26: a seed URI repeated in the (already deduplicated)
+        // seed list is looked up once and, when missing, printed as one
+        // `quote_gone` row, not one per repetition.
+        let uri = AtUri::parse("at://did:plc:a/app.bsky.feed.post/missing").unwrap();
+        let deduped = dedup_first_seen(vec![uri.clone(), uri.clone()], |u| u.as_str().to_string());
+        assert_eq!(deduped.len(), 1);
+
+        let (found, gone) = resolve_seed_uris(&deduped, HashMap::new());
+        assert!(found.is_empty());
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].reason, Some(Reason::QuoteGone));
+    }
+
+    #[test]
+    fn resolve_seed_uris_removes_found_posts_from_fetched() {
+        // Finding 3: a found URI is taken out of `fetched` with `remove`,
+        // not cloned out with `get`.
+        let uri = AtUri::parse("at://did:plc:a/app.bsky.feed.post/found").unwrap();
+        let post = post(uri.as_str(), "cid1", "did:plc:a", json!(null));
+        let mut fetched = HashMap::new();
+        fetched.insert(uri.as_str().to_string(), post);
+
+        let (found, gone) = resolve_seed_uris(&[uri], fetched);
+        assert_eq!(found.len(), 1);
+        assert!(gone.is_empty());
     }
 
     /// A minimal scored or unscored row, distinguished by `rkey`, which
