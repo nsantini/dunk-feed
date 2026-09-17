@@ -4,6 +4,7 @@
 
 mod cli;
 mod config;
+mod ingest;
 mod score;
 
 use clap::Parser;
