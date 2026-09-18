@@ -277,6 +277,25 @@ impl Store {
         authors::author_put(&conn, row)
     }
 
+    /// Clears the dirty flag on each `post_uri`'s `counts` row. A URI with
+    /// no counts row is skipped, not an error (BC50).
+    pub fn clear_dirty(&self, post_uris: &[&str]) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        counts::clear_dirty(&conn, post_uris)
+    }
+
+    /// Reads one `meta` key. `Ok(None)` when the key has no row (BC67).
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        meta::meta_get(&conn, key)
+    }
+
+    /// Inserts or replaces one `meta` key (BC67).
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        meta::meta_set(&conn, key, value)
+    }
+
     /// Starts the one writer thread with `WriterConfig::default()`
     /// (BC42).
     pub fn writer(&self) -> writer::WriterHandle {
@@ -395,5 +414,46 @@ mod tests {
     fn cursor_is_none_on_a_fresh_store() {
         let store = Store::open_memory().unwrap();
         assert_eq!(store.cursor().unwrap(), None);
+    }
+
+    #[test]
+    fn clear_dirty_clears_the_flag_and_skips_an_unknown_uri() {
+        let store = Store::open_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            counts::incr(&conn, "at://post/1", writer::CountField::Likes, 1).unwrap();
+        }
+
+        // An unknown URI alongside a known one is skipped, not an error.
+        store.clear_dirty(&["at://post/1", "at://post/unknown"]).unwrap();
+
+        let conn = store.lock().unwrap();
+        let dirty: i64 = conn
+            .query_row("SELECT dirty FROM counts WHERE post_uri = 'at://post/1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(dirty, 0);
+    }
+
+    #[test]
+    fn meta_get_of_a_missing_key_is_none() {
+        let store = Store::open_memory().unwrap();
+        assert_eq!(store.meta_get("zstd_dict_id").unwrap(), None);
+    }
+
+    #[test]
+    fn meta_set_then_meta_get_round_trips() {
+        let store = Store::open_memory().unwrap();
+        store.meta_set("zstd_dict_id", "abc123").unwrap();
+        assert_eq!(store.meta_get("zstd_dict_id").unwrap(), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn meta_set_twice_on_one_key_replaces_the_value() {
+        let store = Store::open_memory().unwrap();
+        store.meta_set("last_scorer_pass", "1").unwrap();
+        store.meta_set("last_scorer_pass", "2").unwrap();
+        assert_eq!(store.meta_get("last_scorer_pass").unwrap(), Some("2".to_string()));
     }
 }
