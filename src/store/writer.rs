@@ -241,6 +241,13 @@ impl WriterHandle {
     pub fn health(&self) -> watch::Receiver<WriterState> {
         self.health.clone()
     }
+
+    /// Ops queued on the bounded channel: `max_capacity` minus the sender's
+    /// free capacity (BC29). `0` on an idle writer. The ingest task's stats
+    /// line (story 06) reports this as `channel_depth`.
+    pub fn depth(&self) -> usize {
+        self.tx.max_capacity() - self.tx.capacity()
+    }
 }
 
 /// Spawns the one writer thread over `conn`, TECH-DESIGN section 5.4:
@@ -559,6 +566,32 @@ mod tests {
         handle.flush().await.unwrap();
 
         assert_eq!(likes(&conn.lock().unwrap(), uri), 4, "every op must have landed");
+    }
+
+    #[tokio::test]
+    // Holding the lock keeps the writer thread from draining the channel,
+    // the same trick `full_channel_makes_send_wait` uses, so the queued
+    // depth can be observed before the writer commits it away.
+    #[allow(clippy::await_holding_lock)]
+    async fn depth_counts_queued_ops() {
+        let conn = shared_conn();
+        let cfg = WriterConfig { capacity: 10, max_ops: 1, interval: Duration::from_secs(30) };
+        let handle = spawn(Arc::clone(&conn), cfg);
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+
+        assert_eq!(handle.depth(), 0, "an idle writer has no queued ops");
+
+        let guard = conn.lock().unwrap();
+        handle.send(incr_op(uri, 1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.send(incr_op(uri, 2)).await.unwrap();
+        handle.send(incr_op(uri, 3)).await.unwrap();
+
+        assert_eq!(handle.depth(), 2, "the op pulled by the writer thread is no longer queued");
+
+        drop(guard);
+        handle.flush().await.unwrap();
+        assert_eq!(handle.depth(), 0);
     }
 
     #[tokio::test]

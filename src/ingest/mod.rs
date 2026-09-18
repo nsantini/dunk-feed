@@ -8,6 +8,8 @@
 pub mod embed;
 pub mod hotset;
 
+use std::collections::HashMap;
+
 use crate::jetstream::event::{CommitEvent, Operation};
 use crate::store::writer::{CountField, Op};
 use crate::store::unix_now;
@@ -21,6 +23,12 @@ const POST: &str = "app.bsky.feed.post";
 const LIKE: &str = "app.bsky.feed.like";
 const REPOST: &str = "app.bsky.feed.repost";
 const POSTGATE: &str = "app.bsky.feed.postgate";
+
+/// How often `run_ingest` (story 06's later slice) emits the stats line
+/// (BC27). A module constant, not `Config`: `AGENTS.md` reserves `Config`
+/// for the PRD's score-table constants, and story 05 set the precedent with
+/// the writer's own 500 ms and 1,000 ops.
+const STATS_PERIOD_SECS: f64 = 60.0;
 
 /// A change `translate` asks the caller to apply to its `HotSet`, since
 /// `translate` only borrows one (BC1). `run_ingest` (story 06's later
@@ -261,6 +269,129 @@ pub fn translate(commit: &CommitEvent, hot: &HotSet) -> Translation {
             Operation::Create | Operation::Update => translate_postgate(commit, hot),
         },
         _ => Translation { dropped: Some(Dropped::UnknownCollection), ..Default::default() },
+    }
+}
+
+/// The `ops_per_s` key one `Op` counts under (BC27). A plain string tag
+/// rather than a new field on `Op` itself, since `Op` belongs to
+/// `store::writer` and already exposes everything the writer needs through
+/// `seq`.
+fn op_kind(op: &Op) -> &'static str {
+    match op {
+        Op::InsertPair { .. } => "insert_pair",
+        Op::Incr { .. } => "incr",
+        Op::DeletePost { .. } => "delete_post",
+        Op::Detach { .. } => "detach",
+        Op::Checkpoint { .. } => "checkpoint",
+        Op::Interaction { .. } => "interaction",
+        Op::MarkAllDirty { .. } => "mark_all_dirty",
+    }
+}
+
+/// Divides every count in `counts` by `STATS_PERIOD_SECS`, for the
+/// `events_per_s` and `ops_per_s` fields BC27 names.
+fn per_second<K: Clone + Eq + std::hash::Hash>(counts: &HashMap<K, u64>) -> HashMap<K, f64> {
+    counts.iter().map(|(k, v)| (k.clone(), *v as f64 / STATS_PERIOD_SECS)).collect()
+}
+
+/// The 60-second window's counters, TECH-DESIGN section 5.5's stats line
+/// (BC27). A plain struct with `record_commit` and `emit`: no task, no
+/// runtime, so a scripted sequence of calls tests `gate_hit_rate` and the
+/// window reset (BC26) with neither.
+#[derive(Debug, Default)]
+pub struct Stats {
+    events_by_collection: HashMap<String, u64>,
+    ops_by_kind: HashMap<&'static str, u64>,
+    gate_hits: u64,
+    gate_attempts: u64,
+    dropped_unknown_collection: u64,
+    dropped_self_quote: u64,
+    dropped_non_post_embed: u64,
+    postgate_detaches: u64,
+    last_commit_time: Option<i64>,
+}
+
+impl Stats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Folds one commit and the `Translation` `translate` returned for it
+    /// into the window: the per-collection event count, the per-op-kind
+    /// counts, the postgate detach count, the three drop counters, the gate
+    /// hit/attempt counters (BC26), and the last commit time (BC28). A like
+    /// or repost delete carries no subject, so it touches neither side of
+    /// the gate (BC14); only a like or repost *create* is a gate attempt,
+    /// matching BC26's literal wording.
+    pub fn record_commit(&mut self, commit: &CommitEvent, translation: &Translation) {
+        *self.events_by_collection.entry(commit.collection.clone()).or_insert(0) += 1;
+        if let Some(t) = commit.time_secs() {
+            self.last_commit_time = Some(t);
+        }
+
+        for op in &translation.ops {
+            *self.ops_by_kind.entry(op_kind(op)).or_insert(0) += 1;
+            if matches!(op, Op::Detach { .. }) {
+                self.postgate_detaches += 1;
+            }
+        }
+
+        match translation.dropped {
+            Some(Dropped::UnknownCollection) => self.dropped_unknown_collection += 1,
+            Some(Dropped::SelfQuote) => self.dropped_self_quote += 1,
+            Some(Dropped::NonPostEmbed) => self.dropped_non_post_embed += 1,
+            None => {}
+        }
+
+        let is_gated_collection = commit.collection == LIKE || commit.collection == REPOST;
+        if is_gated_collection && commit.operation == Operation::Create {
+            self.gate_attempts += 1;
+            if translation.ops.iter().any(|op| matches!(op, Op::Incr { .. })) {
+                self.gate_hits += 1;
+            }
+        }
+    }
+
+    /// Hits over attempts, `0.0` on an empty window (BC26).
+    pub fn gate_hit_rate(&self) -> f64 {
+        if self.gate_attempts == 0 {
+            0.0
+        } else {
+            self.gate_hits as f64 / self.gate_attempts as f64
+        }
+    }
+
+    /// `now` minus the last commit's time, never negative, `0` before the
+    /// first commit (BC28).
+    pub fn lag_s(&self) -> i64 {
+        match self.last_commit_time {
+            Some(t) => (unix_now() - t).max(0),
+            None => 0,
+        }
+    }
+
+    /// Logs one `tracing::info!` event carrying every field BC27 names,
+    /// then resets every counter. `hot_set_len` and `channel_depth` are not
+    /// `Stats` counters: `run_ingest` (story 06's later slice) reads them
+    /// from the live `HotSet` and `WriterHandle::depth()` at the moment it
+    /// calls this, the same way it supplies `compressed` from the
+    /// `EventSource`.
+    pub fn emit(&mut self, hot_set_len: usize, channel_depth: usize, compressed: bool) {
+        tracing::info!(
+            events_per_s = ?per_second(&self.events_by_collection),
+            hot_set_len,
+            ops_per_s = ?per_second(&self.ops_by_kind),
+            gate_hit_rate = self.gate_hit_rate(),
+            postgate_detaches = self.postgate_detaches,
+            dropped_unknown_collection = self.dropped_unknown_collection,
+            dropped_self_quote = self.dropped_self_quote,
+            dropped_non_post_embed = self.dropped_non_post_embed,
+            channel_depth,
+            lag_s = self.lag_s(),
+            compressed,
+            "dunk: ingest stats"
+        );
+        *self = Stats::default();
     }
 }
 
@@ -674,5 +805,107 @@ mod tests {
         let before = unix_now();
         let now = quoted_at(&no_created_at_bad_time, &bad_commit);
         assert!(now >= before);
+    }
+
+    // BC26: `gate_hit_rate` counts only like and repost creates. A like
+    // delete carries no subject (BC14) and touches neither counter, even
+    // when its collection is `LIKE`.
+    #[test]
+    fn gate_hit_rate_counts_only_like_and_repost_creates() {
+        let mut stats = Stats::new();
+        assert_eq!(stats.gate_hit_rate(), 0.0, "an empty window is 0.0, not a division by zero");
+
+        let like_hot = commit("jetstream_commit_like.json");
+        let mut hot = HotSet::new();
+        hot.insert("at://did:plc:vvdrimbhu4kouacycafar4cs/app.bsky.feed.post/3mvqkfpsilc26");
+        let translation = translate(&like_hot, &hot);
+        stats.record_commit(&like_hot, &translation);
+
+        let like_cold = commit("jetstream_commit_like.json");
+        let translation = translate(&like_cold, &HotSet::new());
+        stats.record_commit(&like_cold, &translation);
+
+        let repost_hot = commit("jetstream_commit_repost.json");
+        let mut hot = HotSet::new();
+        hot.insert("at://did:plc:ezay5dffpkfnjxh5yirexce2/app.bsky.feed.post/3mvqrul2wq22a");
+        let translation = translate(&repost_hot, &hot);
+        stats.record_commit(&repost_hot, &translation);
+
+        let like_delete = commit("jetstream_commit_like_delete.json");
+        let translation = translate(&like_delete, &HotSet::new());
+        stats.record_commit(&like_delete, &translation);
+
+        // Two hits (the hot like, the hot repost) over three attempts (the
+        // delete never entered the count).
+        assert!((stats.gate_hit_rate() - (2.0 / 3.0)).abs() < f64::EPSILON);
+    }
+
+    // AC6, BC27: the stats line carries every field the contract names, and
+    // resets after `emit`.
+    #[test]
+    fn stats_line_contains_all_fields() {
+        let mut stats = Stats::new();
+
+        // A quote (`insert_pair`), a dropped self quote, a dropped non-post
+        // embed, an unknown collection, and a postgate with two hot entries
+        // (`detach` x2, `postgate_detaches` == 2).
+        let quote = commit("jetstream_commit_post_quote_record.json");
+        let translation = translate(&quote, &HotSet::new());
+        assert_eq!(translation.ops.len(), 1);
+        stats.record_commit(&quote, &translation);
+
+        let self_quote = commit("jetstream_commit_post.json");
+        let translation = translate(&self_quote, &HotSet::new());
+        stats.record_commit(&self_quote, &translation);
+
+        let non_post_embed = commit("jetstream_commit_post_quote_starterpack.json");
+        let translation = translate(&non_post_embed, &HotSet::new());
+        stats.record_commit(&non_post_embed, &translation);
+
+        let mut unknown = commit("jetstream_commit_like.json");
+        unknown.collection = "app.bsky.feed.threadgate".to_string();
+        let translation = translate(&unknown, &HotSet::new());
+        stats.record_commit(&unknown, &translation);
+
+        let postgate = commit("jetstream_commit_postgate_detached.json");
+        let mut hot = HotSet::new();
+        hot.insert("at://did:plc:quoterdid0000000000000000/app.bsky.feed.post/3mvqsnhquote1");
+        hot.insert("at://did:plc:quoterdid0000000000000000/app.bsky.feed.post/3mvqsnhquote2");
+        let translation = translate(&postgate, &hot);
+        assert_eq!(translation.ops.len(), 2);
+        let last_seen_time = postgate.time_secs().expect("fixture carries a parseable time");
+        stats.record_commit(&postgate, &translation);
+
+        assert_eq!(stats.dropped_self_quote, 1);
+        assert_eq!(stats.dropped_non_post_embed, 1);
+        assert_eq!(stats.dropped_unknown_collection, 1);
+        assert_eq!(stats.postgate_detaches, 2);
+        assert_eq!(stats.ops_by_kind.get("insert_pair"), Some(&1));
+        assert_eq!(stats.ops_by_kind.get("detach"), Some(&2));
+        assert_eq!(stats.events_by_collection.get(POST), Some(&3));
+        assert_eq!(stats.events_by_collection.get("app.bsky.feed.threadgate"), Some(&1));
+        assert_eq!(stats.events_by_collection.get(POSTGATE), Some(&1));
+
+        // Per-collection rates are the raw count divided by the 60 s window.
+        let rates = per_second(&stats.events_by_collection);
+        assert!((rates[POST] - (3.0 / STATS_PERIOD_SECS)).abs() < f64::EPSILON);
+
+        // `lag_s`: the postgate commit was the last one recorded.
+        let expected_lag = (unix_now() - last_seen_time).max(0);
+        assert!((stats.lag_s() - expected_lag).abs() <= 1, "lag_s should track the last commit's time");
+
+        stats.emit(42, 7, true);
+
+        // Every counter resets after the line, matching a freshly built `Stats`.
+        assert_eq!(stats.events_by_collection, HashMap::new());
+        assert_eq!(stats.ops_by_kind, HashMap::new());
+        assert_eq!(stats.gate_hits, 0);
+        assert_eq!(stats.gate_attempts, 0);
+        assert_eq!(stats.dropped_unknown_collection, 0);
+        assert_eq!(stats.dropped_self_quote, 0);
+        assert_eq!(stats.dropped_non_post_embed, 0);
+        assert_eq!(stats.postgate_detaches, 0);
+        assert_eq!(stats.gate_hit_rate(), 0.0);
+        assert_eq!(stats.lag_s(), 0);
     }
 }
