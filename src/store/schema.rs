@@ -43,8 +43,8 @@ const V1_STATEMENTS: &[&str] = &[
         quote_did     TEXT NOT NULL,
         original_did  TEXT NOT NULL,
         quoted_at     INTEGER NOT NULL,
-        v_likes_q INTEGER, v_reposts_q INTEGER, v_replies_q INTEGER,
-        v_likes_o INTEGER, v_reposts_o INTEGER, v_replies_o INTEGER,
+        v_likes_q INTEGER NOT NULL, v_reposts_q INTEGER NOT NULL, v_replies_q INTEGER NOT NULL,
+        v_likes_o INTEGER NOT NULL, v_reposts_o INTEGER NOT NULL, v_replies_o INTEGER NOT NULL,
         ratio         REAL NOT NULL,
         rank          REAL NOT NULL,
         promoted_at   INTEGER NOT NULL,
@@ -78,15 +78,17 @@ pub fn schema_version(conn: &Connection) -> Result<Option<i64>, StoreError> {
     if meta_table_exists == 0 {
         return Ok(None);
     }
-    match conn.query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |row| {
-        row.get::<_, String>(0)
-    }) {
-        Ok(value) => value
+    let value = crate::store::optional(conn.query_row(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    ))?;
+    match value {
+        None => Ok(None),
+        Some(value) => value
             .parse::<i64>()
             .map(Some)
             .map_err(|_| StoreError::MalformedMeta { key: "schema_version".to_string(), value }),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(err) => Err(StoreError::Sqlite(err)),
     }
 }
 

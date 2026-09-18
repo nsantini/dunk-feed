@@ -20,14 +20,29 @@ pub mod interactions;
 pub mod meta;
 pub mod pairs;
 pub mod schema;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod writer;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 
 use crate::config::Config;
+
+/// Turns a `rusqlite` "no such row" result into `Ok(None)`, and any other
+/// error into `StoreError::Sqlite`. Used at every site that reads at most
+/// one optional row: `meta::meta_get`, `authors::author_get` and
+/// `schema::schema_version` (round 1 finding 9).
+pub(crate) fn optional<T>(res: rusqlite::Result<T>) -> Result<Option<T>, StoreError> {
+    match res {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(err) => Err(StoreError::Sqlite(err)),
+    }
+}
 
 /// Every error this module raises. Constructed in `mod.rs`, `schema.rs` and
 /// `writer.rs` (BC12); every variant but a writer-thread panic reaches the
@@ -49,6 +64,8 @@ pub enum StoreError {
     WriterGone,
     #[error("the store's connection mutex was poisoned")]
     Poisoned,
+    #[error("Store::writer was already called on this store")]
+    WriterAlreadyStarted,
 }
 
 /// A `pairs.state` value, TECH-DESIGN section 6.
@@ -65,19 +82,6 @@ impl PairState {
             PairState::Candidate => "candidate",
             PairState::Promoted => "promoted",
             PairState::Dropped => "dropped",
-        }
-    }
-}
-
-impl std::str::FromStr for PairState {
-    type Err = StoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "candidate" => Ok(PairState::Candidate),
-            "promoted" => Ok(PairState::Promoted),
-            "dropped" => Ok(PairState::Dropped),
-            _ => Err(StoreError::MalformedRow { table: "pairs", column: "state" }),
         }
     }
 }
@@ -147,18 +151,48 @@ pub fn unix_now() -> i64 {
 fn apply_pragmas(conn: &Connection) -> Result<(), StoreError> {
     conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // The negative form is KiB, so -65536 asks SQLite for a 64 MiB page
+    // cache rather than 65,536 pages.
     conn.pragma_update(None, "cache_size", -65536)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     Ok(())
 }
 
-/// The SQLite store. Holds one `Arc<Mutex<Connection>>`, shared by the
-/// writer thread (slice 3.0) and every synchronous read: a second
-/// connection to `:memory:` would be a second, empty database.
+/// The pragmas for the read-only connection a file-backed `Store` opens
+/// alongside its writable one (BC74). `journal_mode` and `synchronous` are
+/// write-mode properties already fixed by the writable connection that
+/// created the file; `cache_size` (see `apply_pragmas`) and `busy_timeout`
+/// are per-connection and apply here too.
+fn apply_reader_pragmas(conn: &Connection) -> Result<(), StoreError> {
+    conn.pragma_update(None, "cache_size", -65536)?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    Ok(())
+}
+
+/// Applies the pragmas and runs the migration on a freshly opened
+/// connection. Shared by `open_path` and `open_memory` so the two
+/// constructors do not each repeat it.
+fn open_and_migrate(conn: &Connection) -> Result<(), StoreError> {
+    apply_pragmas(conn)?;
+    schema::migrate(conn)?;
+    Ok(())
+}
+
+/// The SQLite store. Holds one `Arc<Mutex<Connection>>` for writes, shared
+/// by the writer thread (slice 3.0), and — for a file-backed database — a
+/// second `Arc<Mutex<Connection>>` opened read-only that every synchronous
+/// read routes through (BC74), so a scan never waits on a commit. A
+/// `:memory:` database has no second connection (BC75): a second connection
+/// to `:memory:` would be a second, empty database. A caller on the tokio
+/// runtime wraps a call into `Store` in `spawn_blocking` (BC76), because
+/// `rusqlite` is synchronous and every method here blocks the calling
+/// thread briefly.
 #[derive(Debug, Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    read_conn: Option<Arc<Mutex<Connection>>>,
+    writer_started: Arc<AtomicBool>,
 }
 
 impl Store {
@@ -169,42 +203,69 @@ impl Store {
 
     /// Opens a file database at `path`, applies the pragmas, and migrates
     /// it to `schema::CURRENT_VERSION`. A missing parent directory fails as
-    /// `StoreError::Open` (BC13); the directory is never created.
+    /// `StoreError::Open` (BC13); the directory is never created. Unless
+    /// `path` is `:memory:`, a second, read-only connection is opened
+    /// alongside it (BC74).
     pub fn open_path(path: &str) -> Result<Self, StoreError> {
         let conn = Connection::open(path)
             .map_err(|source| StoreError::Open { path: path.to_string(), source })?;
-        Self::from_connection(conn)
+        open_and_migrate(&conn)?;
+
+        let read_conn = if path == ":memory:" {
+            None
+        } else {
+            let reader = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|source| StoreError::Open { path: path.to_string(), source })?;
+            apply_reader_pragmas(&reader)?;
+            Some(Arc::new(Mutex::new(reader)))
+        };
+
+        Ok(Store {
+            conn: Arc::new(Mutex::new(conn)),
+            read_conn,
+            writer_started: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Opens an in-memory database. Tests use this so the writer thread and
-    /// every read share the same connection.
+    /// every read share the same connection (BC75).
     pub fn open_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
-        Self::from_connection(conn)
+        open_and_migrate(&conn)?;
+        Ok(Store {
+            conn: Arc::new(Mutex::new(conn)),
+            read_conn: None,
+            writer_started: Arc::new(AtomicBool::new(false)),
+        })
     }
 
-    fn from_connection(conn: Connection) -> Result<Self, StoreError> {
-        apply_pragmas(&conn)?;
-        schema::migrate(&conn)?;
-        Ok(Store { conn: Arc::new(Mutex::new(conn)) })
-    }
-
-    /// Locks the shared connection. `StoreError::Poisoned` if a previous
+    /// Locks the writable connection. `StoreError::Poisoned` if a previous
     /// holder panicked while holding it.
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
         self.conn.lock().map_err(|_| StoreError::Poisoned)
     }
 
+    /// Locks the read-only connection when one exists (a file-backed
+    /// store), or falls back to the writable connection for a `:memory:`
+    /// store, which has no second connection (BC74, BC75).
+    fn read_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
+        match &self.read_conn {
+            Some(read_conn) => read_conn.lock().map_err(|_| StoreError::Poisoned),
+            None => self.lock(),
+        }
+    }
+
     /// The stored Jetstream cursor, `meta.jetstream_seq` (BC43, BC44).
     pub fn cursor(&self) -> Result<Option<u64>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_lock()?;
         meta::cursor(&conn)
     }
 
-    /// Both URIs of every pair whose state is not `dropped` (BC45).
-    pub fn hot_set_uris(&self) -> Result<Vec<String>, StoreError> {
-        let conn = self.lock()?;
-        Ok(pairs::hot_set_uris(&conn)?.collect())
+    /// Streams both URIs of every pair whose state is not `dropped` into
+    /// `f` (BC45). Duplicates are not removed; the caller holds a set.
+    pub fn for_each_hot_uri(&self, f: impl FnMut(&str)) -> Result<(), StoreError> {
+        let conn = self.read_lock()?;
+        pairs::for_each_hot_uri(&conn, f)
     }
 
     /// `candidate` pairs inside `ttl_h` hours with a dirty counts row on
@@ -214,7 +275,7 @@ impl Store {
         now: i64,
         ttl_h: i64,
     ) -> Result<Vec<pairs::PairWithCounts>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_lock()?;
         pairs::dirty_candidates(&conn, now, ttl_h)
     }
 
@@ -225,7 +286,7 @@ impl Store {
         now: i64,
         h: i64,
     ) -> Result<Vec<pairs::PairWithCounts>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_lock()?;
         pairs::promoted_within(&conn, now, h)
     }
 
@@ -261,13 +322,13 @@ impl Store {
 
     /// Every `feed` row, `rank DESC, quote_cid ASC` (BC62, BC63).
     pub fn feed_rows(&self) -> Result<Vec<feed::FeedRow>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_lock()?;
         feed::feed_rows(&conn)
     }
 
     /// Reads one `authors` row (BC64, BC66).
     pub fn author_get(&self, did: &str) -> Result<Option<authors::AuthorRow>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_lock()?;
         authors::author_get(&conn, did)
     }
 
@@ -286,7 +347,7 @@ impl Store {
 
     /// Reads one `meta` key. `Ok(None)` when the key has no row (BC67).
     pub fn meta_get(&self, key: &str) -> Result<Option<String>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_lock()?;
         meta::meta_get(&conn, key)
     }
 
@@ -298,16 +359,25 @@ impl Store {
 
     /// Starts the one writer thread with `WriterConfig::default()`
     /// (BC42).
-    pub fn writer(&self) -> writer::WriterHandle {
+    pub fn writer(&self) -> Result<writer::WriterHandle, StoreError> {
         self.writer_with(writer::WriterConfig::default())
     }
 
     /// Starts the one writer thread with a caller-supplied config. Tests
     /// use a smaller `max_ops` and `interval` than the default so a batch
     /// closes quickly. The thread shares this `Store`'s connection, so a
-    /// `:memory:` test sees the writer's rows through the same `Store`.
-    pub fn writer_with(&self, cfg: writer::WriterConfig) -> writer::WriterHandle {
-        writer::spawn(Arc::clone(&self.conn), cfg)
+    /// `:memory:` test sees the writer's rows through the same `Store`. A
+    /// second call on this `Store` (or a clone of it) is
+    /// `StoreError::WriterAlreadyStarted`: one store has one writer thread
+    /// (BC73).
+    pub fn writer_with(
+        &self,
+        cfg: writer::WriterConfig,
+    ) -> Result<writer::WriterHandle, StoreError> {
+        if self.writer_started.swap(true, Ordering::SeqCst) {
+            return Err(StoreError::WriterAlreadyStarted);
+        }
+        Ok(writer::spawn(Arc::clone(&self.conn), cfg))
     }
 }
 
@@ -372,15 +442,6 @@ mod tests {
         let busy_timeout: i64 =
             conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0)).unwrap();
         assert_eq!(busy_timeout, 5000);
-    }
-
-    #[test]
-    fn pair_state_round_trips_through_str() {
-        use std::str::FromStr;
-        for state in [PairState::Candidate, PairState::Promoted, PairState::Dropped] {
-            assert_eq!(PairState::from_str(state.as_str()).unwrap(), state);
-        }
-        assert!(PairState::from_str("bogus").is_err());
     }
 
     #[test]
@@ -455,5 +516,27 @@ mod tests {
         store.meta_set("last_scorer_pass", "1").unwrap();
         store.meta_set("last_scorer_pass", "2").unwrap();
         assert_eq!(store.meta_get("last_scorer_pass").unwrap(), Some("2".to_string()));
+    }
+
+    #[test]
+    fn file_store_reads_through_the_read_only_connection() {
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("dunk-store-read-only-{nanos}.sqlite3"));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let store = Store::open_path(&path_str).unwrap();
+        store.meta_set("zstd_dict_id", "abc123").unwrap();
+
+        // Hold the writable connection's lock; a read that went through it
+        // instead of the separate read-only connection would deadlock here
+        // (BC74).
+        let write_guard = store.conn.lock().unwrap();
+        assert_eq!(store.meta_get("zstd_dict_id").unwrap(), Some("abc123".to_string()));
+        drop(write_guard);
+
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 }

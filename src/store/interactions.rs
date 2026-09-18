@@ -8,6 +8,8 @@ use crate::store::StoreError;
 
 /// Appends one row. The four payload columns are nullable and stored
 /// verbatim; `received_at` is whatever `now` the caller passes (BC34).
+/// Round 1 finding 5: prepared through `prepare_cached`, like every other
+/// per-op statement in `commit_batch`'s path.
 pub fn insert_interaction(
     conn: &Connection,
     item: Option<&str>,
@@ -16,23 +18,17 @@ pub fn insert_interaction(
     req_id: Option<&str>,
     now: i64,
 ) -> Result<(), StoreError> {
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO interactions (received_at, item, event, feed_context, req_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![now, item, event, feed_context, req_id],
     )?;
+    stmt.execute(rusqlite::params![now, item, event, feed_context, req_id])?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema;
-
-    fn migrated_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        schema::migrate(&conn).unwrap();
-        conn
-    }
+    use crate::store::test_support::migrated_conn;
 
     #[test]
     fn insert_interaction_appends_a_row() {

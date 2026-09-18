@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::store::{counts, interactions, meta, pairs, unix_now, StoreError};
 
@@ -60,6 +60,12 @@ pub enum Op {
         feed_context: Option<String>,
         req_id: Option<String>,
     },
+    /// Sets `counts.dirty = 1` on every row (round 1 finding 2). Story 06
+    /// sends this on an `#info OutdatedCursor` frame, TECH-DESIGN section
+    /// 5.4.
+    MarkAllDirty {
+        seq: u64,
+    },
 }
 
 impl Op {
@@ -71,7 +77,8 @@ impl Op {
             | Op::Incr { seq, .. }
             | Op::DeletePost { seq, .. }
             | Op::Detach { seq, .. }
-            | Op::Checkpoint { seq } => Some(*seq),
+            | Op::Checkpoint { seq }
+            | Op::MarkAllDirty { seq } => Some(*seq),
             Op::Interaction { .. } => None,
         }
     }
@@ -141,6 +148,7 @@ fn apply_op(conn: &Connection, op: &Op, now: i64) -> Result<(), StoreError> {
             req_id.as_deref(),
             now,
         ),
+        Op::MarkAllDirty { .. } => counts::mark_all_dirty(conn),
     }
 }
 
@@ -152,7 +160,11 @@ fn apply_op(conn: &Connection, op: &Op, now: i64) -> Result<(), StoreError> {
 #[derive(Debug, Clone, Copy)]
 pub struct WriterConfig {
     /// The bounded channel's capacity. `WriterHandle::send` waits, rather
-    /// than drops the op, once this many are already queued (BC37).
+    /// than drops the op, once this many are already queued (BC37). This
+    /// 10,000 is a store default the engineer chose from the traffic
+    /// analysis (spec.md's "Answers from the engineer"), not a TECH-DESIGN
+    /// section 5.4 number: section 5.4 only fixes `max_ops` at 1,000 and
+    /// `interval` at 500 ms.
     pub capacity: usize,
     /// A batch closes at this many ops even if `interval` has not elapsed
     /// (BC40).
@@ -177,6 +189,15 @@ enum WriterMsg {
     Shutdown(oneshot::Sender<()>),
 }
 
+/// The writer thread's health, published on `WriterHandle::health()`
+/// (round 1 finding 3). `main.rs` (story 06) owns the decision to exit the
+/// process on `Failed`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriterState {
+    Running,
+    Failed(String),
+}
+
 /// A handle to the running writer thread. `send`, `flush` and `shutdown`
 /// all go through the same bounded channel, so a `flush` queued after a
 /// run of `send`s only ever acknowledges once every op ahead of it in the
@@ -186,6 +207,7 @@ enum WriterMsg {
 #[derive(Debug, Clone)]
 pub struct WriterHandle {
     tx: mpsc::Sender<WriterMsg>,
+    health: watch::Receiver<WriterState>,
 }
 
 impl WriterHandle {
@@ -212,6 +234,13 @@ impl WriterHandle {
         self.tx.send(WriterMsg::Shutdown(ack_tx)).await.map_err(|_| StoreError::WriterGone)?;
         ack_rx.await.map_err(|_| StoreError::WriterGone)
     }
+
+    /// A `watch::Receiver` over the writer thread's health (BC71). Every
+    /// handle (every clone) observes the same channel, so a caller holding
+    /// no op to send still sees the thread die (BC72).
+    pub fn health(&self) -> watch::Receiver<WriterState> {
+        self.health.clone()
+    }
 }
 
 /// Spawns the one writer thread over `conn`, TECH-DESIGN section 5.4:
@@ -219,11 +248,12 @@ impl WriterHandle {
 /// lets a `:memory:` test see the writer's rows.
 pub(crate) fn spawn(conn: Arc<Mutex<Connection>>, cfg: WriterConfig) -> WriterHandle {
     let (tx, rx) = mpsc::channel(cfg.capacity);
+    let (health_tx, health_rx) = watch::channel(WriterState::Running);
     std::thread::Builder::new()
         .name("dunk-store-writer".to_string())
-        .spawn(move || writer_loop(conn, rx, cfg))
+        .spawn(move || writer_loop(conn, rx, cfg, health_tx))
         .expect("failed to spawn the store writer thread");
-    WriterHandle { tx }
+    WriterHandle { tx, health: health_rx }
 }
 
 /// Waits for one message, but never past `deadline`. `None` on a timeout
@@ -255,14 +285,21 @@ fn recv_before(rx: &mut mpsc::Receiver<WriterMsg>, deadline: Instant) -> Option<
 /// closes the batch immediately, even with zero ops and long before
 /// `interval` would: a caller waiting on `flush` or `shutdown` must not be
 /// made to wait out the batch timer (BC38, BC39).
-fn writer_loop(conn: Arc<Mutex<Connection>>, mut rx: mpsc::Receiver<WriterMsg>, cfg: WriterConfig) {
+fn writer_loop(
+    conn: Arc<Mutex<Connection>>,
+    mut rx: mpsc::Receiver<WriterMsg>,
+    cfg: WriterConfig,
+    health_tx: watch::Sender<WriterState>,
+) {
     loop {
         let first = match rx.blocking_recv() {
             Some(msg) => msg,
             None => return, // Every WriterHandle was dropped.
         };
 
-        let mut ops: Vec<Op> = Vec::new();
+        // Round 1 finding 5: sized once per batch instead of growing
+        // through repeated reallocation as ops arrive.
+        let mut ops: Vec<Op> = Vec::with_capacity(cfg.max_ops);
         let mut flush_acks: Vec<oneshot::Sender<()>> = Vec::new();
         let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
         let deadline = Instant::now() + cfg.interval;
@@ -303,6 +340,10 @@ fn writer_loop(conn: Arc<Mutex<Connection>>, mut rx: mpsc::Receiver<WriterMsg>, 
 
         if let Err(err) = commit_result {
             tracing::error!(error = %err, "store writer: commit_batch failed, thread exiting");
+            // Published before the thread returns, so a caller holding no
+            // op to send still observes the death through `health()`
+            // (BC72), not only through the next `send`'s `WriterGone`.
+            let _ = health_tx.send(WriterState::Failed(err.to_string()));
             // Dropping `flush_acks` and `shutdown_ack` without a send makes
             // every waiter's `.await` fail on a closed oneshot channel,
             // which `WriterHandle` turns into `StoreError::WriterGone`
@@ -324,13 +365,7 @@ fn writer_loop(conn: Arc<Mutex<Connection>>, mut rx: mpsc::Receiver<WriterMsg>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema;
-
-    fn migrated_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        schema::migrate(&conn).unwrap();
-        conn
-    }
+    use crate::store::test_support::migrated_conn;
 
     fn incr_op(post_uri: &str, seq: u64) -> Op {
         Op::Incr { post_uri: post_uri.to_string(), field: CountField::Likes, seq }
@@ -470,6 +505,7 @@ mod tests {
         assert_eq!(Op::DeletePost { uri: "at://x".to_string(), seq: 3 }.seq(), Some(3));
         assert_eq!(Op::Detach { quote_uri: "at://x".to_string(), seq: 4 }.seq(), Some(4));
         assert_eq!(Op::Checkpoint { seq: 5 }.seq(), Some(5));
+        assert_eq!(Op::MarkAllDirty { seq: 6 }.seq(), Some(6));
         assert_eq!(
             Op::Interaction { item: None, event: None, feed_context: None, req_id: None }.seq(),
             None
@@ -588,6 +624,60 @@ mod tests {
         assert!(matches!(err, StoreError::WriterGone));
     }
 
+    #[tokio::test]
+    async fn mark_all_dirty() {
+        let conn = shared_conn();
+        let handle = spawn(Arc::clone(&conn), WriterConfig::default());
+        let uri_a = "at://did:plc:o/app.bsky.feed.post/o1";
+        let uri_b = "at://did:plc:o/app.bsky.feed.post/o2";
+
+        handle.send(incr_op(uri_a, 1)).await.unwrap();
+        handle.send(incr_op(uri_b, 2)).await.unwrap();
+        handle.flush().await.unwrap();
+        counts::clear_dirty(&conn.lock().unwrap(), &[uri_a, uri_b]).unwrap();
+
+        handle.send(Op::MarkAllDirty { seq: 3 }).await.unwrap();
+        handle.flush().await.unwrap();
+
+        let conn = conn.lock().unwrap();
+        for uri in [uri_a, uri_b] {
+            let dirty: i64 = conn
+                .query_row("SELECT dirty FROM counts WHERE post_uri = ?1", [uri], |row| row.get(0))
+                .unwrap();
+            assert_eq!(dirty, 1);
+        }
+        assert_eq!(meta::cursor(&conn).unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn health() {
+        // BC71, BC72: `Running`, then `Failed` once the writer thread hits
+        // an unrecoverable error, published before it returns so a caller
+        // holding no op to send still observes the death.
+        let conn = shared_conn();
+        let handle = spawn(Arc::clone(&conn), WriterConfig::default());
+        assert_eq!(*handle.health().borrow(), WriterState::Running);
+
+        // Break `counts` so the writer's next commit fails unrecoverably.
+        conn.lock().unwrap().execute("DROP TABLE counts", []).unwrap();
+
+        let mut health = handle.health();
+        handle.send(incr_op("at://did:plc:o/app.bsky.feed.post/o1", 1)).await.unwrap();
+        health.changed().await.unwrap();
+        assert!(matches!(*health.borrow(), WriterState::Failed(_)));
+
+        // A second `send` observes the dead writer too (BC36).
+        let err =
+            handle.send(incr_op("at://did:plc:o/app.bsky.feed.post/o1", 2)).await.unwrap_err();
+        assert!(matches!(err, StoreError::WriterGone));
+
+        // BC73: one store has one writer thread.
+        let store = crate::store::Store::open_memory().unwrap();
+        let _handle = store.writer().unwrap();
+        let err = store.writer().unwrap_err();
+        assert!(matches!(err, StoreError::WriterAlreadyStarted));
+    }
+
     #[test]
     #[ignore]
     fn throughput_100k_incr() {
@@ -600,7 +690,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let store = crate::store::Store::open_path(&path_str).unwrap();
-            let handle = store.writer();
+            let handle = store.writer().unwrap();
 
             let start = Instant::now();
             for seq in 0..100_000u64 {

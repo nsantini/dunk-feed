@@ -1,14 +1,18 @@
 //! `pairs` table row operations, TECH-DESIGN section 6 and 5.2. Every
 //! write function here takes an already-open `Connection` (or a
 //! `Transaction`, which derefs to one) so `writer::commit_batch` can run all
-//! of them inside one transaction. `hot_set_uris`, `dirty_candidates`,
+//! of them inside one transaction. `for_each_hot_uri`, `dirty_candidates`,
 //! `promoted_within`, `demote`, `drop_pair` and `expire` are the
 //! synchronous reads the scorer pass (TECH-DESIGN section 7.2) needs.
+//!
+//! Round 1 finding 7: every dropped-state transition goes through
+//! `drop_pair`, and every SQL statement here that writes a `state` column
+//! uses `PairState::as_str()`, never a literal.
 
 use rusqlite::Connection;
 
 use crate::score::Counts;
-use crate::store::{counts, feed, DropReason, StoreError};
+use crate::store::{counts, feed, DropReason, PairState, StoreError};
 
 /// One `pairs` row with both sides' counts, saturated at `u32::MAX`
 /// (BC49). Returned by `dirty_candidates` and `promoted_within`.
@@ -49,35 +53,48 @@ pub fn insert_pair(
     quoted_at: i64,
     first_seen_at: i64,
 ) -> Result<(), StoreError> {
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO pairs (quote_uri, quote_did, quote_cid, original_uri, original_did, quoted_at, first_seen_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(quote_uri) DO NOTHING",
-        rusqlite::params![
-            quote_uri,
-            quote_did,
-            quote_cid,
-            original_uri,
-            original_did,
-            quoted_at,
-            first_seen_at
-        ],
     )?;
+    stmt.execute(rusqlite::params![
+        quote_uri,
+        quote_did,
+        quote_cid,
+        original_uri,
+        original_did,
+        quoted_at,
+        first_seen_at
+    ])?;
     Ok(())
 }
 
-/// A `post` delete for `uri`. `foreign_keys` is on and `feed.quote_uri`
-/// references `pairs.quote_uri`, so if `uri` is a pair's `quote_uri` its
-/// `feed` row is deleted before the `pairs` row (BC30). Every pair holding
-/// `uri` as `original_uri` is instead marked `dropped` with
-/// `original_gone`, and each of those pairs' `feed` rows is deleted, but the
-/// pair rows themselves stay (BC31). A `uri` in no pair changes nothing
-/// pair-side and is not an error (BC32); the `counts` row for `uri` is
-/// deleted in every case, whether or not it exists.
+/// True when no pair whose `state` is not `dropped` still names `uri` as
+/// `quote_uri` or `original_uri` (round 1 finding 1). `expire` and
+/// `delete_post` check this before a `counts` row is deleted, so a URI a
+/// live pair still needs is never evicted (BC58, BC59, BC61).
+fn is_orphaned(conn: &Connection, uri: &str) -> Result<bool, StoreError> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM pairs WHERE (quote_uri = ?1 OR original_uri = ?1) AND state != ?2",
+        rusqlite::params![uri, PairState::Dropped.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(count == 0)
+}
+
+/// A `post` delete for `uri`. If `uri` is a pair's `quote_uri`, that pair is
+/// dropped through `drop_pair` with `DropReason::QuoteGone` (BC30): its
+/// `feed` row is deleted and the `pairs` row stays `dropped` for `expire` to
+/// remove. Every pair holding `uri` as `original_uri` is dropped the same
+/// way with `DropReason::OriginalGone` (BC31). A `uri` in no pair changes
+/// nothing pair-side and is not an error (BC32). `uri`'s own `counts` row is
+/// deleted only when no non-dropped pair still names it on either side
+/// (round 1 finding 1), which after the drops above holds unless `uri` is
+/// still someone else's live original or quote.
 pub fn delete_post(conn: &Connection, uri: &str) -> Result<(), StoreError> {
     // BC30: this `uri` as a quote_uri.
-    feed::delete_feed_row(conn, uri)?;
-    conn.execute("DELETE FROM pairs WHERE quote_uri = ?1", [uri])?;
+    drop_pair(conn, uri, DropReason::QuoteGone)?;
 
     // BC31: this `uri` as an original_uri.
     let quote_uris: Vec<String> = {
@@ -86,46 +103,37 @@ pub fn delete_post(conn: &Connection, uri: &str) -> Result<(), StoreError> {
         rows.collect::<Result<Vec<_>, _>>()?
     };
     for quote_uri in &quote_uris {
-        feed::delete_feed_row(conn, quote_uri)?;
+        drop_pair(conn, quote_uri, DropReason::OriginalGone)?;
     }
-    conn.execute(
-        "UPDATE pairs SET state = 'dropped', drop_reason = 'original_gone' WHERE original_uri = ?1",
-        [uri],
-    )?;
 
-    // BC32: the counts row goes regardless of whether `uri` was in a pair.
-    counts::delete_counts(conn, uri)?;
+    // BC32, round 1 finding 1.
+    if is_orphaned(conn, uri)? {
+        counts::delete_counts(conn, uri)?;
+    }
     Ok(())
 }
 
-/// A `postgate` detach for `quote_uri`. Marks the pair `dropped` with
-/// `detached` and deletes its `feed` row; the pair row stays (BC33).
+/// A `postgate` detach for `quote_uri`: `drop_pair` with `DropReason::Detached`
+/// (BC33).
 pub fn detach(conn: &Connection, quote_uri: &str) -> Result<(), StoreError> {
-    feed::delete_feed_row(conn, quote_uri)?;
-    conn.execute(
-        "UPDATE pairs SET state = 'dropped', drop_reason = 'detached' WHERE quote_uri = ?1",
-        [quote_uri],
-    )?;
-    Ok(())
+    drop_pair(conn, quote_uri, DropReason::Detached)
 }
 
-/// Both URIs of every pair whose `state` is not `dropped` (BC45).
-/// Duplicates are not removed; the caller (the scorer's hot set) holds a
-/// set.
-pub fn hot_set_uris(conn: &Connection) -> Result<impl Iterator<Item = String>, StoreError> {
-    let mut stmt =
-        conn.prepare("SELECT quote_uri, original_uri FROM pairs WHERE state != 'dropped'")?;
-    let rows = stmt.query_map([], |row| {
+/// Streams `quote_uri` and then `original_uri` of every pair whose `state`
+/// is not `dropped` into `f` (BC45). Duplicates are not removed; the caller
+/// (the scorer's hot set) holds a set. Round 1 finding 6: this streams
+/// straight from the statement instead of collecting every URI into a `Vec`
+/// before the caller sees the first one.
+pub fn for_each_hot_uri(conn: &Connection, mut f: impl FnMut(&str)) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare("SELECT quote_uri, original_uri FROM pairs WHERE state != ?1")?;
+    let mut rows = stmt.query(rusqlite::params![PairState::Dropped.as_str()])?;
+    while let Some(row) = rows.next()? {
         let quote_uri: String = row.get(0)?;
         let original_uri: String = row.get(1)?;
-        Ok([quote_uri, original_uri])
-    })?;
-    let uris: Vec<String> = rows
-        .collect::<Result<Vec<[String; 2]>, rusqlite::Error>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-    Ok(uris.into_iter())
+        f(&quote_uri);
+        f(&original_uri);
+    }
+    Ok(())
 }
 
 /// `candidate` pairs whose `first_seen_at` is within `ttl_h` hours of `now`
@@ -138,18 +146,20 @@ pub fn dirty_candidates(
     ttl_h: i64,
 ) -> Result<Vec<PairWithCounts>, StoreError> {
     let cutoff = now - ttl_h * 3600;
+    // Round 1 finding 5 (BC78): starts from `counts WHERE dirty = 1`, which
+    // the `counts_dirty` partial index serves, then joins `pairs` on either
+    // side, then applies the state and TTL filters. `DISTINCT` collapses
+    // the join's two rows for a pair whose counts are dirty on both sides.
     let mut stmt = conn.prepare(
-        "SELECT quote_uri, quote_did, quote_cid, original_uri, original_did, quoted_at, first_seen_at
-         FROM pairs
-         WHERE state = 'candidate'
-           AND first_seen_at >= ?1
-           AND EXISTS (
-               SELECT 1 FROM counts
-               WHERE (counts.post_uri = pairs.quote_uri OR counts.post_uri = pairs.original_uri)
-                 AND counts.dirty = 1
-           )",
+        "SELECT DISTINCT p.quote_uri, p.quote_did, p.quote_cid, p.original_uri, p.original_did, p.quoted_at, p.first_seen_at
+         FROM counts c
+         JOIN pairs p ON (c.post_uri = p.quote_uri OR c.post_uri = p.original_uri)
+         WHERE c.dirty = 1
+           AND p.state = ?1
+           AND p.first_seen_at >= ?2",
     )?;
-    let rows = stmt.query_map([cutoff], pair_columns)?;
+    let rows =
+        stmt.query_map(rusqlite::params![PairState::Candidate.as_str(), cutoff], pair_columns)?;
     rows_with_counts(conn, rows)
 }
 
@@ -164,9 +174,10 @@ pub fn promoted_within(
     let mut stmt = conn.prepare(
         "SELECT quote_uri, quote_did, quote_cid, original_uri, original_did, quoted_at, first_seen_at
          FROM pairs
-         WHERE state = 'promoted' AND quoted_at >= ?1",
+         WHERE state = ?1 AND quoted_at >= ?2",
     )?;
-    let rows = stmt.query_map([cutoff], pair_columns)?;
+    let rows =
+        stmt.query_map(rusqlite::params![PairState::Promoted.as_str(), cutoff], pair_columns)?;
     rows_with_counts(conn, rows)
 }
 
@@ -174,30 +185,35 @@ pub fn promoted_within(
 /// `drop_reason = NULL` (BC55).
 pub fn demote(conn: &Connection, quote_uri: &str) -> Result<(), StoreError> {
     feed::delete_feed_row(conn, quote_uri)?;
-    conn.execute(
-        "UPDATE pairs SET state = 'candidate', drop_reason = NULL WHERE quote_uri = ?1",
-        [quote_uri],
-    )?;
+    let mut stmt = conn
+        .prepare_cached("UPDATE pairs SET state = ?2, drop_reason = NULL WHERE quote_uri = ?1")?;
+    stmt.execute(rusqlite::params![quote_uri, PairState::Candidate.as_str()])?;
     Ok(())
 }
 
 /// Marks the pair `dropped` with `reason` and deletes its `feed` row
-/// (BC56). The pair row stays.
+/// (BC56). The pair row stays. Round 1 finding 7: every dropped-state
+/// transition (`detach`, both sides of `delete_post`) goes through this one
+/// function.
 pub fn drop_pair(conn: &Connection, quote_uri: &str, reason: DropReason) -> Result<(), StoreError> {
     feed::delete_feed_row(conn, quote_uri)?;
-    conn.execute(
-        "UPDATE pairs SET state = 'dropped', drop_reason = ?2 WHERE quote_uri = ?1",
-        rusqlite::params![quote_uri, reason.as_str()],
-    )?;
+    let mut stmt =
+        conn.prepare_cached("UPDATE pairs SET state = ?2, drop_reason = ?3 WHERE quote_uri = ?1")?;
+    stmt.execute(rusqlite::params![quote_uri, PairState::Dropped.as_str(), reason.as_str()])?;
     Ok(())
 }
 
 /// TECH-DESIGN section 7.2 step 6. Deletes `candidate` or `dropped` pairs
-/// whose `first_seen_at` is older than `candidate_ttl_h` hours, and their
-/// `counts` rows (BC58). Deletes `feed` rows whose `promoted_at` is older
-/// than `feed_ttl_d` days, and their pairs and counts rows with them
-/// (BC59). A `promoted` pair inside the feed TTL but past the candidate TTL
-/// is kept: it lives by the feed TTL, never the candidate TTL (BC60).
+/// whose `first_seen_at` is older than `candidate_ttl_h` hours (BC58).
+/// Deletes `feed` rows whose `promoted_at` is older than `feed_ttl_d` days,
+/// and their pairs with them (BC59). A `promoted` pair inside the feed TTL
+/// but past the candidate TTL is kept: it lives by the feed TTL, never the
+/// candidate TTL (BC60). Round 1 finding 1: a side's `counts` row is
+/// deleted, and that URI reported in `ExpireReport::evicted_uris`, only when
+/// no non-dropped pair still names it on either side (BC61) — so a URI a
+/// live pair still needs (a shared original whose other quote survives) is
+/// never evicted. Round 1 finding 5 (BC79): every delete here is one
+/// statement over the whole matching set, not one statement per row.
 pub fn expire(
     conn: &Connection,
     now: i64,
@@ -205,30 +221,42 @@ pub fn expire(
     feed_ttl_d: i64,
 ) -> Result<ExpireReport, StoreError> {
     let mut report = ExpireReport::default();
+    let mut touched_uris: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // BC58: candidate/dropped pairs older than the candidate TTL. `feed`
     // never holds a row for these states, so no feed delete is needed.
     let candidate_cutoff = now - candidate_ttl_h * 3600;
     let expired_candidates: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT quote_uri, original_uri FROM pairs
-             WHERE state IN ('candidate', 'dropped') AND first_seen_at < ?1",
+            "SELECT quote_uri, original_uri FROM pairs WHERE state IN (?1, ?2) AND first_seen_at < ?3",
         )?;
-        let rows = stmt.query_map([candidate_cutoff], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                PairState::Candidate.as_str(),
+                PairState::Dropped.as_str(),
+                candidate_cutoff
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    for (quote_uri, original_uri) in expired_candidates {
-        conn.execute("DELETE FROM pairs WHERE quote_uri = ?1", [&quote_uri])?;
-        counts::delete_counts(conn, &quote_uri)?;
-        counts::delete_counts(conn, &original_uri)?;
-        report.evicted_uris.push(quote_uri);
-        report.evicted_uris.push(original_uri);
-        report.candidates_expired += 1;
+    report.candidates_expired = expired_candidates.len();
+    for (quote_uri, original_uri) in &expired_candidates {
+        touched_uris.insert(quote_uri.clone());
+        touched_uris.insert(original_uri.clone());
     }
+    conn.execute(
+        "DELETE FROM pairs WHERE state IN (?1, ?2) AND first_seen_at < ?3",
+        rusqlite::params![
+            PairState::Candidate.as_str(),
+            PairState::Dropped.as_str(),
+            candidate_cutoff
+        ],
+    )?;
 
-    // BC59: feed rows older than the feed TTL, and their pairs.
+    // BC59: feed rows older than the feed TTL, and their pairs. `feed` must
+    // be deleted before `pairs`, because `feed.quote_uri` references
+    // `pairs.quote_uri` and `foreign_keys` is on.
     let feed_cutoff = now - feed_ttl_d * 86400;
     let expired_feed: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
@@ -241,15 +269,36 @@ pub fn expire(
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    for (quote_uri, original_uri) in expired_feed {
-        feed::delete_feed_row(conn, &quote_uri)?;
-        conn.execute("DELETE FROM pairs WHERE quote_uri = ?1", [&quote_uri])?;
-        counts::delete_counts(conn, &quote_uri)?;
-        counts::delete_counts(conn, &original_uri)?;
-        report.evicted_uris.push(quote_uri);
-        report.evicted_uris.push(original_uri);
-        report.feed_expired += 1;
+    report.feed_expired = expired_feed.len();
+    for (quote_uri, original_uri) in &expired_feed {
+        touched_uris.insert(quote_uri.clone());
+        touched_uris.insert(original_uri.clone());
     }
+    conn.execute("DELETE FROM feed WHERE promoted_at < ?1", [feed_cutoff])?;
+    if !expired_feed.is_empty() {
+        let placeholders = vec!["?"; expired_feed.len()].join(",");
+        let sql = format!("DELETE FROM pairs WHERE quote_uri IN ({placeholders})");
+        let quote_uris: Vec<&String> =
+            expired_feed.iter().map(|(quote_uri, _)| quote_uri).collect();
+        conn.execute(&sql, rusqlite::params_from_iter(quote_uris))?;
+    }
+
+    // Round 1 finding 1: only a URI no non-dropped pair still names is
+    // evicted.
+    let mut orphaned: Vec<String> = touched_uris
+        .into_iter()
+        .map(|uri| is_orphaned(conn, &uri).map(|orphaned| (uri, orphaned)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(|(uri, orphaned)| orphaned.then_some(uri))
+        .collect();
+    if !orphaned.is_empty() {
+        orphaned.sort();
+        let placeholders = vec!["?"; orphaned.len()].join(",");
+        let sql = format!("DELETE FROM counts WHERE post_uri IN ({placeholders})");
+        conn.execute(&sql, rusqlite::params_from_iter(orphaned.iter()))?;
+    }
+    report.evicted_uris = orphaned;
 
     Ok(report)
 }
@@ -307,14 +356,7 @@ fn rows_with_counts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema;
-
-    fn migrated_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        schema::migrate(&conn).unwrap();
-        conn
-    }
+    use crate::store::test_support::migrated_conn;
 
     fn insert_test_pair(conn: &Connection, quote_uri: &str, original_uri: &str) {
         insert_pair(
@@ -332,8 +374,12 @@ mod tests {
 
     fn insert_feed_row(conn: &Connection, quote_uri: &str) {
         conn.execute(
-            "INSERT INTO feed (quote_uri, quote_cid, quote_did, original_did, quoted_at, ratio, rank, promoted_at, verified_at)
-             VALUES (?1, 'bafyq', 'did:plc:q', 'did:plc:o', 1700000000, 1.0, 1.0, 1700000000, 1700000000)",
+            "INSERT INTO feed (
+                quote_uri, quote_cid, quote_did, original_did, quoted_at,
+                v_likes_q, v_reposts_q, v_replies_q, v_likes_o, v_reposts_o, v_replies_o,
+                ratio, rank, promoted_at, verified_at
+             )
+             VALUES (?1, 'bafyq', 'did:plc:q', 'did:plc:o', 1700000000, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 1700000000, 1700000000)",
             [quote_uri],
         )
         .unwrap();
@@ -367,9 +413,47 @@ mod tests {
 
         delete_post(&conn, quote_uri).unwrap();
 
-        assert_eq!(pair_count(&conn), 0);
+        // Round 1 finding 7: the pair row stays, dropped, for `expire` to
+        // remove, instead of a hard delete that hid `quote_gone` from the
+        // per-reason accounting.
+        assert_eq!(pair_count(&conn), 1, "the pair row stays for expire to remove");
         assert_eq!(feed_count(&conn), 0);
+        let (state, drop_reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, drop_reason FROM pairs WHERE quote_uri = ?1",
+                [quote_uri],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "dropped");
+        assert_eq!(drop_reason, Some("quote_gone".to_string()));
         assert_eq!(counts::counts_for(&conn, quote_uri).unwrap(), crate::score::Counts::default());
+    }
+
+    #[test]
+    fn delete_post_keeps_a_shared_original() {
+        let conn = migrated_conn();
+        let original_uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        let q1 = "at://did:plc:q/app.bsky.feed.post/q1";
+        let q2 = "at://did:plc:q/app.bsky.feed.post/q2";
+        insert_test_pair(&conn, q1, original_uri);
+        insert_test_pair(&conn, q2, original_uri);
+        counts::incr(&conn, original_uri, crate::store::writer::CountField::Likes, 1_700_000_100)
+            .unwrap();
+
+        // q1 is deleted; q2 still holds a live, non-dropped reference to
+        // the shared original, so the original's counts row must survive
+        // (round 1 finding 1).
+        delete_post(&conn, q1).unwrap();
+
+        assert_eq!(
+            counts::counts_for(&conn, original_uri).unwrap(),
+            crate::score::Counts { likes: 1, reposts: 0, replies: 0 }
+        );
+        let q2_state: String = conn
+            .query_row("SELECT state FROM pairs WHERE quote_uri = ?1", [q2], |row| row.get(0))
+            .unwrap();
+        assert_eq!(q2_state, "candidate", "q2's pair is untouched");
     }
 
     #[test]
@@ -436,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_set_uris_yields_both_uris_of_every_non_dropped_pair() {
+    fn for_each_hot_uri() {
         let conn = migrated_conn();
         insert_test_pair(
             &conn,
@@ -448,15 +532,23 @@ mod tests {
             "at://did:plc:q/app.bsky.feed.post/q2",
             "at://did:plc:o/app.bsky.feed.post/o2",
         );
+        insert_test_pair(
+            &conn,
+            "at://did:plc:q/app.bsky.feed.post/q3",
+            "at://did:plc:o/app.bsky.feed.post/o3",
+        );
         detach(&conn, "at://did:plc:q/app.bsky.feed.post/q2").unwrap();
 
-        let mut uris: Vec<String> = hot_set_uris(&conn).unwrap().collect();
+        let mut uris: Vec<String> = Vec::new();
+        super::for_each_hot_uri(&conn, |uri| uris.push(uri.to_string())).unwrap();
         uris.sort();
         assert_eq!(
             uris,
             vec![
                 "at://did:plc:o/app.bsky.feed.post/o1".to_string(),
+                "at://did:plc:o/app.bsky.feed.post/o3".to_string(),
                 "at://did:plc:q/app.bsky.feed.post/q1".to_string(),
+                "at://did:plc:q/app.bsky.feed.post/q3".to_string(),
             ]
         );
     }
@@ -663,5 +755,32 @@ mod tests {
         assert!(!remaining.contains(old_candidate));
         assert!(!remaining.contains(old_feed));
         assert_eq!(feed_count(&conn), 1, "only kept_promoted's feed row remains");
+    }
+
+    #[test]
+    fn expire_keeps_a_shared_original() {
+        let conn = migrated_conn();
+        let original_uri = "at://did:plc:o/app.bsky.feed.post/shared-o";
+        let q1 = "at://did:plc:q/app.bsky.feed.post/q1";
+        let q2 = "at://did:plc:q/app.bsky.feed.post/q2";
+        insert_test_pair(&conn, q1, original_uri);
+        insert_test_pair(&conn, q2, original_uri);
+        counts::incr(&conn, original_uri, crate::store::writer::CountField::Likes, 1).unwrap();
+        // Only q1 is old enough to expire; q2 keeps a live reference to the
+        // shared original.
+        conn.execute("UPDATE pairs SET first_seen_at = 0 WHERE quote_uri = ?1", [q1]).unwrap();
+
+        let report = super::expire(&conn, 1_700_000_000, 48, 30).unwrap();
+
+        assert_eq!(report.candidates_expired, 1);
+        assert!(
+            !report.evicted_uris.contains(&original_uri.to_string()),
+            "the shared original must not be reported as evicted"
+        );
+        assert_eq!(
+            counts::counts_for(&conn, original_uri).unwrap(),
+            crate::score::Counts { likes: 1, reposts: 0, replies: 0 },
+            "the shared original's counts row must survive"
+        );
     }
 }

@@ -12,39 +12,62 @@ use crate::store::StoreError;
 /// first use (BC11, BC28). Always sets `dirty = 1` and `last_event_at =
 /// now`, whether the row is new or already existed. Called twice in one
 /// batch for the same `post_uri` moves the column by two (BC29), because
-/// each call is its own statement inside the caller's transaction.
+/// each call is its own statement inside the caller's transaction. Round 1
+/// finding 5 (BC77): one of three fixed SQL strings, one per `CountField`,
+/// prepared through `prepare_cached` so no batch of up to 1,000 ops
+/// re-parses SQL per op.
 pub fn incr(
     conn: &Connection,
     post_uri: &str,
     field: CountField,
     now: i64,
 ) -> Result<(), StoreError> {
-    let column = match field {
-        CountField::Likes => "likes",
-        CountField::Reposts => "reposts",
-        CountField::Replies => "replies",
+    let sql = match field {
+        CountField::Likes => {
+            "INSERT INTO counts (post_uri, likes, last_event_at, dirty) VALUES (?1, 1, ?2, 1)
+             ON CONFLICT(post_uri) DO UPDATE SET likes = likes + 1, last_event_at = ?2, dirty = 1"
+        }
+        CountField::Reposts => {
+            "INSERT INTO counts (post_uri, reposts, last_event_at, dirty) VALUES (?1, 1, ?2, 1)
+             ON CONFLICT(post_uri) DO UPDATE SET reposts = reposts + 1, last_event_at = ?2, dirty = 1"
+        }
+        CountField::Replies => {
+            "INSERT INTO counts (post_uri, replies, last_event_at, dirty) VALUES (?1, 1, ?2, 1)
+             ON CONFLICT(post_uri) DO UPDATE SET replies = replies + 1, last_event_at = ?2, dirty = 1"
+        }
     };
-    let sql = format!(
-        "INSERT INTO counts (post_uri, {column}, last_event_at, dirty) VALUES (?1, 1, ?2, 1)
-         ON CONFLICT(post_uri) DO UPDATE SET {column} = {column} + 1, last_event_at = ?2, dirty = 1"
-    );
-    conn.execute(&sql, rusqlite::params![post_uri, now])?;
+    let mut stmt = conn.prepare_cached(sql)?;
+    stmt.execute(rusqlite::params![post_uri, now])?;
     Ok(())
 }
 
-/// Clears `dirty` on every URI in `post_uris`. A URI with no `counts` row is
-/// skipped, not an error (BC50): the `UPDATE` simply touches zero rows.
+/// Clears `dirty` on every URI in `post_uris` in one set-based `UPDATE`
+/// (BC50, round 1 finding 5), not one statement per URI. A URI with no
+/// `counts` row is skipped, not an error: the `UPDATE` simply touches zero
+/// rows for it.
 pub fn clear_dirty(conn: &Connection, post_uris: &[&str]) -> Result<(), StoreError> {
-    for post_uri in post_uris {
-        conn.execute("UPDATE counts SET dirty = 0 WHERE post_uri = ?1", [post_uri])?;
+    if post_uris.is_empty() {
+        return Ok(());
     }
+    let placeholders = vec!["?"; post_uris.len()].join(",");
+    let sql = format!("UPDATE counts SET dirty = 0 WHERE post_uri IN ({placeholders})");
+    conn.execute(&sql, rusqlite::params_from_iter(post_uris.iter()))?;
+    Ok(())
+}
+
+/// Sets `dirty = 1` on every `counts` row in one statement (round 1
+/// finding 2, `Op::MarkAllDirty`).
+pub fn mark_all_dirty(conn: &Connection) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare_cached("UPDATE counts SET dirty = 1")?;
+    stmt.execute([])?;
     Ok(())
 }
 
 /// Deletes the `counts` row for `post_uri`, if one exists. A no-op when
 /// there is none.
 pub fn delete_counts(conn: &Connection, post_uri: &str) -> Result<(), StoreError> {
-    conn.execute("DELETE FROM counts WHERE post_uri = ?1", [post_uri])?;
+    let mut stmt = conn.prepare_cached("DELETE FROM counts WHERE post_uri = ?1")?;
+    stmt.execute([post_uri])?;
     Ok(())
 }
 
@@ -81,13 +104,7 @@ fn saturate(value: i64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema;
-
-    fn migrated_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        schema::migrate(&conn).unwrap();
-        conn
-    }
+    use crate::store::test_support::migrated_conn;
 
     #[test]
     fn lazy_row_creation() {

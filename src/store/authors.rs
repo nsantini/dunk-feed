@@ -22,7 +22,7 @@ pub struct AuthorRow {
 /// `StoreError::MalformedRow` (BC66): the row is never returned with a
 /// silently empty label list.
 pub fn author_get(conn: &Connection, did: &str) -> Result<Option<AuthorRow>, StoreError> {
-    let row = conn.query_row(
+    let row = crate::store::optional(conn.query_row(
         "SELECT did, followers, active, labels, checked_at FROM authors WHERE did = ?1",
         [did],
         |row| {
@@ -33,17 +33,16 @@ pub fn author_get(conn: &Connection, did: &str) -> Result<Option<AuthorRow>, Sto
             let checked_at: i64 = row.get(4)?;
             Ok((did, followers, active, labels, checked_at))
         },
-    );
+    ))?;
     match row {
-        Ok((did, followers, active, labels, checked_at)) => {
+        None => Ok(None),
+        Some((did, followers, active, labels, checked_at)) => {
             let labels = match labels {
                 None => None,
                 Some(text) => Some(parse_labels(&text)?),
             };
             Ok(Some(AuthorRow { did, followers, active: active != 0, labels, checked_at }))
         }
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(err) => Err(StoreError::Sqlite(err)),
     }
 }
 
@@ -80,13 +79,7 @@ fn parse_labels(text: &str) -> Result<Vec<String>, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema;
-
-    fn migrated_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        schema::migrate(&conn).unwrap();
-        conn
-    }
+    use crate::store::test_support::migrated_conn;
 
     fn row(did: &str) -> AuthorRow {
         AuthorRow {

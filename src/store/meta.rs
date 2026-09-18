@@ -10,11 +10,9 @@ use crate::store::StoreError;
 /// Reads one key. `Ok(None)` when the key has no row (BC67); `meta_set`
 /// inserts or replaces, so there is never more than one row per key.
 pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, StoreError> {
-    match conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0)) {
-        Ok(value) => Ok(Some(value)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(err) => Err(StoreError::Sqlite(err)),
-    }
+    crate::store::optional(
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0)),
+    )
 }
 
 /// Inserts or replaces one key.
@@ -50,13 +48,7 @@ pub fn set_cursor(conn: &Connection, seq: u64) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema;
-
-    fn migrated_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        schema::migrate(&conn).unwrap();
-        conn
-    }
+    use crate::store::test_support::migrated_conn;
 
     #[test]
     fn meta_get_missing_key_is_none() {

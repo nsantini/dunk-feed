@@ -4,11 +4,13 @@
 
 use rusqlite::Connection;
 
-use crate::store::StoreError;
+use crate::store::{PairState, StoreError};
 
 /// One row of the `feed` table, TECH-DESIGN section 6. The six `v_*`
-/// columns are nullable because a pair can be promoted before both sides
-/// have every count type.
+/// columns are `INTEGER NOT NULL` (round 1 finding 8, BC82): section 7.2
+/// step 4 promotes only on verified counts, so all six always exist by the
+/// time a `FeedRow` is written, and a promotion without them is a type
+/// error rather than a null row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedRow {
     pub quote_uri: String,
@@ -16,12 +18,12 @@ pub struct FeedRow {
     pub quote_did: String,
     pub original_did: String,
     pub quoted_at: i64,
-    pub v_likes_q: Option<i64>,
-    pub v_reposts_q: Option<i64>,
-    pub v_replies_q: Option<i64>,
-    pub v_likes_o: Option<i64>,
-    pub v_reposts_o: Option<i64>,
-    pub v_replies_o: Option<i64>,
+    pub v_likes_q: i64,
+    pub v_reposts_q: i64,
+    pub v_replies_q: i64,
+    pub v_likes_o: i64,
+    pub v_reposts_o: i64,
+    pub v_replies_o: i64,
     pub ratio: f64,
     pub rank: f64,
     pub promoted_at: i64,
@@ -34,7 +36,8 @@ pub struct FeedRow {
 /// first, because `feed.quote_uri` references `pairs.quote_uri` and
 /// `foreign_keys` is on.
 pub fn delete_feed_row(conn: &Connection, quote_uri: &str) -> Result<(), StoreError> {
-    conn.execute("DELETE FROM feed WHERE quote_uri = ?1", [quote_uri])?;
+    let mut stmt = conn.prepare_cached("DELETE FROM feed WHERE quote_uri = ?1")?;
+    stmt.execute([quote_uri])?;
     Ok(())
 }
 
@@ -83,10 +86,9 @@ pub fn promote(conn: &Connection, row: &FeedRow) -> Result<(), StoreError> {
             row.verified_at,
         ],
     )?;
-    conn.execute(
-        "UPDATE pairs SET state = 'promoted', drop_reason = NULL WHERE quote_uri = ?1",
-        [&row.quote_uri],
-    )?;
+    let mut stmt = conn
+        .prepare_cached("UPDATE pairs SET state = ?2, drop_reason = NULL WHERE quote_uri = ?1")?;
+    stmt.execute(rusqlite::params![row.quote_uri, PairState::Promoted.as_str()])?;
     Ok(())
 }
 
@@ -126,14 +128,7 @@ pub fn feed_rows(conn: &Connection) -> Result<Vec<FeedRow>, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::schema;
-
-    fn migrated_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        schema::migrate(&conn).unwrap();
-        conn
-    }
+    use crate::store::test_support::migrated_conn;
 
     fn insert_pair_row(conn: &Connection, quote_uri: &str) {
         crate::store::pairs::insert_pair(
@@ -161,8 +156,12 @@ mod tests {
         let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
         insert_pair_row(&conn, quote_uri);
         conn.execute(
-            "INSERT INTO feed (quote_uri, quote_cid, quote_did, original_did, quoted_at, ratio, rank, promoted_at, verified_at)
-             VALUES (?1, 'bafyq', 'did:plc:q', 'did:plc:o', 1700000000, 1.0, 1.0, 1700000000, 1700000000)",
+            "INSERT INTO feed (
+                quote_uri, quote_cid, quote_did, original_did, quoted_at,
+                v_likes_q, v_reposts_q, v_replies_q, v_likes_o, v_reposts_o, v_replies_o,
+                ratio, rank, promoted_at, verified_at
+             )
+             VALUES (?1, 'bafyq', 'did:plc:q', 'did:plc:o', 1700000000, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 1700000000, 1700000000)",
             [quote_uri],
         )
         .unwrap();
@@ -180,12 +179,12 @@ mod tests {
             quote_did: "did:plc:q".to_string(),
             original_did: "did:plc:o".to_string(),
             quoted_at: 1_700_000_000,
-            v_likes_q: Some(1),
-            v_reposts_q: None,
-            v_replies_q: None,
-            v_likes_o: Some(2),
-            v_reposts_o: None,
-            v_replies_o: None,
+            v_likes_q: 1,
+            v_reposts_q: 0,
+            v_replies_q: 0,
+            v_likes_o: 2,
+            v_reposts_o: 0,
+            v_replies_o: 0,
             ratio: 1.5,
             rank,
             promoted_at,
@@ -222,10 +221,10 @@ mod tests {
 
         promote(&conn, &feed_row(quote_uri, 1.0, 1_700_000_000)).unwrap();
         let mut second = feed_row(quote_uri, 2.5, 1_700_099_999);
-        second.v_likes_q = Some(99);
+        second.v_likes_q = 99;
         promote(&conn, &second).unwrap();
 
-        let (rank, promoted_at, v_likes_q): (f64, i64, Option<i64>) = conn
+        let (rank, promoted_at, v_likes_q): (f64, i64, i64) = conn
             .query_row(
                 "SELECT rank, promoted_at, v_likes_q FROM feed WHERE quote_uri = ?1",
                 [quote_uri],
@@ -233,7 +232,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rank, 2.5, "every column but promoted_at is replaced");
-        assert_eq!(v_likes_q, Some(99));
+        assert_eq!(v_likes_q, 99);
         assert_eq!(promoted_at, 1_700_000_000, "promoted_at keeps its first value");
     }
 
