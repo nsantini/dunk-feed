@@ -116,7 +116,7 @@ pub fn candidates(posts: Vec<PostView>) -> Vec<Candidate> {
         if !seen.insert(quote.uri.clone()) {
             continue;
         }
-        if original_uri.did() == quote.author.did {
+        if embed::is_self_quote(&original_uri, &quote.author.did) {
             out.push(Candidate::SelfQuote { quote, original_uri });
         } else {
             out.push(Candidate::Scoreable { quote, original_uri });
@@ -237,14 +237,13 @@ pub fn build_rows(
 /// requires a non-negative age, and a caller error here must never produce
 /// one silently.
 pub fn age_hours(created_at: &str, now: DateTime<Utc>) -> f64 {
-    let parsed = DateTime::parse_from_rfc3339(created_at).map(|dt| dt.with_timezone(&Utc));
-    let hours = match parsed {
-        Ok(created_at) => {
-            let seconds = now.signed_duration_since(created_at).num_seconds();
-            seconds as f64 / 3600.0
-        }
-        Err(err) => {
-            eprintln!("warning: quote createdAt {created_at:?} does not parse as RFC 3339: {err}");
+    // Round 1 finding 7: shares `parse_rfc3339_secs` with
+    // `CommitEvent::time_secs` and `ingest::quoted_at` instead of parsing
+    // RFC3339 a second way here.
+    let hours = match crate::jetstream::event::parse_rfc3339_secs(created_at) {
+        Some(secs) => (now.timestamp() - secs) as f64 / 3600.0,
+        None => {
+            eprintln!("warning: quote createdAt {created_at:?} does not parse as RFC 3339");
             return 0.0;
         }
     };

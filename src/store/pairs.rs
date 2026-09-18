@@ -9,7 +9,7 @@
 //! `drop_pair`, and every SQL statement here that writes a `state` column
 //! uses `PairState::as_str()`, never a literal.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::score::Counts;
 use crate::store::{counts, feed, DropReason, PairState, StoreError};
@@ -92,9 +92,19 @@ fn is_orphaned(conn: &Connection, uri: &str) -> Result<bool, StoreError> {
 /// deleted only when no non-dropped pair still names it on either side
 /// (round 1 finding 1), which after the drops above holds unless `uri` is
 /// still someone else's live original or quote.
-pub fn delete_post(conn: &Connection, uri: &str) -> Result<(), StoreError> {
-    // BC30: this `uri` as a quote_uri.
-    drop_pair(conn, uri, DropReason::QuoteGone)?;
+///
+/// Round 1 finding 2 (BC38): returns exactly the URIs that `for_each_hot_uri`
+/// would have listed before this call and will not list after it, so
+/// `run_ingest` can evict them from its in-memory `HotSet` without a second
+/// scan. `uri` itself, `uri`'s own original (if `uri` is also a quote), and
+/// every quote this call drops via `DropReason::OriginalGone` are the only
+/// URIs whose hot-ness can change; each is checked with `is_orphaned` before
+/// and after the drops, since only a URI that was live and is now orphaned
+/// left the hot set.
+pub fn delete_post(conn: &Connection, uri: &str) -> Result<Vec<String>, StoreError> {
+    let own_original: Option<String> = conn
+        .query_row("SELECT original_uri FROM pairs WHERE quote_uri = ?1", [uri], |row| row.get(0))
+        .optional()?;
 
     // BC31: this `uri` as an original_uri.
     let quote_uris: Vec<String> = {
@@ -102,21 +112,66 @@ pub fn delete_post(conn: &Connection, uri: &str) -> Result<(), StoreError> {
         let rows = stmt.query_map([uri], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
+
+    let mut candidates = vec![uri.to_string()];
+    candidates.extend(own_original.iter().cloned());
+    candidates.extend(quote_uris.iter().cloned());
+    candidates.sort();
+    candidates.dedup();
+    let mut was_live = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        was_live.push(!is_orphaned(conn, candidate)?);
+    }
+
+    // BC30: this `uri` as a quote_uri.
+    drop_pair(conn, uri, DropReason::QuoteGone)?;
     for quote_uri in &quote_uris {
         drop_pair(conn, quote_uri, DropReason::OriginalGone)?;
+    }
+
+    let mut evicted = Vec::new();
+    for (candidate, was_live) in candidates.iter().zip(was_live) {
+        if was_live && is_orphaned(conn, candidate)? {
+            evicted.push(candidate.clone());
+        }
     }
 
     // BC32, round 1 finding 1.
     if is_orphaned(conn, uri)? {
         counts::delete_counts(conn, uri)?;
     }
-    Ok(())
+    Ok(evicted)
 }
 
 /// A `postgate` detach for `quote_uri`: `drop_pair` with `DropReason::Detached`
-/// (BC33).
-pub fn detach(conn: &Connection, quote_uri: &str) -> Result<(), StoreError> {
-    drop_pair(conn, quote_uri, DropReason::Detached)
+/// (BC33). Round 1 finding 2 (BC38): returns the same way `delete_post`
+/// does, checking `quote_uri` and its `original_uri` for a live-to-orphaned
+/// transition.
+pub fn detach(conn: &Connection, quote_uri: &str) -> Result<Vec<String>, StoreError> {
+    let original_uri: Option<String> = conn
+        .query_row("SELECT original_uri FROM pairs WHERE quote_uri = ?1", [quote_uri], |row| {
+            row.get(0)
+        })
+        .optional()?;
+
+    let mut candidates = vec![quote_uri.to_string()];
+    candidates.extend(original_uri.iter().cloned());
+    candidates.sort();
+    candidates.dedup();
+    let mut was_live = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        was_live.push(!is_orphaned(conn, candidate)?);
+    }
+
+    drop_pair(conn, quote_uri, DropReason::Detached)?;
+
+    let mut evicted = Vec::new();
+    for (candidate, was_live) in candidates.iter().zip(was_live) {
+        if was_live && is_orphaned(conn, candidate)? {
+            evicted.push(candidate.clone());
+        }
+    }
+    Ok(evicted)
 }
 
 /// Streams `quote_uri` and then `original_uri` of every pair whose `state`
@@ -485,6 +540,37 @@ mod tests {
         );
     }
 
+    // Round 1 finding 2, BC38: an original with two quotes and no other
+    // references evicts three URIs — both quotes and the original.
+    #[test]
+    fn delete_post_of_an_original_with_two_quotes_evicts_all_three() {
+        let conn = migrated_conn();
+        let original_uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        let q1 = "at://did:plc:q/app.bsky.feed.post/q1";
+        let q2 = "at://did:plc:q/app.bsky.feed.post/q2";
+        insert_test_pair(&conn, q1, original_uri);
+        insert_test_pair(&conn, q2, original_uri);
+
+        let mut evicted = delete_post(&conn, original_uri).unwrap();
+        evicted.sort();
+        assert_eq!(evicted, vec![original_uri, q1, q2]);
+    }
+
+    #[test]
+    fn delete_post_keeps_a_shared_original_out_of_the_eviction_list() {
+        let conn = migrated_conn();
+        let original_uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        let q1 = "at://did:plc:q/app.bsky.feed.post/q1";
+        let q2 = "at://did:plc:q/app.bsky.feed.post/q2";
+        insert_test_pair(&conn, q1, original_uri);
+        insert_test_pair(&conn, q2, original_uri);
+
+        // q1 alone is deleted; q2 still needs the original, so only q1
+        // leaves the hot set.
+        let evicted = delete_post(&conn, q1).unwrap();
+        assert_eq!(evicted, vec![q1]);
+    }
+
     #[test]
     fn delete_post_when_uri_in_no_pair() {
         let conn = migrated_conn();
@@ -517,6 +603,33 @@ mod tests {
         assert_eq!(state, "dropped");
         assert_eq!(drop_reason, Some("detached".to_string()));
         assert_eq!(pair_count(&conn), 1, "the pair row stays");
+    }
+
+    // Round 1 finding 2, BC38: detach evicts both sides of the dropped pair
+    // when neither is needed elsewhere.
+    #[test]
+    fn detach_evicts_both_sides_with_no_other_reference() {
+        let conn = migrated_conn();
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
+        let original_uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        insert_test_pair(&conn, quote_uri, original_uri);
+
+        let mut evicted = detach(&conn, quote_uri).unwrap();
+        evicted.sort();
+        assert_eq!(evicted, vec![original_uri, quote_uri]);
+    }
+
+    #[test]
+    fn detach_keeps_an_original_still_live_elsewhere() {
+        let conn = migrated_conn();
+        let original_uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        let q1 = "at://did:plc:q/app.bsky.feed.post/q1";
+        let q2 = "at://did:plc:q/app.bsky.feed.post/q2";
+        insert_test_pair(&conn, q1, original_uri);
+        insert_test_pair(&conn, q2, original_uri);
+
+        let evicted = detach(&conn, q1).unwrap();
+        assert_eq!(evicted, vec![q1]);
     }
 
     #[test]

@@ -92,8 +92,17 @@ impl CommitEvent {
 
     /// Unix seconds. `None` when `time` did not parse (BC11).
     pub fn time_secs(&self) -> Option<i64> {
-        self.parsed_time().map(|dt| dt.timestamp())
+        parse_rfc3339_secs(&self.time)
     }
+}
+
+/// Parses `s` as RFC3339, returning unix seconds; `None` when it does not
+/// parse. Round 1 finding 7: the one place an RFC3339 timestamp string is
+/// turned into unix seconds, shared by `CommitEvent::time_secs`,
+/// `validate::age_hours` and `ingest::quoted_at`, so the three ingest and
+/// validate call sites read the same rule.
+pub fn parse_rfc3339_secs(s: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
 }
 
 /// What `client.rs`'s `next()` returns to the caller. `Identity`, `Account`,
@@ -257,5 +266,12 @@ mod tests {
         };
         assert_eq!(commit.time_micros(), None);
         assert_eq!(commit.time_secs(), None);
+    }
+
+    // Round 1 finding 7.
+    #[test]
+    fn parse_rfc3339_secs_parses_and_rejects() {
+        assert_eq!(parse_rfc3339_secs("2026-01-01T00:00:00Z"), Some(1_767_225_600));
+        assert_eq!(parse_rfc3339_secs("not-a-timestamp"), None);
     }
 }

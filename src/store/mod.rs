@@ -377,7 +377,22 @@ impl Store {
         if self.writer_started.swap(true, Ordering::SeqCst) {
             return Err(StoreError::WriterAlreadyStarted);
         }
-        Ok(writer::spawn(Arc::clone(&self.conn), cfg))
+        Ok(writer::spawn(Arc::clone(&self.conn), cfg, None))
+    }
+
+    /// Starts the one writer thread with `WriterConfig::default()`, wired to
+    /// send every batch's evicted URIs (BC38) on `evict_tx`. Round 1
+    /// finding 2: the one constructor `run` (`src/ingest/mod.rs`, slice 6.0)
+    /// uses; `writer()` and `writer_with()` keep their signatures and start
+    /// a writer with no eviction sender at all.
+    pub fn writer_evicting(
+        &self,
+        evict_tx: tokio::sync::mpsc::UnboundedSender<Vec<String>>,
+    ) -> Result<writer::WriterHandle, StoreError> {
+        if self.writer_started.swap(true, Ordering::SeqCst) {
+            return Err(StoreError::WriterAlreadyStarted);
+        }
+        Ok(writer::spawn(Arc::clone(&self.conn), writer::WriterConfig::default(), Some(evict_tx)))
     }
 }
 

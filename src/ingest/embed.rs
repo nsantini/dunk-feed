@@ -56,6 +56,25 @@ impl AtUri {
             .and_then(|rest| rest.splitn(3, '/').nth(2))
             .expect("AtUri only holds a string that already parsed")
     }
+
+    /// The collection segment of `at://<authority>/<collection>/<rkey>`,
+    /// with no other validation of the shape `parse` requires. Round 1
+    /// finding 7: an associated function, not a method on a parsed `AtUri`,
+    /// because `classify_embed` (`src/ingest/mod.rs`) needs the collection
+    /// of a URI that `parse` has already rejected; a method could only ever
+    /// return `app.bsky.feed.post`.
+    pub fn collection_of(uri: &str) -> Option<&str> {
+        uri.strip_prefix("at://").and_then(|rest| rest.split('/').nth(1))
+    }
+}
+
+/// Whether `original` is the quoting author's own post: `original`'s
+/// authority DID equals `author_did` (BC4 in `ingest::translate`,
+/// TECH-DESIGN section 10's same rule in `validate::candidates`). Round 1
+/// finding 7: shared so the rule is not duplicated between the two modules
+/// that each catch a self quote at a different point in their own pipeline.
+pub fn is_self_quote(original: &AtUri, author_did: &str) -> bool {
+    original.did() == author_did
 }
 
 /// Whether a post record embeds a quote of another post, TECH-DESIGN
@@ -224,5 +243,23 @@ mod tests {
         assert_eq!(uri.as_str(), "at://did:plc:abc/app.bsky.feed.post/xyz");
         assert_eq!(uri.did(), "did:plc:abc");
         assert_eq!(uri.rkey(), "xyz");
+    }
+
+    // Round 1 finding 7.
+    #[test]
+    fn collection_of_reads_the_middle_segment() {
+        assert_eq!(
+            AtUri::collection_of("at://did:plc:abc/app.bsky.graph.starterpack/xyz"),
+            Some("app.bsky.graph.starterpack")
+        );
+        assert_eq!(AtUri::collection_of("not-a-uri"), None);
+        assert_eq!(AtUri::collection_of("at://did:plc:abc"), None);
+    }
+
+    #[test]
+    fn is_self_quote_compares_the_original_authority_to_the_author() {
+        let original = AtUri::parse("at://did:plc:abc/app.bsky.feed.post/xyz").unwrap();
+        assert!(is_self_quote(&original, "did:plc:abc"));
+        assert!(!is_self_quote(&original, "did:plc:other"));
     }
 }

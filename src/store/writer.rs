@@ -95,27 +95,33 @@ impl Op {
 /// op fails, the transaction is dropped without a commit and rolls back: no
 /// op in the batch lands and `meta.jetstream_seq` keeps its previous value
 /// (BC8, BC35).
-pub fn commit_batch(conn: &Connection, ops: &[Op], now: i64) -> Result<(), StoreError> {
+///
+/// Round 1 finding 2: returns every URI a `DeletePost` or a `Detach` in this
+/// batch evicted from the hot set (BC38), collected from `pairs::delete_post`
+/// and `pairs::detach` and returned only once the transaction has committed,
+/// so `writer_loop` never reports an eviction that then rolled back.
+pub fn commit_batch(conn: &Connection, ops: &[Op], now: i64) -> Result<Vec<String>, StoreError> {
     if ops.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let tx = conn.unchecked_transaction()?;
     let mut highest_seq: Option<u64> = None;
+    let mut evicted = Vec::new();
     for op in ops {
         if let Some(seq) = op.seq() {
             highest_seq = Some(highest_seq.map_or(seq, |h| h.max(seq)));
         }
-        apply_op(&tx, op, now)?;
+        evicted.extend(apply_op(&tx, op, now)?);
     }
     if let Some(seq) = highest_seq {
         meta::set_cursor(&tx, seq)?;
     }
     tx.commit()?;
-    Ok(())
+    Ok(evicted)
 }
 
-fn apply_op(conn: &Connection, op: &Op, now: i64) -> Result<(), StoreError> {
+fn apply_op(conn: &Connection, op: &Op, now: i64) -> Result<Vec<String>, StoreError> {
     match op {
         Op::InsertPair {
             quote_uri,
@@ -126,29 +132,41 @@ fn apply_op(conn: &Connection, op: &Op, now: i64) -> Result<(), StoreError> {
             quoted_at,
             first_seen_at,
             ..
-        } => pairs::insert_pair(
-            conn,
-            quote_uri,
-            quote_did,
-            quote_cid,
-            original_uri,
-            original_did,
-            *quoted_at,
-            *first_seen_at,
-        ),
-        Op::Incr { post_uri, field, .. } => counts::incr(conn, post_uri, *field, now),
+        } => {
+            pairs::insert_pair(
+                conn,
+                quote_uri,
+                quote_did,
+                quote_cid,
+                original_uri,
+                original_did,
+                *quoted_at,
+                *first_seen_at,
+            )?;
+            Ok(Vec::new())
+        }
+        Op::Incr { post_uri, field, .. } => {
+            counts::incr(conn, post_uri, *field, now)?;
+            Ok(Vec::new())
+        }
         Op::DeletePost { uri, .. } => pairs::delete_post(conn, uri),
         Op::Detach { quote_uri, .. } => pairs::detach(conn, quote_uri),
-        Op::Checkpoint { .. } => Ok(()),
-        Op::Interaction { item, event, feed_context, req_id } => interactions::insert_interaction(
-            conn,
-            item.as_deref(),
-            event.as_deref(),
-            feed_context.as_deref(),
-            req_id.as_deref(),
-            now,
-        ),
-        Op::MarkAllDirty { .. } => counts::mark_all_dirty(conn),
+        Op::Checkpoint { .. } => Ok(Vec::new()),
+        Op::Interaction { item, event, feed_context, req_id } => {
+            interactions::insert_interaction(
+                conn,
+                item.as_deref(),
+                event.as_deref(),
+                feed_context.as_deref(),
+                req_id.as_deref(),
+                now,
+            )?;
+            Ok(Vec::new())
+        }
+        Op::MarkAllDirty { .. } => {
+            counts::mark_all_dirty(conn)?;
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -252,13 +270,21 @@ impl WriterHandle {
 
 /// Spawns the one writer thread over `conn`, TECH-DESIGN section 5.4:
 /// sharing `Store`'s connection, rather than opening a second one, is what
-/// lets a `:memory:` test see the writer's rows.
-pub(crate) fn spawn(conn: Arc<Mutex<Connection>>, cfg: WriterConfig) -> WriterHandle {
+/// lets a `:memory:` test see the writer's rows. Round 1 finding 2:
+/// `evict_tx`, when given, receives every batch's evicted URIs (BC38) once
+/// that batch has committed; `Store::writer()` and `Store::writer_with()`
+/// pass `None`, and `Store::writer_evicting()` is the one caller (`run`,
+/// story 06's slice 6.0) that supplies a sender.
+pub(crate) fn spawn(
+    conn: Arc<Mutex<Connection>>,
+    cfg: WriterConfig,
+    evict_tx: Option<mpsc::UnboundedSender<Vec<String>>>,
+) -> WriterHandle {
     let (tx, rx) = mpsc::channel(cfg.capacity);
     let (health_tx, health_rx) = watch::channel(WriterState::Running);
     std::thread::Builder::new()
         .name("dunk-store-writer".to_string())
-        .spawn(move || writer_loop(conn, rx, cfg, health_tx))
+        .spawn(move || writer_loop(conn, rx, cfg, health_tx, evict_tx))
         .expect("failed to spawn the store writer thread");
     WriterHandle { tx, health: health_rx }
 }
@@ -297,6 +323,7 @@ fn writer_loop(
     mut rx: mpsc::Receiver<WriterMsg>,
     cfg: WriterConfig,
     health_tx: watch::Sender<WriterState>,
+    evict_tx: Option<mpsc::UnboundedSender<Vec<String>>>,
 ) {
     loop {
         let first = match rx.blocking_recv() {
@@ -345,18 +372,29 @@ fn writer_loop(
             Err(_) => Err(StoreError::Poisoned),
         };
 
-        if let Err(err) = commit_result {
-            tracing::error!(error = %err, "store writer: commit_batch failed, thread exiting");
-            // Published before the thread returns, so a caller holding no
-            // op to send still observes the death through `health()`
-            // (BC72), not only through the next `send`'s `WriterGone`.
-            let _ = health_tx.send(WriterState::Failed(err.to_string()));
-            // Dropping `flush_acks` and `shutdown_ack` without a send makes
-            // every waiter's `.await` fail on a closed oneshot channel,
-            // which `WriterHandle` turns into `StoreError::WriterGone`
-            // (BC36). Dropping `rx` when this function returns does the
-            // same for the next `send`.
-            return;
+        let evicted = match commit_result {
+            Ok(evicted) => evicted,
+            Err(err) => {
+                tracing::error!(error = %err, "store writer: commit_batch failed, thread exiting");
+                // Published before the thread returns, so a caller holding
+                // no op to send still observes the death through `health()`
+                // (BC72), not only through the next `send`'s `WriterGone`.
+                let _ = health_tx.send(WriterState::Failed(err.to_string()));
+                // Dropping `flush_acks` and `shutdown_ack` without a send
+                // makes every waiter's `.await` fail on a closed oneshot
+                // channel, which `WriterHandle` turns into
+                // `StoreError::WriterGone` (BC36). Dropping `rx` when this
+                // function returns does the same for the next `send`.
+                return;
+            }
+        };
+
+        // Round 1 finding 2: sent only once the batch above has committed,
+        // and never for a batch that evicted nothing.
+        if !evicted.is_empty() {
+            if let Some(evict_tx) = &evict_tx {
+                let _ = evict_tx.send(evicted);
+            }
         }
 
         for ack in flush_acks {
@@ -537,7 +575,7 @@ mod tests {
     async fn full_channel_makes_send_wait() {
         let conn = shared_conn();
         let cfg = WriterConfig { capacity: 2, max_ops: 1, interval: Duration::from_secs(30) };
-        let handle = spawn(Arc::clone(&conn), cfg);
+        let handle = spawn(Arc::clone(&conn), cfg, None);
         let uri = "at://did:plc:o/app.bsky.feed.post/o1";
 
         // Hold the connection so the writer thread, which pulls this first
@@ -576,7 +614,7 @@ mod tests {
     async fn depth_counts_queued_ops() {
         let conn = shared_conn();
         let cfg = WriterConfig { capacity: 10, max_ops: 1, interval: Duration::from_secs(30) };
-        let handle = spawn(Arc::clone(&conn), cfg);
+        let handle = spawn(Arc::clone(&conn), cfg, None);
         let uri = "at://did:plc:o/app.bsky.feed.post/o1";
 
         assert_eq!(handle.depth(), 0, "an idle writer has no queued ops");
@@ -598,7 +636,7 @@ mod tests {
     async fn batch_closes_at_max_ops_without_waiting_for_the_timer() {
         let conn = shared_conn();
         let cfg = WriterConfig { capacity: 100, max_ops: 5, interval: Duration::from_secs(30) };
-        let handle = spawn(Arc::clone(&conn), cfg);
+        let handle = spawn(Arc::clone(&conn), cfg, None);
         let uri = "at://did:plc:o/app.bsky.feed.post/o1";
 
         for seq in 1..=5u64 {
@@ -617,7 +655,7 @@ mod tests {
         let conn = shared_conn();
         let cfg =
             WriterConfig { capacity: 100, max_ops: 1_000, interval: Duration::from_millis(50) };
-        let handle = spawn(Arc::clone(&conn), cfg);
+        let handle = spawn(Arc::clone(&conn), cfg, None);
         let uri = "at://did:plc:o/app.bsky.feed.post/o1";
 
         handle.send(incr_op(uri, 1)).await.unwrap();
@@ -633,7 +671,7 @@ mod tests {
     async fn flush_returns_after_the_pending_batch_is_committed() {
         let conn = shared_conn();
         let cfg = WriterConfig { capacity: 100, max_ops: 1_000, interval: Duration::from_secs(30) };
-        let handle = spawn(Arc::clone(&conn), cfg);
+        let handle = spawn(Arc::clone(&conn), cfg, None);
         let uri = "at://did:plc:o/app.bsky.feed.post/o1";
 
         handle.send(incr_op(uri, 1)).await.unwrap();
@@ -642,10 +680,43 @@ mod tests {
         assert_eq!(likes(&conn.lock().unwrap(), uri), 1);
     }
 
+    // Round 1 finding 2: the writer thread sends the batch's evicted URIs
+    // on `evict_tx`, only after the batch has committed, and never for a
+    // batch that evicted nothing.
+    #[tokio::test]
+    async fn evicted_uris_are_sent_only_after_commit_and_never_empty() {
+        let conn = shared_conn();
+        let cfg = WriterConfig { capacity: 100, max_ops: 2, interval: Duration::from_secs(30) };
+        let (evict_tx, mut evict_rx) = mpsc::unbounded_channel();
+        let handle = spawn(Arc::clone(&conn), cfg, Some(evict_tx));
+        let original_uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
+
+        // Batch 1: an `Incr` alone evicts nothing (no message expected).
+        handle.send(incr_op(original_uri, 1)).await.unwrap();
+        handle.flush().await.unwrap();
+        assert!(evict_rx.try_recv().is_err(), "a batch with no eviction must send no message");
+
+        // Batch 2: insert a pair, then delete the original in the same
+        // batch. Both sides leave the hot set.
+        handle.send(insert_pair_op(2)).await.unwrap();
+        handle.send(Op::DeletePost { uri: original_uri.to_string(), seq: 3 }).await.unwrap();
+        handle.flush().await.unwrap();
+
+        let mut evicted = tokio::time::timeout(Duration::from_secs(1), evict_rx.recv())
+            .await
+            .expect("an eviction message should arrive")
+            .expect("the channel should still be open");
+        evicted.sort();
+        let mut expected = vec![original_uri.to_string(), quote_uri.to_string()];
+        expected.sort();
+        assert_eq!(evicted, expected);
+    }
+
     #[tokio::test]
     async fn shutdown_commits_then_a_later_send_is_writer_gone() {
         let conn = shared_conn();
-        let handle = spawn(Arc::clone(&conn), WriterConfig::default());
+        let handle = spawn(Arc::clone(&conn), WriterConfig::default(), None);
         let uri = "at://did:plc:o/app.bsky.feed.post/o1";
 
         handle.send(incr_op(uri, 1)).await.unwrap();
@@ -660,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn mark_all_dirty() {
         let conn = shared_conn();
-        let handle = spawn(Arc::clone(&conn), WriterConfig::default());
+        let handle = spawn(Arc::clone(&conn), WriterConfig::default(), None);
         let uri_a = "at://did:plc:o/app.bsky.feed.post/o1";
         let uri_b = "at://did:plc:o/app.bsky.feed.post/o2";
 
@@ -688,7 +759,7 @@ mod tests {
         // an unrecoverable error, published before it returns so a caller
         // holding no op to send still observes the death.
         let conn = shared_conn();
-        let handle = spawn(Arc::clone(&conn), WriterConfig::default());
+        let handle = spawn(Arc::clone(&conn), WriterConfig::default(), None);
         assert_eq!(*handle.health().borrow(), WriterState::Running);
 
         // Break `counts` so the writer's next commit fails unrecoverably.

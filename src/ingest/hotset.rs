@@ -11,7 +11,12 @@ use std::collections::HashSet;
 use xxhash_rust::xxh3::xxh3_64;
 
 /// A set of `xxh3_64(uri.as_bytes())` hashes. Never stores the URI itself.
+/// Round 1 finding 6: no caller needs `is_empty` (`len() == 0` reads just as
+/// well at the one place, `run`'s log line, that might have wanted it), so
+/// clippy's `len_without_is_empty` is silenced here instead of carrying a
+/// method nothing calls.
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::len_without_is_empty)]
 pub struct HotSet {
     hashes: HashSet<u64>,
 }
@@ -40,12 +45,6 @@ impl HotSet {
     /// The number of distinct hashes held.
     pub fn len(&self) -> usize {
         self.hashes.len()
-    }
-
-    /// Whether the set holds no hash.
-    #[allow(dead_code)] // clippy's `len_without_is_empty` requires this method; nothing calls it yet.
-    pub fn is_empty(&self) -> bool {
-        self.hashes.is_empty()
     }
 
     /// Clears the set, then calls `source` with a callback that inserts
@@ -101,12 +100,10 @@ mod tests {
     fn len_counts_distinct_uris_and_a_repeat_insert_does_not_grow_it() {
         let mut hot = HotSet::new();
         assert_eq!(hot.len(), 0);
-        assert!(hot.is_empty());
 
         hot.insert("at://did:plc:a/app.bsky.feed.post/1");
         hot.insert("at://did:plc:b/app.bsky.feed.post/2");
         assert_eq!(hot.len(), 2);
-        assert!(!hot.is_empty());
 
         // A repeat insert of a URI already held does not grow the set.
         assert!(!hot.insert("at://did:plc:a/app.bsky.feed.post/1"));

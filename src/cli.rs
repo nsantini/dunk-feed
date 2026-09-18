@@ -87,40 +87,29 @@ pub enum CliError {
     Ingest(#[from] IngestError),
 }
 
-/// `Validate`'s real behaviour, factored out of [`dispatch`] so its body
-/// stays a plain `?` chain over `ValidateError`, mapped to `CliError::Validate`
-/// at the call site rather than threading a second error type through it.
-async fn dispatch_validate(
-    config: &Config,
-    pages: u32,
-    seed_file: Option<&std::path::Path>,
-    csv_path: &std::path::Path,
-) -> Result<(), ValidateError> {
-    let client = AppViewClient::new(config)?;
-    let weights = Weights::from(config);
-    let thresholds = Thresholds::from(config);
-    validate::run(&client, &weights, &thresholds, pages, seed_file, csv_path).await
-}
-
 /// Dispatches `command`, built from `config`. `Run` calls `ingest::run`
 /// (BC33 to BC35); `Validate` builds the `AppViewClient`, `Weights` and
 /// `Thresholds` `config` describes and calls `validate::run` with its own
 /// flags; `Publish` and `Dump` only print their own name (`Command::run`).
 /// This is the only path that can fail: `main.rs` prints the error and
-/// exits 1 (BC10, BC11, BC12, BC34).
+/// exits 1 (BC10, BC11, BC12, BC34). Round 1 finding 6: `Validate`'s body
+/// used to live in a separate `dispatch_validate`, whose only reason to
+/// exist was mapping `ValidateError` to `CliError::Validate` at its call
+/// site; `CliError::Validate`'s own `#[from]` does that through `?` just as
+/// well, so the indirection is gone.
 pub async fn dispatch(command: &Command, config: &Config) -> Result<(), CliError> {
     match command {
-        Command::Run => ingest::run(config).await.map_err(CliError::Ingest),
+        Command::Run => ingest::run(config).await?,
         Command::Validate { pages, seed_file, csv_path } => {
-            dispatch_validate(config, *pages, seed_file.as_deref(), csv_path)
-                .await
-                .map_err(CliError::Validate)
+            let client = AppViewClient::new(config).map_err(ValidateError::from)?;
+            let weights = Weights::from(config);
+            let thresholds = Thresholds::from(config);
+            validate::run(&client, &weights, &thresholds, *pages, seed_file.as_deref(), csv_path)
+                .await?;
         }
-        other => {
-            other.run();
-            Ok(())
-        }
+        other => other.run(),
     }
+    Ok(())
 }
 
 #[cfg(test)]
