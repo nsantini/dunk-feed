@@ -107,7 +107,7 @@ docs/  stories/  AGENTS.md
 ```
 
 Dependencies, all common and maintained: `tokio`, `tokio-tungstenite` (rustls),
-`zstd`, `serde`, `serde_json`, `rusqlite` (`bundled`), `reqwest` (rustls, json),
+`futures-util`, `zstd`, `serde`, `serde_json`, `rusqlite` (`bundled`), `reqwest` (rustls, json),
 `axum`, `tower-http` (trace, timeout), `clap`, `tracing`, `tracing-subscriber`,
 `thiserror`, `anyhow`, `base64`, `ahash` or `xxhash-rust`, `time` or `chrono`.
 No `atrium`, no ORM, no async SQLite.
@@ -124,7 +124,7 @@ once at start and fails fast on a bad value.
 | `DUNK_HOSTNAME` | required | Public hostname, forms `did:web:<hostname>` |
 | `DUNK_PUBLISHER_DID` | required | Your account DID. Forms the feed at-URI |
 | `DUNK_FEED_RKEY` | `dunks` | Record key of the generator record |
-| `DUNK_JETSTREAM_URL` | `wss://jetstream.us-east.bsky.network` | Host only |
+| `DUNK_JETSTREAM_URL` | `wss://jetstream.us-east.bsky.network,wss://jetstream.us-west.bsky.network` | Comma-separated host list, no path. The client rotates to the next host on every failed connect. On 2026-09-18 us-east returned 503 for over 40 minutes while us-west served |
 | `DUNK_APPVIEW_URL` | `https://public.api.bsky.app` | |
 | `DUNK_W_REPOST` `DUNK_W_REPLY` | `2.0` `0.5` | `Wr`, `Wc` |
 | `DUNK_K` | `5` | Smoothing |
@@ -153,8 +153,16 @@ once at start and fails fast on a bad value.
    text. Parse the envelope `{"$type":"message","payload":{...}}`.
 4. Dispatch on `payload.$type`. Handle `#commit`. Log `#info` and act on
    `OutdatedCursor` (section 5.4). Ignore `#identity`, `#account`, `#sync`.
-5. On close or error: back off 1 s, 2 s, 4 s up to 60 s, reconnect with the last
-   committed `seq`. Never reconnect without a cursor unless section 5.4 says so.
+5. On close or error: back off 1 s, 2 s, 4 s up to 60 s, rotate to the next host
+   in the list, and reconnect with `last_seq + 1`. The first connect follows the
+   same rule; only a configuration error is fatal. If the server rejects the
+   cursor with HTTP 400, retry once from the head. The backoff counter resets on
+   the first event of a connection, not on the handshake.
+6. If the dictionary cannot be fetched from any host, connect uncompressed, log
+   at `warn`, expose `is_compressed() == false` for `/healthz`, and retry the
+   fetch on every reconnect and every 10 minutes. The dictionary is cached as
+   one file per id, written atomically. Three consecutive decompression
+   failures discard it and force a refetch.
 
 The client exposes an `async fn next(&mut self) -> Result<Event>` and hides
 reconnects. Tests feed it recorded frames from `tests/fixtures/`.
@@ -492,7 +500,7 @@ Prints the feed URL. Never runs inside `dunk run`.
 - **Backup.** `sqlite3 /data/dunk.db ".backup /data/backup.db"` nightly is enough. Losing the DB loses 30 days of feed history and nothing else. The hot set and counters rebuild within 48 h.
 - **Logs.** `tracing` JSON to stdout. The ingest and scorer stats lines are the dashboards.
 - **Upgrades.** `docker compose pull && up -d`. The Jetstream cursor makes a restart under 36 h gapless.
-- **Failure modes.** Jetstream down: ingest backs off, `/healthz` goes 503 after 300 s, the feed keeps serving the last snapshot. App View down: no promotions, feed keeps serving. Disk full: writer thread errors, process exits, Docker restarts it, cursor resumes. OOM: memory limit trips at 512 MB, same recovery.
+- **Failure modes.** One Jetstream host down: the client rotates to the next host within one backoff step. All hosts down: ingest backs off, `/healthz` goes 503 after 300 s, the feed keeps serving the last snapshot. App View down: no promotions, feed keeps serving. Disk full: writer thread errors, process exits, Docker restarts it, cursor resumes. OOM: memory limit trips at 512 MB, same recovery.
 
 ## 14. Testing strategy
 
