@@ -619,15 +619,17 @@ async fn wait_for_shutdown_signal() {
 /// `dunk run`'s entry point (slice 6.0), TECH-DESIGN section 5.1 end to
 /// end: opens `cfg.db_path` (BC35), starts the writer, rebuilds the hot set
 /// from `pairs` and logs its size and the elapsed time at `info` (BC22),
-/// reads the stored cursor and connects to Jetstream at it, then runs
-/// [`run_ingest`] until SIGINT or SIGTERM flips the shutdown watch (BC33).
-/// Once `run_ingest` returns, `writer.flush()` then `writer.shutdown()` run
-/// so every committed op reaches the database before the process exits; a
-/// failure on either is logged, not raised, since the original result from
-/// `run_ingest` (success or `IngestError`) is the one this function
-/// returns. The scorer task (story 07) and the HTTP server (story 08) each
-/// have their place named below, spawned alongside `run_ingest`; neither
-/// has code yet (`## Non-goals`).
+/// reads the stored cursor and connects to Jetstream at it, then spawns
+/// [`run_ingest`] on its own task, running until SIGINT or SIGTERM flips
+/// the shutdown watch (BC33). Once that task returns, `writer.flush()`
+/// then `writer.shutdown()` run on this handle (a clone of the one the
+/// spawned task holds) so every committed op reaches the database before
+/// the process exits; a failure on either is logged, not raised, since the
+/// original result from `run_ingest` (success or `IngestError`) is the one
+/// this function returns. The scorer task (story 07) and the HTTP server
+/// (story 08) each have their place named below, spawned alongside
+/// `run_ingest` and sharing a clone of `shutdown_rx`; neither has code yet
+/// (`## Non-goals`).
 pub async fn run(cfg: &Config) -> Result<(), IngestError> {
     let store = crate::store::Store::open(cfg)?;
     let writer = store.writer()?;
@@ -653,11 +655,16 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
         let _ = shutdown_tx.send(true);
     });
 
-    // Story 07's scorer task and story 08's HTTP server start here,
-    // spawned alongside `run_ingest` and sharing this same `shutdown_rx`
-    // (cloned). Neither exists yet.
+    // Story 07's scorer task and story 08's HTTP server start here, each
+    // spawned alongside `run_ingest` below and sharing a clone of
+    // `shutdown_rx`. Neither exists yet.
 
-    let result = run_ingest(cfg, source, &writer, &mut hot, shutdown_rx).await;
+    let ingest_cfg = cfg.clone();
+    let ingest_writer = writer.clone();
+    let ingest_handle = tokio::spawn(async move {
+        run_ingest(&ingest_cfg, source, &ingest_writer, &mut hot, shutdown_rx).await
+    });
+    let result = ingest_handle.await.expect("the run_ingest task should not panic");
 
     if let Err(err) = writer.flush().await {
         tracing::warn!(error = %err, "ingest: writer flush failed during shutdown");
