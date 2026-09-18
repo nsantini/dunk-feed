@@ -1,0 +1,29 @@
+{
+  "$type": "message",
+  "payload": {
+    "$type": "network.bsky.jetstream.subscribeEvents#commit",
+    "cid": "bafyreiquoterecord0000000000000000000000000000000000000001",
+    "collection": "app.bsky.feed.post",
+    "did": "did:plc:quoterdid0000000000000000",
+    "operation": "update",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "createdAt": "2026-09-17T23:30:00.000Z",
+      "embed": {
+        "$type": "app.bsky.embed.record",
+        "record": {
+          "cid": "bafyreioriginalcid00000000000000000000000000000000000000000",
+          "uri": "at://did:plc:originaldid00000000000000/app.bsky.feed.post/original0001"
+        }
+      },
+      "langs": [
+        "en"
+      ],
+      "text": "quoting someone else's post via app.bsky.embed.record, edited"
+    },
+    "rev": "3mvqsnhrecoru",
+    "rkey": "3mvqsnhquote1",
+    "seq": 26036300005,
+    "time": "2026-09-17T23:30:05.100000Z"
+  }
+}

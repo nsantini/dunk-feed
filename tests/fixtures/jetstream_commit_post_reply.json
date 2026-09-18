@@ -1,0 +1,32 @@
+{
+  "$type": "message",
+  "payload": {
+    "$type": "network.bsky.jetstream.subscribeEvents#commit",
+    "cid": "bafyreiapqkcbjlbhwr3do2rk7cysmm5kt6cknvdxf7np4gbaznprpmsnjm",
+    "collection": "app.bsky.feed.post",
+    "did": "did:plc:66y3apg6p6r7rsoc644wa7pe",
+    "operation": "create",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "createdAt": "2026-09-17T23:29:14.558Z",
+      "langs": [
+        "en"
+      ],
+      "reply": {
+        "parent": {
+          "cid": "bafyreife3kgyokoqp5at4df5n6mwscbbmocz6jrxvoirqsrg6xs23ex4we",
+          "uri": "at://did:plc:ezay5dffpkfnjxh5yirexce2/app.bsky.feed.post/3mvqrul2wq22a"
+        },
+        "root": {
+          "cid": "bafyreife3kgyokoqp5at4df5n6mwscbbmocz6jrxvoirqsrg6xs23ex4we",
+          "uri": "at://did:plc:ezay5dffpkfnjxh5yirexce2/app.bsky.feed.post/3mvqrul2wq22a"
+        }
+      },
+      "text": "replying to that post"
+    },
+    "rev": "3mvqsnhytzi2c",
+    "rkey": "3mvqsnhyq4i2c",
+    "seq": 26036300004,
+    "time": "2026-09-17T23:29:14.753164Z"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "$type": "message",
+  "payload": {
+    "$type": "network.bsky.jetstream.subscribeEvents#commit",
+    "cid": "bafyreicnmmquad2zr3kc5ugs6o2jeio77t6bhfzabnstz7izps2o5nv4vy",
+    "collection": "app.bsky.feed.post",
+    "did": "did:plc:hzzwseuuw5eshd5bdt3uleo6",
+    "operation": "create",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "createdAt": "2026-09-17T23:29:14.619Z",
+      "embed": {
+        "$type": "app.bsky.embed.record",
+        "record": {
+          "cid": "bafyreififpkyznublfscdxvxmnpcppg4b2svib47xvxsmeppufiru74rte",
+          "uri": "at://did:plc:starterpackauthor000000/app.bsky.graph.starterpack/3mu6ks2ljsk2q"
+        }
+      },
+      "facets": [
+        {
+          "features": [
+            {
+              "$type": "app.bsky.richtext.facet#link",
+              "uri": "https://ko-fi.com/eltalite/link/FERRINUFF"
+            }
+          ],
+          "index": {
+            "byteEnd": 135,
+            "byteStart": 110
+          }
+        }
+      ],
+      "langs": [
+        "en"
+      ],
+      "text": "check out this starter pack"
+    },
+    "rev": "3mvqsnhmvci2f",
+    "rkey": "3mvqsnhyy5s2l",
+    "seq": 26036300003,
+    "time": "2026-09-17T23:29:14.756217Z"
+  }
+}
