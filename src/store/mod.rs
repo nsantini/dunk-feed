@@ -12,7 +12,11 @@
 
 #![allow(dead_code)] // First callers are the ingest task (story 06) and the scorer (story 07).
 
+pub mod counts;
+pub mod feed;
+pub mod interactions;
 pub mod meta;
+pub mod pairs;
 pub mod schema;
 pub mod writer;
 
