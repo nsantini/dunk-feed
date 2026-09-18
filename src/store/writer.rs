@@ -1,11 +1,17 @@
-//! The writer's operation type and `commit_batch`, TECH-DESIGN section 5.2
-//! and 5.4. This slice adds `commit_batch`, which applies one batch of `Op`
-//! inside a single transaction; the writer thread, `WriterConfig` and
-//! `WriterHandle` land in slice 3.0.
+//! The writer's operation type, `commit_batch`, and the writer thread
+//! itself, TECH-DESIGN section 5.2 and 5.4. `commit_batch` applies one
+//! batch of `Op` inside a single transaction; `spawn` starts the one
+//! dedicated `std::thread` that owns the channel's receiver, batches by
+//! `WriterConfig::max_ops` or `WriterConfig::interval`, and drives every
+//! commit through `commit_batch` on the connection it shares with `Store`.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::store::{counts, interactions, meta, pairs, StoreError};
+use crate::store::{counts, interactions, meta, pairs, unix_now, StoreError};
 
 /// The count column one `Incr` moves, TECH-DESIGN section 5.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +141,183 @@ fn apply_op(conn: &Connection, op: &Op, now: i64) -> Result<(), StoreError> {
             req_id.as_deref(),
             now,
         ),
+    }
+}
+
+/// The writer's batch-boundary and channel-capacity numbers, TECH-DESIGN
+/// section 5.4. These are module constants there, not `Config` fields (the
+/// engineer's step 2 answer), so `WriterConfig::default()` is the only
+/// place they are set outside a test, which builds a smaller config
+/// through `Store::writer_with` (BC42).
+#[derive(Debug, Clone, Copy)]
+pub struct WriterConfig {
+    /// The bounded channel's capacity. `WriterHandle::send` waits, rather
+    /// than drops the op, once this many are already queued (BC37).
+    pub capacity: usize,
+    /// A batch closes at this many ops even if `interval` has not elapsed
+    /// (BC40).
+    pub max_ops: usize,
+    /// A batch closes on this timer even if fewer than `max_ops` ops have
+    /// arrived (BC41).
+    pub interval: Duration,
+}
+
+impl Default for WriterConfig {
+    fn default() -> Self {
+        WriterConfig { capacity: 10_000, max_ops: 1_000, interval: Duration::from_millis(500) }
+    }
+}
+
+/// One message on the writer's channel: an `Op` to apply, or a control
+/// message the writer thread acknowledges only once the batch holding it
+/// has committed (or, for `Shutdown`, right before the thread exits).
+enum WriterMsg {
+    Op(Op),
+    Flush(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<()>),
+}
+
+/// A handle to the running writer thread. `send`, `flush` and `shutdown`
+/// all go through the same bounded channel, so a `flush` queued after a
+/// run of `send`s only ever acknowledges once every op ahead of it in the
+/// queue has been committed (BC38): the channel is FIFO, and the writer
+/// thread is single-threaded, so nothing ahead of a message in the queue
+/// can still be uncommitted once that message is dispatched.
+#[derive(Debug, Clone)]
+pub struct WriterHandle {
+    tx: mpsc::Sender<WriterMsg>,
+}
+
+impl WriterHandle {
+    /// Queues one `Op`. Waits when the channel is full rather than
+    /// dropping the op (BC37). `StoreError::WriterGone` once the writer
+    /// thread has exited and dropped its receiver.
+    pub async fn send(&self, op: Op) -> Result<(), StoreError> {
+        self.tx.send(WriterMsg::Op(op)).await.map_err(|_| StoreError::WriterGone)
+    }
+
+    /// Returns once every op sent before this call is committed (BC38).
+    pub async fn flush(&self) -> Result<(), StoreError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx.send(WriterMsg::Flush(ack_tx)).await.map_err(|_| StoreError::WriterGone)?;
+        ack_rx.await.map_err(|_| StoreError::WriterGone)
+    }
+
+    /// Commits the pending batch, then the writer thread exits (BC39). A
+    /// `send`, `flush` or `shutdown` made after this call returns
+    /// `StoreError::WriterGone`, because the thread has dropped the
+    /// channel's receiver.
+    pub async fn shutdown(&self) -> Result<(), StoreError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx.send(WriterMsg::Shutdown(ack_tx)).await.map_err(|_| StoreError::WriterGone)?;
+        ack_rx.await.map_err(|_| StoreError::WriterGone)
+    }
+}
+
+/// Spawns the one writer thread over `conn`, TECH-DESIGN section 5.4:
+/// sharing `Store`'s connection, rather than opening a second one, is what
+/// lets a `:memory:` test see the writer's rows.
+pub(crate) fn spawn(conn: Arc<Mutex<Connection>>, cfg: WriterConfig) -> WriterHandle {
+    let (tx, rx) = mpsc::channel(cfg.capacity);
+    std::thread::Builder::new()
+        .name("dunk-store-writer".to_string())
+        .spawn(move || writer_loop(conn, rx, cfg))
+        .expect("failed to spawn the store writer thread");
+    WriterHandle { tx }
+}
+
+/// Waits for one message, but never past `deadline`. `None` on a timeout
+/// or once every `WriterHandle` has dropped its sender. Polls rather than
+/// blocking indefinitely, because `tokio::sync::mpsc::Receiver` has no
+/// `recv`-with-timeout outside an async context, and the writer thread is
+/// a plain `std::thread`, not a runtime worker.
+fn recv_before(rx: &mut mpsc::Receiver<WriterMsg>, deadline: Instant) -> Option<WriterMsg> {
+    loop {
+        match rx.try_recv() {
+            Ok(msg) => return Some(msg),
+            Err(mpsc::error::TryRecvError::Disconnected) => return None,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+        }
+    }
+}
+
+/// The writer thread's whole life: block for the first message of a batch
+/// (an idle writer must not spin), collect more until `max_ops` or
+/// `interval` closes the batch (BC40, BC41), commit it, acknowledge every
+/// `Flush` and `Shutdown` queued inside it, and exit once a `Shutdown` has
+/// been seen or every sender has dropped. A `Flush` or `Shutdown` also
+/// closes the batch immediately, even with zero ops and long before
+/// `interval` would: a caller waiting on `flush` or `shutdown` must not be
+/// made to wait out the batch timer (BC38, BC39).
+fn writer_loop(conn: Arc<Mutex<Connection>>, mut rx: mpsc::Receiver<WriterMsg>, cfg: WriterConfig) {
+    loop {
+        let first = match rx.blocking_recv() {
+            Some(msg) => msg,
+            None => return, // Every WriterHandle was dropped.
+        };
+
+        let mut ops: Vec<Op> = Vec::new();
+        let mut flush_acks: Vec<oneshot::Sender<()>> = Vec::new();
+        let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
+        let deadline = Instant::now() + cfg.interval;
+        let mut close_now = false;
+
+        match first {
+            WriterMsg::Op(op) => ops.push(op),
+            WriterMsg::Flush(ack) => {
+                flush_acks.push(ack);
+                close_now = true;
+            }
+            WriterMsg::Shutdown(ack) => {
+                shutdown_ack = Some(ack);
+                close_now = true;
+            }
+        }
+
+        while !close_now && ops.len() < cfg.max_ops {
+            match recv_before(&mut rx, deadline) {
+                Some(WriterMsg::Op(op)) => ops.push(op),
+                Some(WriterMsg::Flush(ack)) => {
+                    flush_acks.push(ack);
+                    close_now = true;
+                }
+                Some(WriterMsg::Shutdown(ack)) => {
+                    shutdown_ack = Some(ack);
+                    close_now = true;
+                }
+                None => break, // The timer elapsed, or every sender dropped.
+            }
+        }
+
+        let now = unix_now();
+        let commit_result = match conn.lock() {
+            Ok(guard) => commit_batch(&guard, &ops, now),
+            Err(_) => Err(StoreError::Poisoned),
+        };
+
+        if let Err(err) = commit_result {
+            tracing::error!(error = %err, "store writer: commit_batch failed, thread exiting");
+            // Dropping `flush_acks` and `shutdown_ack` without a send makes
+            // every waiter's `.await` fail on a closed oneshot channel,
+            // which `WriterHandle` turns into `StoreError::WriterGone`
+            // (BC36). Dropping `rx` when this function returns does the
+            // same for the next `send`.
+            return;
+        }
+
+        for ack in flush_acks {
+            let _ = ack.send(());
+        }
+        if let Some(ack) = shutdown_ack {
+            let _ = ack.send(());
+            return;
+        }
     }
 }
 
@@ -291,5 +474,158 @@ mod tests {
             Op::Interaction { item: None, event: None, feed_context: None, req_id: None }.seq(),
             None
         );
+    }
+
+    fn shared_conn() -> Arc<Mutex<Connection>> {
+        Arc::new(Mutex::new(migrated_conn()))
+    }
+
+    fn likes(conn: &Connection, post_uri: &str) -> i64 {
+        conn.query_row("SELECT likes FROM counts WHERE post_uri = ?1", [post_uri], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    // Holding the `std::sync::Mutex` guard across the `.await`s below is
+    // the point of this test: it is what stops the writer thread (a plain
+    // `std::thread`, not a runtime worker) from draining the channel, so a
+    // full channel can be observed at all.
+    #[allow(clippy::await_holding_lock)]
+    async fn full_channel_makes_send_wait() {
+        let conn = shared_conn();
+        let cfg = WriterConfig { capacity: 2, max_ops: 1, interval: Duration::from_secs(30) };
+        let handle = spawn(Arc::clone(&conn), cfg);
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+
+        // Hold the connection so the writer thread, which pulls this first
+        // op off the channel right away (`max_ops` is 1), blocks trying to
+        // commit it instead of draining any more of the channel.
+        let guard = conn.lock().unwrap();
+        handle.send(incr_op(uri, 1)).await.unwrap();
+        // Give the thread a moment to pull that op and reach the blocked
+        // lock acquisition before the channel is filled below.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The channel's capacity is 2; these two fit without waiting.
+        handle.send(incr_op(uri, 2)).await.unwrap();
+        handle.send(incr_op(uri, 3)).await.unwrap();
+
+        // A further send must wait rather than drop the op (BC37).
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(150), handle.send(incr_op(uri, 4))).await;
+        assert!(timed_out.is_err(), "send must wait while the channel is full");
+
+        drop(guard);
+
+        // Once the lock is free the writer commits and drains the rest;
+        // the op dropped by the timed-out future above is resent.
+        handle.send(incr_op(uri, 4)).await.unwrap();
+        handle.flush().await.unwrap();
+
+        assert_eq!(likes(&conn.lock().unwrap(), uri), 4, "every op must have landed");
+    }
+
+    #[tokio::test]
+    async fn batch_closes_at_max_ops_without_waiting_for_the_timer() {
+        let conn = shared_conn();
+        let cfg = WriterConfig { capacity: 100, max_ops: 5, interval: Duration::from_secs(30) };
+        let handle = spawn(Arc::clone(&conn), cfg);
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+
+        for seq in 1..=5u64 {
+            handle.send(incr_op(uri, seq)).await.unwrap();
+        }
+
+        // If the batch had not already closed at 5 ops, this would have to
+        // wait out the 30-second interval instead of returning promptly.
+        tokio::time::timeout(Duration::from_secs(5), handle.flush()).await.unwrap().unwrap();
+
+        assert_eq!(likes(&conn.lock().unwrap(), uri), 5);
+    }
+
+    #[tokio::test]
+    async fn batch_closes_on_the_timer() {
+        let conn = shared_conn();
+        let cfg =
+            WriterConfig { capacity: 100, max_ops: 1_000, interval: Duration::from_millis(50) };
+        let handle = spawn(Arc::clone(&conn), cfg);
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+
+        handle.send(incr_op(uri, 1)).await.unwrap();
+
+        // Well past the 50ms interval, and nowhere near max_ops, so only
+        // the timer can have closed this batch.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(likes(&conn.lock().unwrap(), uri), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_returns_after_the_pending_batch_is_committed() {
+        let conn = shared_conn();
+        let cfg = WriterConfig { capacity: 100, max_ops: 1_000, interval: Duration::from_secs(30) };
+        let handle = spawn(Arc::clone(&conn), cfg);
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+
+        handle.send(incr_op(uri, 1)).await.unwrap();
+        handle.flush().await.unwrap();
+
+        assert_eq!(likes(&conn.lock().unwrap(), uri), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_commits_then_a_later_send_is_writer_gone() {
+        let conn = shared_conn();
+        let handle = spawn(Arc::clone(&conn), WriterConfig::default());
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+
+        handle.send(incr_op(uri, 1)).await.unwrap();
+        handle.shutdown().await.unwrap();
+
+        assert_eq!(likes(&conn.lock().unwrap(), uri), 1);
+
+        let err = handle.send(incr_op(uri, 2)).await.unwrap_err();
+        assert!(matches!(err, StoreError::WriterGone));
+    }
+
+    #[test]
+    #[ignore]
+    fn throughput_100k_incr() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("dunk-store-throughput-{nanos}.sqlite3"));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = crate::store::Store::open_path(&path_str).unwrap();
+            let handle = store.writer();
+
+            let start = Instant::now();
+            for seq in 0..100_000u64 {
+                handle
+                    .send(Op::Incr {
+                        post_uri: format!("at://did:plc:o/app.bsky.feed.post/o{}", seq % 1_000),
+                        field: CountField::Likes,
+                        seq,
+                    })
+                    .await
+                    .unwrap();
+            }
+            handle.flush().await.unwrap();
+            let elapsed = start.elapsed();
+            handle.shutdown().await.unwrap();
+
+            let file_size = std::fs::metadata(&path_str).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "throughput_100k_incr: {:.0} ops/s, {file_size} bytes",
+                100_000.0 / elapsed.as_secs_f64()
+            );
+        });
+
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 }

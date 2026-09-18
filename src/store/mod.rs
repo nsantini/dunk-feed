@@ -1,11 +1,12 @@
 //! SQLite store, TECH-DESIGN section 6. `Store::open` opens the database at
 //! `Config.db_path` in WAL mode and creates the versioned schema when it is
-//! missing. `Store::writer` (slice 3.0) starts the one writer thread that
-//! commits batches of `Op`; the rest of this module exposes the synchronous
-//! reads the scorer needs. `rusqlite` is synchronous and TECH-DESIGN section
-//! 3 forbids an async SQLite crate, so every read here blocks the calling
-//! thread briefly under one shared `Mutex<Connection>` — the same connection
-//! the writer thread uses, so a `:memory:` test sees the writer's rows.
+//! missing. `Store::writer` starts the one writer thread that commits
+//! batches of `Op`; the rest of this module exposes the synchronous reads
+//! the scorer needs (slice 4.0). `rusqlite` is synchronous and TECH-DESIGN
+//! section 3 forbids an async SQLite crate, so every read here blocks the
+//! calling thread briefly under one shared `Mutex<Connection>` — the same
+//! connection the writer thread uses, so a `:memory:` test sees the
+//! writer's rows.
 //!
 //! No raw SQL lives outside `src/store/` (AGENTS.md); every other module
 //! calls through the functions this module re-exports.
@@ -197,6 +198,20 @@ impl Store {
     pub fn cursor(&self) -> Result<Option<u64>, StoreError> {
         let conn = self.lock()?;
         meta::cursor(&conn)
+    }
+
+    /// Starts the one writer thread with `WriterConfig::default()`
+    /// (BC42).
+    pub fn writer(&self) -> writer::WriterHandle {
+        self.writer_with(writer::WriterConfig::default())
+    }
+
+    /// Starts the one writer thread with a caller-supplied config. Tests
+    /// use a smaller `max_ops` and `interval` than the default so a batch
+    /// closes quickly. The thread shares this `Store`'s connection, so a
+    /// `:memory:` test sees the writer's rows through the same `Store`.
+    pub fn writer_with(&self, cfg: writer::WriterConfig) -> writer::WriterHandle {
+        writer::spawn(Arc::clone(&self.conn), cfg)
     }
 }
 
