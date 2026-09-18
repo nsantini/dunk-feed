@@ -13,6 +13,7 @@
 
 #![allow(dead_code)] // First callers are the ingest task (story 06) and the scorer (story 07).
 
+pub mod authors;
 pub mod counts;
 pub mod feed;
 pub mod interactions;
@@ -198,6 +199,82 @@ impl Store {
     pub fn cursor(&self) -> Result<Option<u64>, StoreError> {
         let conn = self.lock()?;
         meta::cursor(&conn)
+    }
+
+    /// Both URIs of every pair whose state is not `dropped` (BC45).
+    pub fn hot_set_uris(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        Ok(pairs::hot_set_uris(&conn)?.collect())
+    }
+
+    /// `candidate` pairs inside `ttl_h` hours with a dirty counts row on
+    /// either side (BC46, BC47, BC48).
+    pub fn dirty_candidates(
+        &self,
+        now: i64,
+        ttl_h: i64,
+    ) -> Result<Vec<pairs::PairWithCounts>, StoreError> {
+        let conn = self.lock()?;
+        pairs::dirty_candidates(&conn, now, ttl_h)
+    }
+
+    /// `promoted` pairs whose `quoted_at` is at or after `now - h * 3600`
+    /// (BC51).
+    pub fn promoted_within(
+        &self,
+        now: i64,
+        h: i64,
+    ) -> Result<Vec<pairs::PairWithCounts>, StoreError> {
+        let conn = self.lock()?;
+        pairs::promoted_within(&conn, now, h)
+    }
+
+    /// Upserts a `feed` row and promotes its pair (BC52, BC53, BC54).
+    pub fn promote(&self, row: &feed::FeedRow) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        feed::promote(&conn, row)
+    }
+
+    /// Returns a pair to `candidate` and deletes its `feed` row (BC55).
+    pub fn demote(&self, quote_uri: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        pairs::demote(&conn, quote_uri)
+    }
+
+    /// Marks a pair `dropped` with `reason` and deletes its `feed` row
+    /// (BC56).
+    pub fn drop_pair(&self, quote_uri: &str, reason: DropReason) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        pairs::drop_pair(&conn, quote_uri, reason)
+    }
+
+    /// TECH-DESIGN section 7.2 step 6 (BC58, BC59, BC60, BC61).
+    pub fn expire(
+        &self,
+        now: i64,
+        candidate_ttl_h: i64,
+        feed_ttl_d: i64,
+    ) -> Result<pairs::ExpireReport, StoreError> {
+        let conn = self.lock()?;
+        pairs::expire(&conn, now, candidate_ttl_h, feed_ttl_d)
+    }
+
+    /// Every `feed` row, `rank DESC, quote_cid ASC` (BC62, BC63).
+    pub fn feed_rows(&self) -> Result<Vec<feed::FeedRow>, StoreError> {
+        let conn = self.lock()?;
+        feed::feed_rows(&conn)
+    }
+
+    /// Reads one `authors` row (BC64, BC66).
+    pub fn author_get(&self, did: &str) -> Result<Option<authors::AuthorRow>, StoreError> {
+        let conn = self.lock()?;
+        authors::author_get(&conn, did)
+    }
+
+    /// Inserts or replaces one `authors` row (BC65).
+    pub fn author_put(&self, row: &authors::AuthorRow) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        authors::author_put(&conn, row)
     }
 
     /// Starts the one writer thread with `WriterConfig::default()`
