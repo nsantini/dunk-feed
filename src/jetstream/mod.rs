@@ -12,4 +12,5 @@
 pub mod client;
 pub mod event;
 
+pub use client::{JetstreamClient, JetstreamError};
 pub use event::Event;

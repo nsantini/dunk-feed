@@ -120,56 +120,33 @@ mod tests {
     }
 
     #[test]
-    fn commit_post_decodes_as_create() {
-        let frame = decode("jetstream_commit_post.json");
-        match frame.payload {
-            Payload::Commit(commit) => {
-                assert_eq!(commit.operation, Operation::Create);
-                assert_eq!(commit.collection, "app.bsky.feed.post");
-                assert!(!commit.did.is_empty());
-                assert!(!commit.rkey.is_empty());
-                assert!(!commit.rev.is_empty());
-                assert!(commit.seq > 0);
-                assert!(commit.record.is_some());
-                assert!(commit.cid.is_some());
+    fn commit_fixtures_decode_as_create() {
+        // AC1: post, like, repost and postgate each decode into
+        // Payload::Commit with operation Create, the matching collection,
+        // and a populated record and cid (unlike the delete fixture,
+        // checked separately below). Table-driven, the shape
+        // `identity_account_sync_decode_to_their_own_variants` already
+        // uses, rather than one near-identical test per collection.
+        for (fixture, collection) in [
+            ("jetstream_commit_post.json", "app.bsky.feed.post"),
+            ("jetstream_commit_like.json", "app.bsky.feed.like"),
+            ("jetstream_commit_repost.json", "app.bsky.feed.repost"),
+            ("jetstream_commit_postgate.json", "app.bsky.feed.postgate"),
+        ] {
+            let frame = decode(fixture);
+            match frame.payload {
+                Payload::Commit(commit) => {
+                    assert_eq!(commit.operation, Operation::Create);
+                    assert_eq!(commit.collection, collection);
+                    assert!(!commit.did.is_empty());
+                    assert!(!commit.rkey.is_empty());
+                    assert!(!commit.rev.is_empty());
+                    assert!(commit.seq > 0);
+                    assert!(commit.record.is_some());
+                    assert!(commit.cid.is_some());
+                }
+                other => panic!("expected Payload::Commit for {fixture}, got {other:?}"),
             }
-            other => panic!("expected Payload::Commit, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn commit_like_decodes_as_create() {
-        let frame = decode("jetstream_commit_like.json");
-        match frame.payload {
-            Payload::Commit(commit) => {
-                assert_eq!(commit.operation, Operation::Create);
-                assert_eq!(commit.collection, "app.bsky.feed.like");
-            }
-            other => panic!("expected Payload::Commit, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn commit_repost_decodes_as_create() {
-        let frame = decode("jetstream_commit_repost.json");
-        match frame.payload {
-            Payload::Commit(commit) => {
-                assert_eq!(commit.operation, Operation::Create);
-                assert_eq!(commit.collection, "app.bsky.feed.repost");
-            }
-            other => panic!("expected Payload::Commit, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn commit_postgate_decodes_as_create() {
-        let frame = decode("jetstream_commit_postgate.json");
-        match frame.payload {
-            Payload::Commit(commit) => {
-                assert_eq!(commit.operation, Operation::Create);
-                assert_eq!(commit.collection, "app.bsky.feed.postgate");
-            }
-            other => panic!("expected Payload::Commit, got {other:?}"),
         }
     }
 

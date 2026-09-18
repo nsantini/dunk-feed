@@ -45,7 +45,7 @@ pub struct Config {
     pub hostname: String,
     pub publisher_did: String,
     pub feed_rkey: String,
-    pub jetstream_url: String,
+    pub jetstream_urls: Vec<String>,
     pub appview_url: String,
     pub w_repost: f64,
     pub w_reply: f64,
@@ -207,6 +207,45 @@ fn positive_float_or_default(
     Ok(value)
 }
 
+/// Splits `DUNK_JETSTREAM_URL` on `,`, trims each entry, and drops empty
+/// entries (BC26). Falls back to `default` when unset (BC27). At least one
+/// host is required (BC28): an empty, whitespace-only, or all-entries-empty
+/// value is invalid, the same rule as `drop_labels`. Every surviving entry
+/// must start with `wss://` or `ws://` (BC29); the client (`client.rs`)
+/// rotates through the list on every failed connect (BC30), never
+/// reconnecting to the same host alone unless only one was configured
+/// (BC25).
+fn jetstream_urls(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: &str,
+) -> Result<Vec<String>, ConfigError> {
+    let raw = string_or_default(lookup, name, default);
+    let urls: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect();
+    if urls.is_empty() {
+        return Err(ConfigError::Invalid {
+            name,
+            value: raw,
+            reason: "at least one host is required".to_string(),
+        });
+    }
+    for url in &urls {
+        if !(url.starts_with("wss://") || url.starts_with("ws://")) {
+            return Err(ConfigError::Invalid {
+                name,
+                value: url.clone(),
+                reason: "must start with wss:// or ws://".to_string(),
+            });
+        }
+    }
+    Ok(urls)
+}
+
 /// Splits `DUNK_DROP_LABELS` on `,`, trims each entry, and drops empty
 /// entries (BC10). Falls back to `default` when unset (BC9). An empty or
 /// whitespace-only value is malformed, the same rule as an empty number
@@ -242,11 +281,11 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         hostname: required(&lookup, "DUNK_HOSTNAME")?,
         publisher_did: required(&lookup, "DUNK_PUBLISHER_DID")?,
         feed_rkey: string_or_default(&lookup, "DUNK_FEED_RKEY", "dunks"),
-        jetstream_url: string_or_default(
+        jetstream_urls: jetstream_urls(
             &lookup,
             "DUNK_JETSTREAM_URL",
-            "wss://jetstream.us-east.bsky.network",
-        ),
+            "wss://jetstream.us-east.bsky.network,wss://jetstream.us-west.bsky.network",
+        )?,
         appview_url: string_or_default(&lookup, "DUNK_APPVIEW_URL", "https://public.api.bsky.app"),
         w_repost: nonneg_float_or_default(&lookup, "DUNK_W_REPOST", 2.0)?,
         w_reply: nonneg_float_or_default(&lookup, "DUNK_W_REPLY", 0.5)?,
@@ -353,7 +392,10 @@ mod tests {
         let config = load(env(&required_pair())).unwrap();
         assert_eq!(config.db_path, "/data/dunk.db");
         assert_eq!(config.http_addr, "0.0.0.0:3000");
-        assert_eq!(config.jetstream_url, "wss://jetstream.us-east.bsky.network");
+        assert_eq!(
+            config.jetstream_urls,
+            vec!["wss://jetstream.us-east.bsky.network", "wss://jetstream.us-west.bsky.network"]
+        );
         assert_eq!(config.appview_url, "https://public.api.bsky.app");
         assert_eq!(config.w_repost, 2.0);
         assert_eq!(config.w_reply, 0.5);
@@ -379,6 +421,68 @@ mod tests {
         let mut pairs = required_pair().to_vec();
         pairs.push(("DUNK_TYPO", "surprise"));
         assert!(load(env(&pairs)).is_ok());
+    }
+
+    #[test]
+    fn single_jetstream_url_is_kept_as_one_host() {
+        // BC25: one configured host stays one host; the client retries that
+        // same host rather than rotating.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_JETSTREAM_URL", "wss://jetstream.example.com"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.jetstream_urls, vec!["wss://jetstream.example.com"]);
+    }
+
+    #[test]
+    fn jetstream_url_list_is_split_trimmed_and_kept_in_order() {
+        // BC26.
+        let mut pairs = required_pair().to_vec();
+        pairs.push((
+            "DUNK_JETSTREAM_URL",
+            " wss://a.example.com, ws://b.example.com ,wss://c.example.com",
+        ));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(
+            config.jetstream_urls,
+            vec!["wss://a.example.com", "ws://b.example.com", "wss://c.example.com"]
+        );
+    }
+
+    #[test]
+    fn jetstream_url_default_is_two_hosts() {
+        // BC27.
+        let config = load(env(&required_pair())).unwrap();
+        assert_eq!(
+            config.jetstream_urls,
+            vec!["wss://jetstream.us-east.bsky.network", "wss://jetstream.us-west.bsky.network"]
+        );
+    }
+
+    #[test]
+    fn empty_jetstream_url_is_invalid() {
+        // BC28: at least one host is required.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_JETSTREAM_URL", "   , , "));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_JETSTREAM_URL"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jetstream_url_bad_scheme_is_invalid() {
+        // BC29: every entry must start with wss:// or ws://.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_JETSTREAM_URL", "wss://good.example.com,https://bad.example.com"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, value, .. } => {
+                assert_eq!(name, "DUNK_JETSTREAM_URL");
+                assert_eq!(value, "https://bad.example.com");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

@@ -8,12 +8,17 @@
 //! (TECH-DESIGN section 5.1's "Approach"). A cold start with no cache and an
 //! unreachable dictionary endpoint is not fatal: `Dictionary` is caught
 //! here, logged at `warn`, and the caller connects with no
-//! `zstdDictionary` parameter, so frames arrive as text (BC19).
+//! `zstdDictionary` parameter, so frames arrive as text (BC19). Running
+//! this way is "degraded": `is_compressed()` and `dictionary_id()` say so,
+//! and the fetch is retried on every reconnect and on a 10-minute timer
+//! (BC39, BC40).
 //!
-//! `JetstreamClient::next` hides every reconnect: on a closed socket or a
-//! transport error it backs off `1s, 2s, 4s, ... 60s` and resumes at
-//! `last_seq + 1` (TECH-DESIGN section 5.4's inclusive-resume rule), so the
-//! caller only ever sees the next `Event`, never the gap.
+//! `JetstreamClient::next` hides every reconnect: on a closed socket, a
+//! transport error, or a failed connect (including the first one, BC31) it
+//! backs off `1s, 2s, 4s, ... 60s`, rotates to the next configured host
+//! (BC30), and resumes at `last_seq + 1` (TECH-DESIGN section 5.4's
+//! inclusive-resume rule), so the caller only ever sees the next `Event`,
+//! never the gap.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -21,6 +26,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use thiserror::Error;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use zstd::dict::DecoderDictionary;
@@ -34,17 +40,39 @@ use crate::jetstream::event::{Event, Frame, Payload};
 const COLLECTIONS: [&str; 4] =
     ["app.bsky.feed.post", "app.bsky.feed.like", "app.bsky.feed.repost", "app.bsky.feed.postgate"];
 
-/// The name of the dictionary id cache file, in the directory that holds
-/// `cfg.db_path`.
-const DICT_ID_FILE: &str = "zstd-dict-id";
+/// The prefix and suffix of one dictionary cache file, `zstd-dict-<id>.bin`,
+/// in the directory that holds `cfg.db_path` (BC35, BC36). There is no
+/// separate pointer file: the file with the highest id wins on load.
+const DICT_FILE_PREFIX: &str = "zstd-dict-";
+const DICT_FILE_SUFFIX: &str = ".bin";
 
 /// The HTTP header the dictionary endpoint returns the dictionary id on.
 const DICT_ID_HEADER: &str = "x-zstd-dictionary-id";
 
+/// The timeout every dictionary HTTP request carries (BC34), the same
+/// timeout `appview/mod.rs`'s `REQUEST_TIMEOUT` uses. One `reqwest::Client`
+/// built with it is kept for the life of a `JetstreamClient`, never rebuilt
+/// per request.
+const DICTIONARY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often `next()` retries a dictionary fetch while degraded with no
+/// dictionary in hand (BC39), independent of the retry that already
+/// happens on every reconnect.
+const DICT_RETRY_INTERVAL: Duration = Duration::from_secs(600);
+
+/// The cap `decompress` grows its output buffer to before giving up on one
+/// frame, so a genuinely corrupt frame cannot grow the buffer without
+/// bound.
+const MAX_DECOMPRESS_CAP: usize = 16 * 1024 * 1024;
+
 /// Every way this module's work can fail. Every variant is caught inside
-/// `JetstreamClient`'s own reconnect loop, except a caller-fatal one; this
-/// story raises no caller-fatal variant. The caller sees one log line per
-/// skipped frame and one per reconnect (BC21), never this type itself.
+/// `JetstreamClient`'s own connect and reconnect loops, except a
+/// caller-fatal configuration error; this story raises no other
+/// caller-fatal variant. The caller sees one log line per skipped frame and
+/// one per reconnect (BC21), never this type itself. Carries no variant
+/// that nothing constructs (BC46): the earlier `Socket` variant was never
+/// raised, since a socket error is logged and retried inline, so it is
+/// gone.
 #[derive(Debug, Error)]
 pub enum JetstreamError {
     /// The dictionary was neither cached nor fetchable: no cache on disk,
@@ -56,85 +84,130 @@ pub enum JetstreamError {
     /// failed its `serde` shape, such as an unrecognised `operation` (BC8).
     #[error("frame decode failed: {0}")]
     Decode(String),
-    /// The initial WebSocket handshake failed.
+    /// The configuration was bad, for example an empty host list (BC32).
+    /// The only caller-fatal variant `connect` raises.
     #[error("connect failed: {0}")]
     Connect(String),
-    /// The WebSocket closed or errored after a successful connect.
-    #[error("socket error: {0}")]
-    Socket(String),
 }
 
 /// A prepared zstd dictionary: the id Jetstream tags it with, and the
-/// `DecoderDictionary` built from its bytes once at connect so a frame
-/// never re-prepares it (TECH-DESIGN section 5.1's "Approach").
+/// `DecoderDictionary` built from its bytes once at connect (or dictionary
+/// retry) so a frame never re-prepares it (TECH-DESIGN section 5.1's
+/// "Approach").
 pub struct Dictionary {
     pub id: String,
     prepared: DecoderDictionary<'static>,
 }
 
 impl Dictionary {
-    /// Returns the directory `cfg.db_path` lives in, or the current
-    /// directory when `db_path` names a bare file with no parent.
-    fn cache_dir(cfg: &Config) -> PathBuf {
-        Path::new(&cfg.db_path).parent().map(Path::to_path_buf).unwrap_or_default()
+    /// Returns the directory `db_path` lives in, or the current directory
+    /// when `db_path` names a bare file with no parent.
+    fn cache_dir(db_path: &str) -> PathBuf {
+        Path::new(db_path).parent().map(Path::to_path_buf).unwrap_or_default()
     }
 
-    /// Loads the dictionary from disk if it is cached (BC17, no HTTP call),
-    /// otherwise fetches it from `cfg.jetstream_url`'s dictionary endpoint
+    /// Loads the dictionary from disk if a cache file is present (BC17, no
+    /// HTTP call), otherwise fetches it from `host`'s dictionary endpoint
     /// and writes the cache (BC18). A write failure warns and still uses
-    /// the fetched bytes for this run (BC20). Returns `Dictionary` on a
-    /// cold start with a reachable host and header; returns
-    /// `JetstreamError::Dictionary` when neither the cache nor a fetch
-    /// produced one (BC19), which the caller catches and treats as
-    /// "connect with no dictionary".
-    pub async fn load_or_fetch(cfg: &Config) -> Result<Self, JetstreamError> {
-        let dir = Self::cache_dir(cfg);
-        if let Some(dict) = Self::read_cache(&dir) {
+    /// the fetched bytes for this run (BC20). Returns `JetstreamError::
+    /// Dictionary` when neither the cache nor a fetch produced one (BC19),
+    /// which the caller catches and treats as "connect with no dictionary".
+    async fn load_or_fetch(
+        http: &reqwest::Client,
+        cache_dir: &Path,
+        host: &str,
+    ) -> Result<Self, JetstreamError> {
+        if let Some(dict) = Self::read_cache(cache_dir) {
             return Ok(dict);
         }
-        let (id, bytes) = Self::fetch(cfg).await?;
-        Self::write_cache(&dir, &id, &bytes);
+        let (id, bytes) = Self::fetch(http, host).await?;
+        Self::write_cache(cache_dir, &id, &bytes);
         Ok(Self { prepared: DecoderDictionary::copy(&bytes), id })
     }
 
-    /// Reads `zstd-dict-id` and `zstd-<id>.dict` from `dir`. `None` on any
-    /// miss: file absent, unreadable, or the two disagree, which sends the
-    /// caller to `fetch` instead of failing outright.
+    /// Reads every `zstd-dict-<id>.bin` file in `dir` and keeps the one
+    /// with the highest id (BC36); there is no pointer file. `None` on any
+    /// miss: the directory is unreadable, holds no matching file, or the
+    /// winning file is empty or unreadable (BC37), which sends the caller
+    /// to `fetch` instead of failing outright.
     fn read_cache(dir: &Path) -> Option<Self> {
-        let id = std::fs::read_to_string(dir.join(DICT_ID_FILE)).ok()?;
-        let id = id.trim().to_string();
-        if id.is_empty() {
+        let entries = std::fs::read_dir(dir).ok()?;
+        let mut best: Option<(u64, PathBuf)> = None;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(id_str) =
+                name.strip_prefix(DICT_FILE_PREFIX).and_then(|s| s.strip_suffix(DICT_FILE_SUFFIX))
+            else {
+                continue;
+            };
+            let Ok(id_num) = id_str.parse::<u64>() else { continue };
+            if best.as_ref().is_none_or(|(current, _)| id_num > *current) {
+                best = Some((id_num, entry.path()));
+            }
+        }
+        let (id_num, path) = best?;
+        let bytes = std::fs::read(&path).ok()?;
+        if bytes.is_empty() {
             return None;
         }
-        let bytes = std::fs::read(dir.join(format!("zstd-{id}.dict"))).ok()?;
-        Some(Self { prepared: DecoderDictionary::copy(&bytes), id })
+        Some(Self { prepared: DecoderDictionary::copy(&bytes), id: id_num.to_string() })
     }
 
-    /// Writes `zstd-dict-id` and `zstd-<id>.dict` to `dir`. Logged at `warn`
-    /// and otherwise ignored on failure (BC20): an unwritable cache
-    /// directory does not fail the caller, which already has the bytes it
-    /// needs for this run.
+    /// Writes `zstd-dict-<id>.bin` to `dir`: a `.tmp` name first, then
+    /// renamed, so a reader never sees a part-written file (BC35). Every
+    /// older `zstd-dict-*.bin` file is deleted after the rename succeeds
+    /// (BC35). Logged at `warn` and otherwise ignored on failure (BC20): an
+    /// unwritable cache directory does not fail the caller, which already
+    /// has the bytes it needs for this run.
     fn write_cache(dir: &Path, id: &str, bytes: &[u8]) {
         if let Err(err) = std::fs::create_dir_all(dir) {
             tracing::warn!(error = %err, dir = %dir.display(), "jetstream: could not create dictionary cache dir");
             return;
         }
-        if let Err(err) = std::fs::write(dir.join(format!("zstd-{id}.dict")), bytes) {
+        let final_path = dir.join(format!("{DICT_FILE_PREFIX}{id}{DICT_FILE_SUFFIX}"));
+        let tmp_path = dir.join(format!("{DICT_FILE_PREFIX}{id}{DICT_FILE_SUFFIX}.tmp"));
+        if let Err(err) = std::fs::write(&tmp_path, bytes) {
             tracing::warn!(error = %err, "jetstream: could not write dictionary cache file");
             return;
         }
-        if let Err(err) = std::fs::write(dir.join(DICT_ID_FILE), id) {
-            tracing::warn!(error = %err, "jetstream: could not write dictionary id cache file");
+        if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
+            tracing::warn!(error = %err, "jetstream: could not rename dictionary cache file");
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let keep = final_path.file_name();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let lossy = name.to_string_lossy();
+            if lossy.starts_with(DICT_FILE_PREFIX)
+                && lossy.ends_with(DICT_FILE_SUFFIX)
+                && Some(name.as_os_str()) != keep
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
 
-    /// Fetches the dictionary bytes and id from `cfg.jetstream_url`'s HTTP
-    /// dictionary endpoint. `Dictionary` on a transport failure, a
-    /// non-success status, or a response with no `x-zstd-dictionary-id`
-    /// header (BC19).
-    async fn fetch(cfg: &Config) -> Result<(String, Vec<u8>), JetstreamError> {
-        let url = dictionary_url(&cfg.jetstream_url);
-        let response = reqwest::get(&url)
+    /// Deletes `dir`'s `zstd-dict-<id>.bin` cache file (BC38): called when
+    /// three consecutive decompression failures discard a dictionary, so a
+    /// restart does not load the same bad cache back in.
+    fn delete_cache_file(dir: &Path, id: &str) {
+        let _ = std::fs::remove_file(dir.join(format!("{DICT_FILE_PREFIX}{id}{DICT_FILE_SUFFIX}")));
+    }
+
+    /// Fetches the dictionary bytes and id from `host`'s HTTP dictionary
+    /// endpoint over `http`, a client built once with a 10s timeout
+    /// (BC34). `Dictionary` on a transport failure, a non-success status,
+    /// or a response with no `x-zstd-dictionary-id` header (BC19).
+    async fn fetch(
+        http: &reqwest::Client,
+        host: &str,
+    ) -> Result<(String, Vec<u8>), JetstreamError> {
+        let url = dictionary_url(host);
+        let response = http
+            .get(&url)
+            .send()
             .await
             .map_err(|err| JetstreamError::Dictionary(format!("fetching {url}: {err}")))?;
         if !response.status().is_success() {
@@ -160,12 +233,12 @@ impl Dictionary {
 }
 
 /// Builds the dictionary endpoint URL from a `wss://` or `ws://` Jetstream
-/// base, swapping the scheme for `https://`/`http://`, TECH-DESIGN section
+/// host, swapping the scheme for `https://`/`http://`, TECH-DESIGN section
 /// 5.1. This is the v2 `network.bsky.jetstream.getZstdDictionary` XRPC
 /// endpoint, verified live on 2026-09-18; the v1 `/subscribe/zstd-dictionary`
 /// path is rejected outright (TECH-DESIGN section 12, D4).
-fn dictionary_url(jetstream_url: &str) -> String {
-    let base = jetstream_url.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+fn dictionary_url(host: &str) -> String {
+    let base = host.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
     format!("{base}/xrpc/network.bsky.jetstream.getZstdDictionary")
 }
 
@@ -177,8 +250,8 @@ fn dictionary_url(jetstream_url: &str) -> String {
 /// 2026-09-18; the v1 `/subscribe` path and its `wantedCollections`
 /// parameter are rejected outright (TECH-DESIGN section 12, D4). Pure, so a
 /// test can assert the whole string with no network involved.
-pub fn subscribe_url(jetstream_url: &str, dict_id: Option<&str>, cursor: Option<u64>) -> String {
-    let mut url = format!("{jetstream_url}/xrpc/network.bsky.jetstream.subscribeEvents?");
+pub fn subscribe_url(host: &str, dict_id: Option<&str>, cursor: Option<u64>) -> String {
+    let mut url = format!("{host}/xrpc/network.bsky.jetstream.subscribeEvents?");
     for collection in COLLECTIONS {
         url.push_str("collections=");
         url.push_str(collection);
@@ -198,38 +271,52 @@ pub fn subscribe_url(jetstream_url: &str, dict_id: Option<&str>, cursor: Option<
 
 /// Decodes one WebSocket message into a [`Frame`]. `binary` is `true` for a
 /// binary message, decompressed against `dict` first (BC9); `false` for a
-/// text message, parsed as JSON directly, the same path a decoded binary
-/// frame takes (BC23). `dict` is `None` when no dictionary is in hand, in
-/// which case a binary message is treated as raw JSON bytes with no
-/// decompression. `JetstreamError::Decode` on a corrupt zstd frame or a
-/// payload that fails its shape; the reconnect loop (slice 3.0) catches
-/// this, logs at `warn`, and reads the next frame rather than treating it
-/// as fatal (BC8, BC9).
+/// text message, parsed as JSON directly (BC23, BC45). `dict` is `None`
+/// when no dictionary is in hand, in which case a binary message is parsed
+/// as raw JSON bytes with no decompression, the same as a text message.
+/// `JetstreamError::Decode` on a corrupt zstd frame or a payload that fails
+/// its shape; `JetstreamClient` catches this, logs at `warn`, and reads the
+/// next frame rather than treating it as fatal (BC8, BC9).
 pub fn decode_frame(
     data: &[u8],
     binary: bool,
     dict: Option<&Dictionary>,
 ) -> Result<Frame, JetstreamError> {
-    let json = if binary {
-        match dict {
-            Some(dict) => decompress(data, &dict.prepared)?,
-            None => data.to_vec(),
+    match (binary, dict) {
+        (true, Some(dict)) => {
+            let json = decompress(data, &dict.prepared)?;
+            serde_json::from_slice(&json).map_err(|err| JetstreamError::Decode(err.to_string()))
         }
-    } else {
-        data.to_vec()
-    };
-    serde_json::from_slice(&json).map_err(|err| JetstreamError::Decode(err.to_string()))
+        _ => serde_json::from_slice(data).map_err(|err| JetstreamError::Decode(err.to_string())),
+    }
 }
 
-/// Decompresses one zstd frame against a prepared dictionary. `Decode` on a
-/// malformed or corrupt frame (BC9): never a panic.
+/// Decompresses one zstd frame against a prepared dictionary with the bulk
+/// API (BC44): `zstd::bulk::Decompressor::with_prepared_dictionary`, which
+/// only references the already-prepared dictionary rather than re-parsing
+/// it, and `decompress(data, cap)` starting at about four times the
+/// compressed length, growing and retrying when the buffer was too small.
+/// `Decode` on a malformed or corrupt frame, or on a frame that still does
+/// not fit under [`MAX_DECOMPRESS_CAP`]: never a panic (BC9).
 fn decompress(data: &[u8], dict: &DecoderDictionary<'static>) -> Result<Vec<u8>, JetstreamError> {
-    use std::io::Read;
-    let mut decoder = zstd::stream::Decoder::with_prepared_dictionary(data, dict)
+    let mut decompressor = zstd::bulk::Decompressor::with_prepared_dictionary(dict)
         .map_err(|err| JetstreamError::Decode(err.to_string()))?;
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(|err| JetstreamError::Decode(err.to_string()))?;
-    Ok(out)
+    let mut cap = (data.len().saturating_mul(4)).max(4096);
+    let mut last_err = None;
+    while cap <= MAX_DECOMPRESS_CAP {
+        match decompressor.decompress(data, cap) {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                last_err = Some(err);
+                cap = cap.saturating_mul(2);
+            }
+        }
+    }
+    Err(JetstreamError::Decode(
+        last_err
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "decompressed frame exceeds the size cap".to_string()),
+    ))
 }
 
 /// Turns one decoded [`Frame`] into the [`Event`] a caller of
@@ -239,7 +326,10 @@ fn decompress(data: &[u8], dict: &DecoderDictionary<'static>) -> Result<Vec<u8>,
 /// returns as-is, `last_seq` untouched, since an info frame carries no `seq`
 /// (BC3); `#identity`, `#account`, `#sync` and `Other` are consumed
 /// internally (BC4). Pure and free of I/O, so the loop it drives is
-/// testable with no socket in play.
+/// testable with no socket in play. `JetstreamClient::dispatch_frame` wraps
+/// this to add the `last_seq` monotonicity clamp (BC43) and the pending
+/// resume cursor (BC41, BC42), which both need per-connection state this
+/// free function does not carry.
 fn dispatch(frame: Frame, last_seq: &mut Option<u64>) -> Option<Event> {
     if frame.kind != "message" {
         return None;
@@ -268,6 +358,8 @@ pub fn backoff_delay(attempt: u32) -> Duration {
 /// event has been seen, never `last_seq` itself (BC14); before that, the
 /// cursor `connect` was originally given, unchanged: `None` starts at the
 /// head (BC15), `Some(n)` resumes at the caller's own checkpoint (BC16).
+/// `JetstreamClient::reconnect` overrides this with `None` while a pending
+/// resume cursor was cleared by an `OutdatedCursor` info event (BC42).
 pub fn resume_cursor(last_seq: Option<u64>, initial: Option<u64>) -> Option<u64> {
     match last_seq {
         Some(seq) => Some(seq + 1),
@@ -275,46 +367,158 @@ pub fn resume_cursor(last_seq: Option<u64>, initial: Option<u64>) -> Option<u64>
     }
 }
 
-/// A live Jetstream v2 connection. Owns the socket, the prepared
-/// dictionary (if one was in hand at connect), the last `seq` seen, and the
-/// reconnect attempt counter. `next()` is the only way a caller drives it:
-/// every reconnect, backoff and resume happens inside that call, so the
-/// caller only ever sees the next [`Event`].
+/// `true` when `err` is a WebSocket handshake rejected with HTTP 400
+/// (BC41): a `cursor` below the retention floor is the known cause.
+fn is_http_400(err: &tokio_tungstenite::tungstenite::Error) -> bool {
+    matches!(
+        err,
+        tokio_tungstenite::tungstenite::Error::Http(response) if response.status().as_u16() == 400
+    )
+}
+
+/// One connect attempt against `host`. On an HTTP 400 rejection while
+/// `cursor` was sent (BC41), logs the rejected cursor at `warn` and retries
+/// once with no cursor, which starts the subscription at the head, before
+/// giving up on this attempt.
+async fn connect_socket(
+    host: &str,
+    dict_id: Option<&str>,
+    cursor: Option<u64>,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<tokio_tungstenite::tungstenite::Error>>
+{
+    let url = subscribe_url(host, dict_id, cursor);
+    match tokio_tungstenite::connect_async(&url).await {
+        Ok((socket, _)) => Ok(socket),
+        Err(err) if cursor.is_some() && is_http_400(&err) => {
+            tracing::warn!(
+                cursor = ?cursor,
+                "jetstream: handshake rejected with HTTP 400, retrying with no cursor"
+            );
+            let url = subscribe_url(host, dict_id, None);
+            tokio_tungstenite::connect_async(&url).await.map(|(socket, _)| socket).map_err(Box::new)
+        }
+        Err(err) => Err(Box::new(err)),
+    }
+}
+
+/// Connects to the next host in `hosts` (round-robin from `*host_index`),
+/// loading or fetching the dictionary at each attempt (logging at `warn`
+/// while degraded, BC39) and backing off between failures (BC12, BC13). A
+/// failed attempt rotates to the next host before the next try, and the
+/// dictionary fetch uses that same rotating host (BC30). Never returns an
+/// error: this is `connect`'s and `reconnect`'s shared "never caller-fatal
+/// for a network reason" loop (BC31).
+async fn connect_with_rotation(
+    http: &reqwest::Client,
+    cache_dir: &Path,
+    hosts: &[String],
+    host_index: &mut usize,
+    dict: &mut Option<Dictionary>,
+    cursor: Option<u64>,
+    attempt: &mut u32,
+) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+    loop {
+        if dict.is_none() {
+            match Dictionary::load_or_fetch(http, cache_dir, &hosts[*host_index]).await {
+                Ok(loaded) => *dict = Some(loaded),
+                Err(err) => {
+                    tracing::warn!(error = %err, "jetstream: degraded, connecting with no dictionary");
+                }
+            }
+        }
+        let dict_id = dict.as_ref().map(|d| d.id.as_str());
+        match connect_socket(&hosts[*host_index], dict_id, cursor).await {
+            Ok(socket) => return socket,
+            Err(err) => {
+                tracing::warn!(error = %err, host = %hosts[*host_index], "jetstream: connect failed");
+                *host_index = (*host_index + 1) % hosts.len();
+                let delay = backoff_delay(*attempt);
+                *attempt = attempt.saturating_add(1);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// A live Jetstream v2 connection. Owns the socket, the shared HTTP client
+/// and cache directory the dictionary uses, the configured host list and
+/// the current rotation position, the prepared dictionary (if one is in
+/// hand), the last `seq` seen, and the reconnect attempt counter. `next()`
+/// is the only way a caller drives it: every reconnect, backoff, rotation
+/// and resume happens inside that call, so the caller only ever sees the
+/// next [`Event`].
 pub struct JetstreamClient {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    jetstream_url: String,
+    http: reqwest::Client,
+    cache_dir: PathBuf,
+    hosts: Vec<String>,
+    host_index: usize,
     dict: Option<Dictionary>,
     initial_cursor: Option<u64>,
     last_seq: Option<u64>,
+    /// Set by an `OutdatedCursor` info event (BC42) and cleared by the next
+    /// commit; while set, a reconnect sends no cursor at all rather than
+    /// the clamped value that caused it.
+    force_no_cursor: bool,
     attempt: u32,
+    /// Cleared to `false` at each successful connect; set on the first
+    /// event this connection returns, which is also when `attempt` resets
+    /// (BC33).
+    got_event_this_connection: bool,
+    decompress_failures: u32,
+    last_dict_retry: Instant,
+    /// Logged once per connection on a `last_seq` regression (BC43), reset
+    /// at each reconnect.
+    warned_seq_regression: bool,
 }
 
 impl JetstreamClient {
-    /// Connects to `cfg.jetstream_url`. Loads or fetches the zstd
-    /// dictionary first (BC17, BC18); a `Dictionary` failure is caught
-    /// here, logged at `warn`, and the connection proceeds with no
-    /// `zstdDictionary` parameter, so frames arrive as text (BC19).
-    /// `cursor` is the caller's own checkpoint, used verbatim until an
-    /// event is seen (BC15, BC16).
+    /// Connects to the first of `cfg.jetstream_urls`. Never caller-fatal for
+    /// a network reason (BC31): a failed handshake backs off and rotates to
+    /// the next configured host exactly as a reconnect does, and this call
+    /// returns only once a connection succeeds. The only fatal case left is
+    /// a bad configuration, here an empty host list (BC32); `config::load`
+    /// already rejects that before a `Config` exists, so this is defence in
+    /// depth. `cursor` is the caller's own checkpoint, used verbatim until
+    /// an event is seen (BC15, BC16).
     pub async fn connect(cfg: &Config, cursor: Option<u64>) -> Result<Self, JetstreamError> {
-        let dict = match Dictionary::load_or_fetch(cfg).await {
-            Ok(dict) => Some(dict),
-            Err(err) => {
-                tracing::warn!(error = %err, "jetstream: connecting with no dictionary");
-                None
-            }
-        };
-        let url = subscribe_url(&cfg.jetstream_url, dict.as_ref().map(|d| d.id.as_str()), cursor);
-        let (socket, _) = tokio_tungstenite::connect_async(&url)
-            .await
-            .map_err(|err| JetstreamError::Connect(err.to_string()))?;
+        if cfg.jetstream_urls.is_empty() {
+            return Err(JetstreamError::Connect("no jetstream hosts configured".to_string()));
+        }
+        let http = reqwest::Client::builder()
+            .timeout(DICTIONARY_TIMEOUT)
+            .build()
+            .expect("reqwest::Client::builder with only a timeout never fails to build");
+        let cache_dir = Dictionary::cache_dir(&cfg.db_path);
+        let hosts = cfg.jetstream_urls.clone();
+        let mut host_index = 0usize;
+        let mut dict = None;
+        let mut attempt = 0u32;
+        let socket = connect_with_rotation(
+            &http,
+            &cache_dir,
+            &hosts,
+            &mut host_index,
+            &mut dict,
+            cursor,
+            &mut attempt,
+        )
+        .await;
         Ok(Self {
             socket,
-            jetstream_url: cfg.jetstream_url.clone(),
+            http,
+            cache_dir,
+            hosts,
+            host_index,
             dict,
             initial_cursor: cursor,
             last_seq: None,
+            force_no_cursor: false,
             attempt: 0,
+            got_event_this_connection: false,
+            decompress_failures: 0,
+            last_dict_retry: Instant::now(),
+            warned_seq_regression: false,
         })
     }
 
@@ -324,17 +528,35 @@ impl JetstreamClient {
         self.last_seq
     }
 
+    /// `true` when a dictionary is currently in hand and frames are
+    /// received compressed (BC39, BC40).
+    pub fn is_compressed(&self) -> bool {
+        self.dict.is_some()
+    }
+
+    /// The id of the dictionary currently in hand, or `None` while
+    /// degraded (BC39, BC40).
+    pub fn dictionary_id(&self) -> Option<&str> {
+        self.dict.as_ref().map(|dict| dict.id.as_str())
+    }
+
     /// Returns the next [`Event`], hiding every reconnect (BC12). A
     /// non-`"message"` envelope, `#identity`/`#account`/`#sync`/`Other`
     /// payloads, and a frame that fails to decode (BC8, BC9, logged at
     /// `warn`) all loop rather than return. A ping, pong, or close-adjacent
     /// message carries no payload and is ignored (BC24). A closed or
-    /// errored socket backs off and reconnects (BC12); this call never
-    /// gives up, so it never actually returns `Err` today, but keeps the
-    /// `Result` so a future caller-fatal `JetstreamError` variant (BC21)
-    /// can surface without a signature change.
+    /// errored socket backs off, rotates hosts and reconnects (BC12, BC30).
+    /// While degraded with no dictionary, a fetch is retried on a
+    /// 10-minute timer checked here, in addition to the retry every
+    /// reconnect already makes (BC39). This call never gives up, so it
+    /// never actually returns `Err` today, but keeps the `Result` so a
+    /// future caller-fatal `JetstreamError` variant (BC21) can surface
+    /// without a signature change.
     pub async fn next(&mut self) -> Result<Event, JetstreamError> {
         loop {
+            if self.dict.is_none() && self.last_dict_retry.elapsed() >= DICT_RETRY_INTERVAL {
+                self.retry_dictionary().await;
+            }
             let event = match self.socket.next().await {
                 Some(Ok(Message::Binary(data))) => self.handle_frame(&data, true),
                 Some(Ok(Message::Text(data))) => self.handle_frame(data.as_bytes(), false),
@@ -355,56 +577,143 @@ impl JetstreamClient {
                 }
             };
             if let Some(event) = event {
+                if !self.got_event_this_connection {
+                    // BC33: the backoff attempt counter resets only when
+                    // the first event of a connection arrives, not on
+                    // handshake success.
+                    self.attempt = 0;
+                    self.got_event_this_connection = true;
+                }
                 return Ok(event);
+            }
+        }
+    }
+
+    /// Retries the dictionary fetch while degraded (BC39, BC40), using the
+    /// current host. Logged at `info` on success, `warn` on a repeat
+    /// failure.
+    async fn retry_dictionary(&mut self) {
+        self.last_dict_retry = Instant::now();
+        match Dictionary::load_or_fetch(&self.http, &self.cache_dir, &self.hosts[self.host_index])
+            .await
+        {
+            Ok(dict) => {
+                tracing::info!(id = %dict.id, "jetstream: dictionary retry succeeded");
+                self.dict = Some(dict);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "jetstream: dictionary retry still degraded");
             }
         }
     }
 
     /// Decodes one message into an [`Event`], or `None` when it should be
     /// consumed internally. A decode failure warns and is otherwise
-    /// swallowed (BC8, BC9): the connection stays open.
+    /// swallowed (BC8, BC9): the connection stays open. Reuses
+    /// [`decode_frame`] rather than re-implementing its decompress-then-
+    /// parse steps; a binary message that fails while a dictionary is in
+    /// use counts toward the three-consecutive-failures discard rule
+    /// (BC38).
     fn handle_frame(&mut self, data: &[u8], binary: bool) -> Option<Event> {
+        let used_dictionary = binary && self.dict.is_some();
         match decode_frame(data, binary, self.dict.as_ref()) {
-            Ok(frame) => dispatch(frame, &mut self.last_seq),
+            Ok(frame) => {
+                if used_dictionary {
+                    self.decompress_failures = 0;
+                }
+                self.dispatch_frame(frame)
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "jetstream: skipping frame");
+                if used_dictionary {
+                    self.on_decompress_failure();
+                }
                 None
             }
         }
     }
 
-    /// Backs off, then reconnects with `cursor = resume_cursor(...)`
-    /// (BC14, BC15, BC16), retrying with the same backoff schedule until a
-    /// connection succeeds. Resets the attempt counter on success, so a
-    /// long-lived connection does not carry a stale attempt count into its
-    /// next disconnect.
-    async fn reconnect(&mut self) {
-        loop {
-            let delay = backoff_delay(self.attempt);
-            tracing::warn!(
-                attempt = self.attempt,
-                delay_secs = delay.as_secs(),
-                "jetstream: backing off before reconnect"
-            );
-            tokio::time::sleep(delay).await;
-            self.attempt = self.attempt.saturating_add(1);
-            let cursor = resume_cursor(self.last_seq, self.initial_cursor);
-            let url = subscribe_url(
-                &self.jetstream_url,
-                self.dict.as_ref().map(|d| d.id.as_str()),
-                cursor,
-            );
-            match tokio_tungstenite::connect_async(&url).await {
-                Ok((socket, _)) => {
-                    self.socket = socket;
-                    self.attempt = 0;
-                    return;
+    /// Counts one decompression failure on the current connection (BC38).
+    /// At three in a row, discards the dictionary, deletes its cache file,
+    /// and marks it due for an immediate retry: the next reconnect (or the
+    /// 10-minute timer) fetches again, and until then the connection runs
+    /// uncompressed.
+    fn on_decompress_failure(&mut self) {
+        self.decompress_failures += 1;
+        if self.decompress_failures >= 3 {
+            if let Some(dict) = self.dict.take() {
+                tracing::warn!(
+                    id = %dict.id,
+                    "jetstream: three consecutive decompression failures, discarding dictionary"
+                );
+                Dictionary::delete_cache_file(&self.cache_dir, &dict.id);
+            }
+            self.decompress_failures = 0;
+            self.last_dict_retry = Instant::now() - DICT_RETRY_INTERVAL;
+        }
+    }
+
+    /// Wraps [`dispatch`] with the per-connection state it cannot itself
+    /// carry: `last_seq` never moves backwards, warning once per connection
+    /// on a regression rather than once per frame (BC43), and the pending
+    /// resume cursor is cleared by a commit and set by an `OutdatedCursor`
+    /// info event (BC41, BC42).
+    fn dispatch_frame(&mut self, frame: Frame) -> Option<Event> {
+        let mut candidate = self.last_seq;
+        let event = dispatch(frame, &mut candidate);
+        if let Some(new_seq) = candidate {
+            match self.last_seq {
+                Some(current) if new_seq < current => {
+                    if !self.warned_seq_regression {
+                        tracing::warn!(
+                            current,
+                            new_seq,
+                            "jetstream: seq went backwards, keeping the higher value"
+                        );
+                        self.warned_seq_regression = true;
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(error = %err, "jetstream: reconnect attempt failed");
-                }
+                _ => self.last_seq = Some(new_seq),
             }
         }
+        match &event {
+            Some(Event::Commit(_)) => self.force_no_cursor = false,
+            Some(Event::Info { name, .. }) if name == "OutdatedCursor" => {
+                self.force_no_cursor = true;
+            }
+            _ => {}
+        }
+        event
+    }
+
+    /// Backs off, rotates to the next configured host, and reconnects with
+    /// `cursor` computed from `resume_cursor` (BC14, BC15, BC16), or with no
+    /// cursor while a pending `OutdatedCursor` clamp is in effect (BC42),
+    /// retrying with the same backoff schedule until a connection succeeds
+    /// (BC12, BC30). The attempt counter is carried into the new
+    /// connection rather than reset here (BC33); `next()` resets it once
+    /// the new connection's first event arrives.
+    async fn reconnect(&mut self) {
+        let cursor = if self.force_no_cursor {
+            None
+        } else {
+            resume_cursor(self.last_seq, self.initial_cursor)
+        };
+        let mut attempt = self.attempt;
+        self.socket = connect_with_rotation(
+            &self.http,
+            &self.cache_dir,
+            &self.hosts,
+            &mut self.host_index,
+            &mut self.dict,
+            cursor,
+            &mut attempt,
+        )
+        .await;
+        self.attempt = attempt;
+        self.got_event_this_connection = false;
+        self.decompress_failures = 0;
+        self.warned_seq_regression = false;
     }
 }
 
@@ -426,12 +735,23 @@ mod tests {
         Dictionary { prepared: DecoderDictionary::copy(&bytes), id: "20260811".to_string() }
     }
 
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("jetstream-client-test-{label}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    fn http_client() -> reqwest::Client {
+        reqwest::Client::builder().timeout(DICTIONARY_TIMEOUT).build().unwrap()
+    }
+
     #[test]
     fn cached_dictionary_is_read_with_no_http_call() {
         // BC17: a cached dictionary is read from disk. This constructs the
         // cache directly rather than over HTTP; a `tempfile`-backed
         // `read_cache` round trip is the more direct proof.
-        let tmp = std::env::temp_dir().join(format!("jetstream-cache-test-{}", std::process::id()));
+        let tmp = temp_dir("cache-hit");
         std::fs::create_dir_all(&tmp).unwrap();
         let bytes = fixture_bytes("jetstream_dict_20260811.bin");
         Dictionary::write_cache(&tmp, "20260811", &bytes);
@@ -442,32 +762,64 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    #[test]
+    fn cache_write_keeps_only_the_newest_file() {
+        // BC35, BC36: writing a new id deletes every older `zstd-dict-*.bin`
+        // file, and the highest id wins on the next read.
+        let tmp = temp_dir("cache-rotate");
+        std::fs::create_dir_all(&tmp).unwrap();
+        Dictionary::write_cache(&tmp, "1", b"one");
+        Dictionary::write_cache(&tmp, "20260811", b"two");
+
+        let names: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["zstd-dict-20260811.bin"]);
+
+        let dict = Dictionary::read_cache(&tmp).expect("cache should be read back");
+        assert_eq!(dict.id, "20260811");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn empty_cache_file_is_a_miss() {
+        // BC37: an empty file is treated as no cache at all.
+        let tmp = temp_dir("cache-empty");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("zstd-dict-1.bin"), b"").unwrap();
+
+        assert!(Dictionary::read_cache(&tmp).is_none());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[tokio::test]
     async fn missing_cache_with_unreachable_host_yields_dictionary_error() {
         // BC19: no cache and a fetch failure (here, an unreachable host)
         // produces `JetstreamError::Dictionary`, never a panic and never a
         // different variant.
-        let tmp =
-            std::env::temp_dir().join(format!("jetstream-cache-test-miss-{}", std::process::id()));
-        std::fs::remove_dir_all(&tmp).ok();
-        let cfg = test_config(&tmp, "wss://127.0.0.1:1");
+        let tmp = temp_dir("cache-miss");
+        let http = http_client();
 
-        match Dictionary::load_or_fetch(&cfg).await {
+        match Dictionary::load_or_fetch(&http, &tmp, "wss://127.0.0.1:1").await {
             Err(JetstreamError::Dictionary(_)) => {}
             Err(other) => panic!("expected JetstreamError::Dictionary, got {other}"),
             Ok(_) => panic!("expected an error, dictionary fetch unexpectedly succeeded"),
         }
     }
 
-    fn test_config(cache_dir: &Path, jetstream_url: &str) -> Config {
+    fn test_config(cache_dir: &Path, jetstream_urls: &[&str]) -> Config {
         let lookup = {
             let db_path = cache_dir.join("dunk.db").to_string_lossy().to_string();
-            let jetstream_url = jetstream_url.to_string();
+            let urls = jetstream_urls.join(",");
             move |name: &str| match name {
                 "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
                 "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
                 "DUNK_DB_PATH" => Some(db_path.clone()),
-                "DUNK_JETSTREAM_URL" => Some(jetstream_url.clone()),
+                "DUNK_JETSTREAM_URL" => Some(urls.clone()),
                 _ => None,
             }
         };
@@ -544,8 +896,9 @@ mod tests {
 
     #[test]
     fn text_message_parses_as_json_directly() {
-        // BC23: a text message, with no dictionary in use, is parsed as
-        // JSON directly, the same path a decoded binary frame takes.
+        // BC23, BC45: a text message, with no dictionary in use, is parsed
+        // with `serde_json::from_slice` directly, the same path a decoded
+        // binary frame takes.
         let raw = br##"{"$type":"ping","payload":{"$type":"network.bsky.jetstream.subscribeEvents#identity","did":"did:plc:abc"}}"##;
         let frame = decode_frame(raw, false, None).expect("text message should decode");
         assert_eq!(frame.kind, "ping");
@@ -616,14 +969,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotates_to_the_next_host_on_a_failed_connect() {
+        // BC30: two unreachable loopback hosts, connected with a fast
+        // backoff. `connect_with_rotation` must not get stuck retrying the
+        // first host alone.
+        let http = http_client();
+        let cache_dir = temp_dir("rotation");
+        let hosts = vec!["ws://127.0.0.1:1".to_string(), "ws://127.0.0.1:2".to_string()];
+        let mut host_index = 0usize;
+        let mut dict = None;
+        let mut attempt = 0u32;
+
+        // Neither host is reachable, so run the loop by hand for two
+        // iterations and check that the index actually rotated, rather
+        // than driving `connect_with_rotation` to completion (it never
+        // returns against two dead hosts).
+        let fut = connect_with_rotation(
+            &http,
+            &cache_dir,
+            &hosts,
+            &mut host_index,
+            &mut dict,
+            None,
+            &mut attempt,
+        );
+        // Give the two failing attempts a moment to run; `backoff_delay(0)`
+        // is 1s and `backoff_delay(1)` is 2s, so 500ms sees the first
+        // rotation without waiting for both.
+        let _ = tokio::time::timeout(Duration::from_millis(500), fut).await;
+        assert_eq!(host_index, 1, "the first failed attempt should rotate to the second host");
+
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[test]
+    fn is_http_400_matches_only_a_400_response() {
+        // BC41's detection helper: sanity-checked directly since a live 400
+        // handshake is not reproducible without the network.
+        use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
+        let ok = tokio_tungstenite::tungstenite::Error::Http(
+            Response::builder().status(StatusCode::OK).body(None).unwrap(),
+        );
+        let bad = tokio_tungstenite::tungstenite::Error::Http(
+            Response::builder().status(StatusCode::BAD_REQUEST).body(None).unwrap(),
+        );
+        assert!(!is_http_400(&ok));
+        assert!(is_http_400(&bad));
+    }
+
+    #[tokio::test]
     #[ignore = "hits the live Jetstream v2 host; run by hand"]
     async fn jetstream_live_connect() {
         // AC8: a live connection decodes real frames from all four
         // collections. The cursor is a unix-microsecond value below the
         // retention floor (spec.md step 7), which starts the subscription
         // near the current head rather than waiting on the full backlog.
-        let tmp = std::env::temp_dir().join(format!("jetstream-live-test-{}", std::process::id()));
-        let cfg = test_config(&tmp, "wss://jetstream.us-west.bsky.network");
+        let tmp = temp_dir("live");
+        let cfg = test_config(&tmp, &["wss://jetstream.us-west.bsky.network"]);
         let mut client = JetstreamClient::connect(&cfg, Some(1_600_000_000_000_000))
             .await
             .expect("live connect should succeed");
