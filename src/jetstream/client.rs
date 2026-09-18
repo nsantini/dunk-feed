@@ -2,8 +2,9 @@
 //! `JetstreamClient` connect/reconnect/resume loop that hands a caller
 //! typed [`Event`]s.
 //!
-//! The zstd dictionary is fetched once and cached on disk next to
-//! `cfg.db_path`, because re-preparing a 65,536-byte `DecoderDictionary`
+//! The zstd dictionary is fetched once and its `zstd::bulk::Decompressor` is
+//! built once, both cached on disk and in memory next to `cfg.db_path`,
+//! because re-building a decompression context from a 65,536-byte dictionary
 //! per frame would cost about 400 times a second at the measured live rate
 //! (TECH-DESIGN section 5.1's "Approach"). A cold start with no cache and an
 //! unreachable dictionary endpoint is not fatal: `Dictionary` is caught
@@ -29,7 +30,7 @@ use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use zstd::dict::DecoderDictionary;
+use zstd::bulk::Decompressor;
 
 use crate::config::Config;
 use crate::jetstream::event::{Event, Frame, Payload};
@@ -91,12 +92,13 @@ pub enum JetstreamError {
 }
 
 /// A prepared zstd dictionary: the id Jetstream tags it with, and the
-/// `DecoderDictionary` built from its bytes once at connect (or dictionary
-/// retry) so a frame never re-prepares it (TECH-DESIGN section 5.1's
-/// "Approach").
+/// `zstd::bulk::Decompressor` built from its bytes once at connect (or
+/// dictionary retry) with `Decompressor::with_dictionary`, which copies the
+/// dictionary bytes into the decompression context and needs no borrow, so a
+/// frame never re-builds it (TECH-DESIGN section 5.1's "Approach").
 pub struct Dictionary {
     pub id: String,
-    prepared: DecoderDictionary<'static>,
+    decompressor: Decompressor<'static>,
 }
 
 impl Dictionary {
@@ -122,7 +124,9 @@ impl Dictionary {
         }
         let (id, bytes) = Self::fetch(http, host).await?;
         Self::write_cache(cache_dir, &id, &bytes);
-        Ok(Self { prepared: DecoderDictionary::copy(&bytes), id })
+        let decompressor = Decompressor::with_dictionary(&bytes)
+            .map_err(|err| JetstreamError::Dictionary(err.to_string()))?;
+        Ok(Self { decompressor, id })
     }
 
     /// Reads every `zstd-dict-<id>.bin` file in `dir` and keeps the one
@@ -151,7 +155,8 @@ impl Dictionary {
         if bytes.is_empty() {
             return None;
         }
-        Some(Self { prepared: DecoderDictionary::copy(&bytes), id: id_num.to_string() })
+        let decompressor = Decompressor::with_dictionary(&bytes).ok()?;
+        Some(Self { decompressor, id: id_num.to_string() })
     }
 
     /// Writes `zstd-dict-<id>.bin` to `dir`: a `.tmp` name first, then
@@ -280,27 +285,29 @@ pub fn subscribe_url(host: &str, dict_id: Option<&str>, cursor: Option<u64>) -> 
 pub fn decode_frame(
     data: &[u8],
     binary: bool,
-    dict: Option<&Dictionary>,
+    dict: Option<&mut Dictionary>,
 ) -> Result<Frame, JetstreamError> {
     match (binary, dict) {
         (true, Some(dict)) => {
-            let json = decompress(data, &dict.prepared)?;
+            let json = decompress(data, &mut dict.decompressor)?;
             serde_json::from_slice(&json).map_err(|err| JetstreamError::Decode(err.to_string()))
         }
         _ => serde_json::from_slice(data).map_err(|err| JetstreamError::Decode(err.to_string())),
     }
 }
 
-/// Decompresses one zstd frame against a prepared dictionary with the bulk
-/// API (BC44): `zstd::bulk::Decompressor::with_prepared_dictionary`, which
-/// only references the already-prepared dictionary rather than re-parsing
-/// it, and `decompress(data, cap)` starting at about four times the
+/// Decompresses one zstd frame against the dictionary's already-built
+/// decompression context (BC44): `decompressor` is built once per
+/// [`Dictionary`], in [`Dictionary::load_or_fetch`] or
+/// [`Dictionary::read_cache`], so this call only ever decompresses, never
+/// re-builds it. `decompress(data, cap)` starts at about four times the
 /// compressed length, growing and retrying when the buffer was too small.
 /// `Decode` on a malformed or corrupt frame, or on a frame that still does
 /// not fit under [`MAX_DECOMPRESS_CAP`]: never a panic (BC9).
-fn decompress(data: &[u8], dict: &DecoderDictionary<'static>) -> Result<Vec<u8>, JetstreamError> {
-    let mut decompressor = zstd::bulk::Decompressor::with_prepared_dictionary(dict)
-        .map_err(|err| JetstreamError::Decode(err.to_string()))?;
+fn decompress(
+    data: &[u8],
+    decompressor: &mut Decompressor<'static>,
+) -> Result<Vec<u8>, JetstreamError> {
     let mut cap = (data.len().saturating_mul(4)).max(4096);
     let mut last_err = None;
     while cap <= MAX_DECOMPRESS_CAP {
@@ -616,7 +623,7 @@ impl JetstreamClient {
     /// (BC38).
     fn handle_frame(&mut self, data: &[u8], binary: bool) -> Option<Event> {
         let used_dictionary = binary && self.dict.is_some();
-        match decode_frame(data, binary, self.dict.as_ref()) {
+        match decode_frame(data, binary, self.dict.as_mut()) {
             Ok(frame) => {
                 if used_dictionary {
                     self.decompress_failures = 0;
@@ -755,7 +762,9 @@ mod tests {
 
     fn recorded_dictionary() -> Dictionary {
         let bytes = fixture_bytes("jetstream_dict_20260811.bin");
-        Dictionary { prepared: DecoderDictionary::copy(&bytes), id: "20260811".to_string() }
+        let decompressor =
+            Decompressor::with_dictionary(&bytes).expect("dictionary should build a decompressor");
+        Dictionary { decompressor, id: "20260811".to_string() }
     }
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -896,10 +905,10 @@ mod tests {
     fn recorded_zstd_frame_decodes_and_parses_as_commit() {
         // AC6: the recorded frame decodes with the recorded dictionary and
         // parses as a Commit for app.bsky.feed.post.
-        let dict = recorded_dictionary();
+        let mut dict = recorded_dictionary();
         let data = fixture_bytes("jetstream_frame.zst");
 
-        let frame = decode_frame(&data, true, Some(&dict)).expect("frame should decode");
+        let frame = decode_frame(&data, true, Some(&mut dict)).expect("frame should decode");
         match frame.payload {
             crate::jetstream::event::Payload::Commit(commit) => {
                 assert_eq!(commit.collection, "app.bsky.feed.post");
@@ -912,8 +921,8 @@ mod tests {
     fn corrupt_zstd_frame_is_skipped_not_a_panic() {
         // BC9: a malformed or corrupt zstd frame is a `Decode` error, never
         // a panic.
-        let dict = recorded_dictionary();
-        let err = decode_frame(b"not a zstd frame", true, Some(&dict)).unwrap_err();
+        let mut dict = recorded_dictionary();
+        let err = decode_frame(b"not a zstd frame", true, Some(&mut dict)).unwrap_err();
         assert!(matches!(err, JetstreamError::Decode(_)));
     }
 
