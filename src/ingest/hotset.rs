@@ -43,6 +43,7 @@ impl HotSet {
     }
 
     /// Whether the set holds no hash.
+    #[allow(dead_code)] // clippy's `len_without_is_empty` requires this method; nothing calls it yet.
     pub fn is_empty(&self) -> bool {
         self.hashes.is_empty()
     }

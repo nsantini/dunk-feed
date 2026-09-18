@@ -9,8 +9,6 @@
 //! `run` (slice 6.0) is `dunk run`'s entry point, wiring the store, the
 //! writer and a real `JetstreamClient` into `run_ingest`.
 
-#![allow(dead_code)] // First caller is `dunk run`, slice 6.0.
-
 pub mod embed;
 pub mod hotset;
 
@@ -636,9 +634,7 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
 
     let mut hot = HotSet::new();
     let rebuild_start = std::time::Instant::now();
-    store.for_each_hot_uri(|uri| {
-        hot.insert(uri);
-    })?;
+    hot.rebuild_from(|f| store.for_each_hot_uri(f))?;
     tracing::info!(
         hot_set_len = hot.len(),
         elapsed_ms = rebuild_start.elapsed().as_millis() as u64,
