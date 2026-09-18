@@ -22,3 +22,4 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 zstd = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

@@ -3,3 +3,4 @@
 //! detector it will call.
 
 pub mod embed;
+pub mod hotset;
