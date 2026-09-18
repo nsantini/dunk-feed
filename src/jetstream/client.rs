@@ -717,6 +717,29 @@ impl JetstreamClient {
     }
 }
 
+/// `JetstreamClient` is the ingest task's live `EventSource` (`src/ingest/
+/// mod.rs`, slice 4.0). Each method just forwards to the inherent one of
+/// the same name; `self.next()` etc. inside this impl resolve to those
+/// inherent methods, since an inherent method always takes priority over a
+/// trait method of the same name, so there is no recursion.
+impl crate::ingest::EventSource for JetstreamClient {
+    async fn next(&mut self) -> Result<Event, JetstreamError> {
+        self.next().await
+    }
+
+    fn last_seq(&self) -> Option<u64> {
+        self.last_seq()
+    }
+
+    fn is_compressed(&self) -> bool {
+        self.is_compressed()
+    }
+
+    fn initial_cursor(&self) -> Option<u64> {
+        self.initial_cursor
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

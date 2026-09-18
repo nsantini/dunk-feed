@@ -3,16 +3,29 @@
 //! is the pure quote detector, and this module's `translate` turns one
 //! decoded [`CommitEvent`] into zero or more [`Op`] values for the writer,
 //! TECH-DESIGN section 5.2. `translate` never touches the store or the
-//! network, so it is unit tested with fixtures alone.
+//! network, so it is unit tested with fixtures alone. `EventSource` is the
+//! small trait `run_ingest`'s task loop reads through; `JetstreamClient`
+//! implements it, and a test vector source drives the loop with no socket.
+//! `run` (slice 6.0) is `dunk run`'s entry point, wiring the store, the
+//! writer and a real `JetstreamClient` into `run_ingest`.
+
+#![allow(dead_code)] // First caller is `dunk run`, slice 6.0.
 
 pub mod embed;
 pub mod hotset;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
+use thiserror::Error;
+use tokio::sync::watch;
+use tokio::time::{interval, MissedTickBehavior};
+
+use crate::config::Config;
 use crate::jetstream::event::{CommitEvent, Operation};
-use crate::store::writer::{CountField, Op};
-use crate::store::unix_now;
+use crate::jetstream::{Event, JetstreamError};
+use crate::store::writer::{CountField, Op, WriterHandle, WriterState};
+use crate::store::{unix_now, StoreError};
 use embed::{AtUri, Embed};
 use hotset::HotSet;
 
@@ -113,7 +126,7 @@ fn classify_embed(record: &serde_json::Value) -> EmbedClass {
             // (the `$type` and a `uri` string were both there), so tell a
             // non-post collection apart from an outright malformed URI by
             // reading the collection segment ourselves.
-            let collection = uri.strip_prefix("at://").and_then(|rest| rest.splitn(3, '/').nth(1));
+            let collection = uri.strip_prefix("at://").and_then(|rest| rest.split('/').nth(1));
             match collection {
                 Some(collection) if collection != "app.bsky.feed.post" => EmbedClass::NonPostEmbed,
                 _ => EmbedClass::None,
@@ -216,8 +229,12 @@ fn translate_gated_incr(commit: &CommitEvent, hot: &HotSet, field: CountField) -
     if commit.operation == Operation::Delete {
         return Translation::default();
     }
-    let Some(subject) =
-        commit.record.as_ref().and_then(|r| r.get("subject")).and_then(|s| s.get("uri")).and_then(|v| v.as_str())
+    let Some(subject) = commit
+        .record
+        .as_ref()
+        .and_then(|r| r.get("subject"))
+        .and_then(|s| s.get("uri"))
+        .and_then(|v| v.as_str())
     else {
         return Translation::default();
     };
@@ -395,6 +412,181 @@ impl Stats {
     }
 }
 
+/// How often `run_ingest` sends `Op::Checkpoint` when the source has a
+/// `last_seq` that no earlier checkpoint sent (BC25), so the cursor still
+/// advances through a run of events that produced no op. A module constant
+/// for the same reason `STATS_PERIOD_SECS` is one: `AGENTS.md` reserves
+/// `Config` for the PRD's score-table constants, and story 05 already set
+/// the writer's own 500 ms and 1,000 ops as the precedent.
+const CHECKPOINT_PERIOD_SECS: u64 = 5;
+
+/// The commit-and-info stream `run_ingest` reads, TECH-DESIGN section 5.1.
+/// `JetstreamClient` (`src/jetstream/client.rs`) implements it directly; a
+/// test vector source implements it over a fixed list of `Event`s, so the
+/// task loop is driven with no socket. Generic rather than a trait object:
+/// `run_ingest` takes one `S: EventSource` and never stores a second
+/// implementation alongside it.
+pub trait EventSource {
+    /// The next event, hiding every reconnect the implementation needs.
+    /// `JetstreamError` only on a caller-fatal failure (BC32); today
+    /// `JetstreamClient::next` never returns one, since it retries every
+    /// network fault itself.
+    async fn next(&mut self) -> Result<Event, JetstreamError>;
+    /// The `seq` of the last commit this source has returned, or `None`
+    /// before the first one.
+    fn last_seq(&self) -> Option<u64>;
+    /// `true` when frames are currently received compressed.
+    fn is_compressed(&self) -> bool;
+    /// The cursor this source connected with, BC23's second fallback for
+    /// `Op::MarkAllDirty`'s `seq` when no commit has been seen yet this run.
+    fn initial_cursor(&self) -> Option<u64>;
+}
+
+/// Every way `run_ingest`, and `run` (story 06's slice 6.0), can fail.
+/// `main.rs` is the only module that catches this: it logs the error and
+/// exits 1 (BC30, BC31, BC32).
+#[derive(Debug, Error)]
+pub enum IngestError {
+    /// A store read, or the hot-set rebuild, failed (BC31). `run` (slice
+    /// 6.0) raises this; `run_ingest` never constructs it itself.
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
+    /// `source.next()` returned a caller-fatal error (BC32).
+    #[error("jetstream error: {0}")]
+    Jetstream(#[from] JetstreamError),
+    /// The writer thread died: its health turned `Failed`, or a `send`
+    /// found it already gone (BC30).
+    #[error("writer thread failed")]
+    WriterFailed,
+}
+
+/// Sends one `Op` to the writer, mapping the only error `WriterHandle::send`
+/// returns, `StoreError::WriterGone`, to `IngestError::WriterFailed` (BC30).
+async fn send_op(writer: &WriterHandle, op: Op) -> Result<(), IngestError> {
+    writer.send(op).await.map_err(|_| IngestError::WriterFailed)
+}
+
+/// Applies one `HotChange` `translate` returned, after every `Op` in the
+/// same `Translation` has already been sent (`## Answers from the
+/// engineer`, step 2).
+fn apply_hot_change(hot: &mut HotSet, change: &HotChange) {
+    match change {
+        HotChange::Insert(uri) => {
+            hot.insert(uri);
+        }
+        HotChange::Remove(uri) => {
+            hot.remove(uri);
+        }
+    }
+}
+
+/// Drives the ingest task loop, TECH-DESIGN section 5.1: reads one `Event`
+/// at a time from `source`, translates each commit into `Op`s sent to
+/// `writer` and `HotChange`s applied to `hot`, sends `Op::Checkpoint` on a
+/// timer when nothing else moved the cursor (BC25), sends
+/// `Op::MarkAllDirty` on an `#info OutdatedCursor` frame (BC23), logs the
+/// stats line on a timer (BC27), and returns once `shutdown` reports `true`
+/// (BC33) or the writer dies (BC30). `run` (slice 6.0) owns the signal
+/// handlers that flip `shutdown`, and calls `WriterHandle::flush` then
+/// `shutdown` once this returns.
+pub async fn run_ingest<S: EventSource>(
+    cfg: &Config,
+    source: S,
+    writer: &WriterHandle,
+    hot: &mut HotSet,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), IngestError> {
+    run_ingest_periodic(
+        cfg,
+        source,
+        writer,
+        hot,
+        shutdown,
+        Duration::from_secs(CHECKPOINT_PERIOD_SECS),
+        Duration::from_secs_f64(STATS_PERIOD_SECS),
+    )
+    .await
+}
+
+/// `run_ingest`'s body, parameterised over the checkpoint and stats
+/// periods. This repository carries no `tokio` `test-util` feature
+/// (`Cargo.toml` is out of this slice's files, and the checkpoint and stats
+/// periods are seconds, not milliseconds), so a real timer is the only kind
+/// a test can use; shrinking both periods here lets a test see a checkpoint
+/// or a stats line in milliseconds rather than waiting out the real 5 s and
+/// 60 s periods `run_ingest` uses in production.
+async fn run_ingest_periodic<S: EventSource>(
+    _cfg: &Config,
+    mut source: S,
+    writer: &WriterHandle,
+    hot: &mut HotSet,
+    mut shutdown: watch::Receiver<bool>,
+    checkpoint_period: Duration,
+    stats_period: Duration,
+) -> Result<(), IngestError> {
+    let mut stats = Stats::new();
+    let mut checkpoint_sent: Option<u64> = None;
+    let mut health = writer.health();
+
+    let mut checkpoint_timer = interval(checkpoint_period);
+    checkpoint_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut stats_timer = interval(stats_period);
+    stats_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // `tokio::time::interval`'s first tick fires immediately; skip it so the
+    // first real checkpoint and stats line land a full period in.
+    checkpoint_timer.tick().await;
+    stats_timer.tick().await;
+
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = shutdown.changed() => {}
+            changed = health.changed() => {
+                if changed.is_ok() && matches!(*health.borrow(), WriterState::Failed(_)) {
+                    return Err(IngestError::WriterFailed);
+                }
+            }
+            _ = checkpoint_timer.tick() => {
+                if let Some(seq) = source.last_seq() {
+                    if checkpoint_sent != Some(seq) {
+                        send_op(writer, Op::Checkpoint { seq }).await?;
+                        checkpoint_sent = Some(seq);
+                    }
+                }
+            }
+            _ = stats_timer.tick() => {
+                stats.emit(hot.len(), writer.depth(), source.is_compressed());
+            }
+            event = source.next() => {
+                match event.map_err(IngestError::Jetstream)? {
+                    Event::Commit(commit) => {
+                        let translation = translate(&commit, hot);
+                        for op in &translation.ops {
+                            send_op(writer, op.clone()).await?;
+                        }
+                        for change in &translation.hot {
+                            apply_hot_change(hot, change);
+                        }
+                        stats.record_commit(&commit, &translation);
+                    }
+                    Event::Info { name, message } => {
+                        tracing::warn!(name = %name, message = %message, "jetstream: info frame");
+                        if name == "OutdatedCursor" {
+                            let seq = source
+                                .last_seq()
+                                .or_else(|| source.initial_cursor())
+                                .unwrap_or(0);
+                            send_op(writer, Op::MarkAllDirty { seq }).await?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,8 +602,8 @@ mod tests {
     /// matching `jetstream::event`'s own fixture tests.
     fn commit(name: &str) -> CommitEvent {
         let raw = fixture(name);
-        let frame: Frame =
-            serde_json::from_str(&raw).unwrap_or_else(|err| panic!("decoding fixture {name}: {err}"));
+        let frame: Frame = serde_json::from_str(&raw)
+            .unwrap_or_else(|err| panic!("decoding fixture {name}: {err}"));
         match frame.payload {
             Payload::Commit(commit) => commit,
             other => panic!("expected Payload::Commit for {name}, got {other:?}"),
@@ -443,7 +635,10 @@ mod tests {
             } => {
                 assert_eq!(op_quote_uri, &quote_uri);
                 assert_eq!(quote_did, &commit.did);
-                assert_eq!(original_uri, "at://did:plc:originaldid00000000000000/app.bsky.feed.post/original0001");
+                assert_eq!(
+                    original_uri,
+                    "at://did:plc:originaldid00000000000000/app.bsky.feed.post/original0001"
+                );
                 assert_eq!(original_did, "did:plc:originaldid00000000000000");
                 assert_eq!(*seq, commit.seq);
             }
@@ -454,7 +649,8 @@ mod tests {
             vec![
                 HotChange::Insert(quote_uri),
                 HotChange::Insert(
-                    "at://did:plc:originaldid00000000000000/app.bsky.feed.post/original0001".to_string()
+                    "at://did:plc:originaldid00000000000000/app.bsky.feed.post/original0001"
+                        .to_string()
                 ),
             ]
         );
@@ -475,7 +671,10 @@ mod tests {
         assert_eq!(translation.ops.len(), 1);
         match &translation.ops[0] {
             Op::InsertPair { original_uri, original_did, .. } => {
-                assert_eq!(original_uri, "at://did:plc:differentauthor00000000/app.bsky.feed.post/3mu6ks2ljsk2q");
+                assert_eq!(
+                    original_uri,
+                    "at://did:plc:differentauthor00000000/app.bsky.feed.post/3mu6ks2ljsk2q"
+                );
                 assert_eq!(original_did, "did:plc:differentauthor00000000");
             }
             other => panic!("expected Op::InsertPair, got {other:?}"),
@@ -528,7 +727,8 @@ mod tests {
         assert_eq!(
             translation.ops,
             vec![Op::Incr {
-                post_uri: "at://did:plc:ezay5dffpkfnjxh5yirexce2/app.bsky.feed.post/3mvqrul2wq22a".to_string(),
+                post_uri: "at://did:plc:ezay5dffpkfnjxh5yirexce2/app.bsky.feed.post/3mvqrul2wq22a"
+                    .to_string(),
                 field: CountField::Replies,
                 seq: commit.seq,
             }]
@@ -625,7 +825,8 @@ mod tests {
         assert_eq!(
             translation.ops,
             vec![Op::Incr {
-                post_uri: "at://did:plc:vvdrimbhu4kouacycafar4cs/app.bsky.feed.post/3mvqkfpsilc26".to_string(),
+                post_uri: "at://did:plc:vvdrimbhu4kouacycafar4cs/app.bsky.feed.post/3mvqkfpsilc26"
+                    .to_string(),
                 field: CountField::Likes,
                 seq: commit.seq,
             }]
@@ -644,7 +845,8 @@ mod tests {
         assert_eq!(
             translation.ops,
             vec![Op::Incr {
-                post_uri: "at://did:plc:ezay5dffpkfnjxh5yirexce2/app.bsky.feed.post/3mvqrul2wq22a".to_string(),
+                post_uri: "at://did:plc:ezay5dffpkfnjxh5yirexce2/app.bsky.feed.post/3mvqrul2wq22a"
+                    .to_string(),
                 field: CountField::Reposts,
                 seq: commit.seq,
             }]
@@ -702,13 +904,15 @@ mod tests {
             translation.ops,
             vec![
                 Op::Detach {
-                    quote_uri: "at://did:plc:quoterdid0000000000000000/app.bsky.feed.post/3mvqsnhquote1"
-                        .to_string(),
+                    quote_uri:
+                        "at://did:plc:quoterdid0000000000000000/app.bsky.feed.post/3mvqsnhquote1"
+                            .to_string(),
                     seq: commit.seq,
                 },
                 Op::Detach {
-                    quote_uri: "at://did:plc:quoterdid0000000000000000/app.bsky.feed.post/3mvqsnhquote2"
-                        .to_string(),
+                    quote_uri:
+                        "at://did:plc:quoterdid0000000000000000/app.bsky.feed.post/3mvqsnhquote2"
+                            .to_string(),
                     seq: commit.seq,
                 },
             ]
@@ -727,8 +931,9 @@ mod tests {
         assert_eq!(
             translation.ops,
             vec![Op::Detach {
-                quote_uri: "at://did:plc:quoterdid0000000000000000/app.bsky.feed.post/3mvqsnhquote1"
-                    .to_string(),
+                quote_uri:
+                    "at://did:plc:quoterdid0000000000000000/app.bsky.feed.post/3mvqsnhquote1"
+                        .to_string(),
                 seq: commit.seq,
             }]
         );
@@ -791,7 +996,8 @@ mod tests {
     fn quoted_at_falls_back_through_created_at_then_commit_time_then_now() {
         let commit = commit("jetstream_commit_post_quote_record.json");
         let record = commit.record.as_ref().unwrap();
-        let expected = chrono::DateTime::parse_from_rfc3339("2026-09-17T23:30:00.000Z").unwrap().timestamp();
+        let expected =
+            chrono::DateTime::parse_from_rfc3339("2026-09-17T23:30:00.000Z").unwrap().timestamp();
         assert_eq!(quoted_at(record, &commit), expected);
 
         let mut no_created_at = commit.record.clone().unwrap();
@@ -892,7 +1098,10 @@ mod tests {
 
         // `lag_s`: the postgate commit was the last one recorded.
         let expected_lag = (unix_now() - last_seen_time).max(0);
-        assert!((stats.lag_s() - expected_lag).abs() <= 1, "lag_s should track the last commit's time");
+        assert!(
+            (stats.lag_s() - expected_lag).abs() <= 1,
+            "lag_s should track the last commit's time"
+        );
 
         stats.emit(42, 7, true);
 
@@ -907,5 +1116,487 @@ mod tests {
         assert_eq!(stats.postgate_detaches, 0);
         assert_eq!(stats.gate_hit_rate(), 0.0);
         assert_eq!(stats.lag_s(), 0);
+    }
+
+    // --- run_ingest ---------------------------------------------------
+
+    /// A `Config` with only the two required variables set, for tests that
+    /// need one to satisfy `run_ingest`'s signature but read nothing from
+    /// it (`_cfg` is unused today; `run`, slice 6.0, is the first real
+    /// reader).
+    fn test_config() -> Config {
+        let lookup = |name: &str| match name {
+            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
+            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            _ => None,
+        };
+        crate::config::load(lookup).expect("test config should load")
+    }
+
+    /// A `like` create commit, built by hand rather than from a fixture:
+    /// story 06's slice 4.0 adds no new fixtures, and every field this
+    /// needs is a plain string or JSON value.
+    fn like_commit(seq: u64, subject_uri: &str) -> CommitEvent {
+        CommitEvent {
+            did: "did:plc:likerdid00000000000000000".to_string(),
+            seq,
+            time: "2026-09-18T00:00:10.000000Z".to_string(),
+            operation: Operation::Create,
+            collection: LIKE.to_string(),
+            rkey: format!("likerkey{seq}"),
+            rev: "revlike".to_string(),
+            cid: Some("bafyreilikecid00000000000000000000000000".to_string()),
+            record: Some(serde_json::json!({
+                "subject": {"uri": subject_uri, "cid": "bafyreisubjectcid0000000000000000"},
+                "createdAt": "2026-09-18T00:00:10.000Z",
+            })),
+        }
+    }
+
+    /// A `postgate` create commit carrying `detached`, built by hand for
+    /// the same reason `like_commit` is.
+    fn postgate_commit(seq: u64, detached: &[&str]) -> CommitEvent {
+        CommitEvent {
+            did: "did:plc:quoterdid0000000000000000".to_string(),
+            seq,
+            time: "2026-09-18T00:00:20.000000Z".to_string(),
+            operation: Operation::Create,
+            collection: POSTGATE.to_string(),
+            rkey: format!("gaterkey{seq}"),
+            rev: "revgate".to_string(),
+            cid: Some("bafyreigatecid0000000000000000000000000".to_string()),
+            record: Some(serde_json::json!({ "detachedEmbeddingUris": detached })),
+        }
+    }
+
+    /// A test vector `EventSource` over a fixed list of `Event`s. Sets
+    /// `last_seq` the same way `JetstreamClient` does, from every commit it
+    /// returns (BC23's first fallback). Once its queue is empty it signals
+    /// `drained` exactly once, then never resolves again, the same shape a
+    /// live source takes once it is caught up: `run_ingest`'s `select!`
+    /// waits on it alongside its timers and the shutdown watch.
+    struct VecSource {
+        events: std::collections::VecDeque<Event>,
+        last_seq: Option<u64>,
+        initial_cursor: Option<u64>,
+        compressed: bool,
+        drained: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl VecSource {
+        fn new(events: Vec<Event>) -> Self {
+            VecSource {
+                events: events.into(),
+                last_seq: None,
+                initial_cursor: None,
+                compressed: true,
+                drained: None,
+            }
+        }
+
+        /// Same as `new`, but returns a receiver that resolves once the
+        /// queue has been drained, so a test knows every event has reached
+        /// `run_ingest` before it flips the shutdown watch.
+        fn with_drained_signal(events: Vec<Event>) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let mut source = Self::new(events);
+            source.drained = Some(tx);
+            (source, rx)
+        }
+    }
+
+    impl EventSource for VecSource {
+        async fn next(&mut self) -> Result<Event, JetstreamError> {
+            match self.events.pop_front() {
+                Some(event) => {
+                    if let Event::Commit(commit) = &event {
+                        self.last_seq = Some(commit.seq);
+                    }
+                    Ok(event)
+                }
+                None => {
+                    if let Some(tx) = self.drained.take() {
+                        let _ = tx.send(());
+                    }
+                    std::future::pending().await
+                }
+            }
+        }
+
+        fn last_seq(&self) -> Option<u64> {
+            self.last_seq
+        }
+
+        fn is_compressed(&self) -> bool {
+            self.compressed
+        }
+
+        fn initial_cursor(&self) -> Option<u64> {
+            self.initial_cursor
+        }
+    }
+
+    // AC8 half, BC33: the loop returns once `shutdown` reports `true`, with
+    // no event and no timer having fired.
+    #[tokio::test]
+    async fn run_ingest_returns_on_shutdown() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        let cfg = test_config();
+        let source = VecSource::new(vec![]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            let mut hot = HotSet::new();
+            run_ingest_periodic(
+                &cfg,
+                source,
+                &writer,
+                &mut hot,
+                shutdown_rx,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            )
+            .await
+        });
+
+        // Give the task a moment to start and block on `source.next()`.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown_tx.send(true).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("run_ingest should return promptly once shutdown is flipped")
+            .expect("the task should not panic");
+        assert!(result.is_ok(), "expected Ok(()), got {result:?}");
+    }
+
+    // AC7, BC25: a checkpoint is sent when no event produced an op, so the
+    // cursor still advances.
+    #[tokio::test]
+    async fn checkpoint_is_sent_when_no_op_was() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        let writer_task = writer.clone();
+        let cfg = test_config();
+        // A cold like: `translate` returns `Translation::default()` (BC13),
+        // but `VecSource` still records its `seq` as `last_seq`.
+        let cold_like =
+            like_commit(101, "at://did:plc:cold000000000000000000/app.bsky.feed.post/cold0001");
+        let (source, drained) = VecSource::with_drained_signal(vec![Event::Commit(cold_like)]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            let mut hot = HotSet::new();
+            run_ingest_periodic(
+                &cfg,
+                source,
+                &writer_task,
+                &mut hot,
+                shutdown_rx,
+                Duration::from_millis(20),
+                Duration::from_secs(3600),
+            )
+            .await
+        });
+
+        drained.await.expect("the source should drain");
+        // The checkpoint timer's period is 20ms; give it room to fire at
+        // least once before shutting down.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap().unwrap();
+
+        writer.flush().await.unwrap();
+        assert_eq!(
+            store.cursor().unwrap(),
+            Some(101),
+            "a checkpoint should have moved the cursor to the cold like's seq"
+        );
+    }
+
+    // AC5, BC23: `OutdatedCursor` sends `MarkAllDirty` with the seq
+    // fallback chain, and never replays event by event.
+    #[tokio::test]
+    async fn outdated_cursor_marks_dirty() {
+        // (a) a commit was seen this run: its seq wins over both fallbacks.
+        {
+            let store = crate::store::Store::open_memory().unwrap();
+            let writer = store.writer().unwrap();
+            let writer_task = writer.clone();
+            let cfg = test_config();
+            let neutral = commit("jetstream_commit_post_reply.json");
+            let neutral_seq = neutral.seq;
+            let (mut source, drained) = VecSource::with_drained_signal(vec![
+                Event::Commit(neutral),
+                Event::Info {
+                    name: "OutdatedCursor".to_string(),
+                    message: "resume cursor below the retention floor".to_string(),
+                },
+            ]);
+            source.initial_cursor = Some(999);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(async move {
+                let mut hot = HotSet::new();
+                run_ingest_periodic(
+                    &cfg,
+                    source,
+                    &writer_task,
+                    &mut hot,
+                    shutdown_rx,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                )
+                .await
+            });
+
+            drained.await.expect("the source should drain");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap().unwrap();
+
+            writer.flush().await.unwrap();
+            assert_eq!(
+                store.cursor().unwrap(),
+                Some(neutral_seq),
+                "MarkAllDirty should carry the last seq the task saw"
+            );
+        }
+
+        // (b) no commit was seen: falls back to the cursor the source
+        // connected at.
+        {
+            let store = crate::store::Store::open_memory().unwrap();
+            let writer = store.writer().unwrap();
+            let writer_task = writer.clone();
+            let cfg = test_config();
+            let (mut source, drained) = VecSource::with_drained_signal(vec![Event::Info {
+                name: "OutdatedCursor".to_string(),
+                message: "resume cursor below the retention floor".to_string(),
+            }]);
+            source.initial_cursor = Some(555);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(async move {
+                let mut hot = HotSet::new();
+                run_ingest_periodic(
+                    &cfg,
+                    source,
+                    &writer_task,
+                    &mut hot,
+                    shutdown_rx,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                )
+                .await
+            });
+
+            drained.await.expect("the source should drain");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap().unwrap();
+
+            writer.flush().await.unwrap();
+            assert_eq!(store.cursor().unwrap(), Some(555));
+        }
+
+        // (c) neither: falls back to 0.
+        {
+            let store = crate::store::Store::open_memory().unwrap();
+            let writer = store.writer().unwrap();
+            let writer_task = writer.clone();
+            let cfg = test_config();
+            let (source, drained) = VecSource::with_drained_signal(vec![Event::Info {
+                name: "OutdatedCursor".to_string(),
+                message: "resume cursor below the retention floor".to_string(),
+            }]);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(async move {
+                let mut hot = HotSet::new();
+                run_ingest_periodic(
+                    &cfg,
+                    source,
+                    &writer_task,
+                    &mut hot,
+                    shutdown_rx,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                )
+                .await
+            });
+
+            drained.await.expect("the source should drain");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap().unwrap();
+
+            writer.flush().await.unwrap();
+            assert_eq!(store.cursor().unwrap(), Some(0));
+        }
+    }
+
+    // AC5 continued, BC24: an info frame with any other name is logged and
+    // produces no op.
+    #[tokio::test]
+    async fn info_with_another_name_produces_no_op() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        let writer_task = writer.clone();
+        let cfg = test_config();
+        let (source, drained) = VecSource::with_drained_signal(vec![Event::Info {
+            name: "SomeOtherInfo".to_string(),
+            message: "nothing to see here".to_string(),
+        }]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            let mut hot = HotSet::new();
+            run_ingest_periodic(
+                &cfg,
+                source,
+                &writer_task,
+                &mut hot,
+                shutdown_rx,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            )
+            .await
+        });
+
+        drained.await.expect("the source should drain");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap().unwrap();
+
+        writer.flush().await.unwrap();
+        assert_eq!(store.cursor().unwrap(), None, "an unrecognised info name must send no op");
+    }
+
+    // BC30: a dead writer is `IngestError::WriterFailed`, whether `send`
+    // discovers it (this test) or `health()` reports `Failed`.
+    #[tokio::test]
+    async fn writer_gone_on_send_is_writer_failed() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        writer.shutdown().await.unwrap(); // the thread exits; a later send is WriterGone
+        let cfg = test_config();
+        let quote = commit("jetstream_commit_post_quote_record.json");
+        let source = VecSource::new(vec![Event::Commit(quote)]);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut hot = HotSet::new();
+
+        let result = run_ingest_periodic(
+            &cfg,
+            source,
+            &writer,
+            &mut hot,
+            shutdown_rx,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .await;
+
+        assert!(matches!(result, Err(IngestError::WriterFailed)));
+    }
+
+    // AC8, BC1, BC11, BC15: a mixed sequence lands the right ops on a real
+    // in-memory store, and `run_ingest` applies the `HotChange`s to the
+    // caller's `HotSet` in step.
+    #[tokio::test]
+    async fn run_ingest_lands_translated_ops_on_a_real_store() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store
+            .writer_with(crate::store::writer::WriterConfig {
+                capacity: 100,
+                max_ops: 1,
+                interval: Duration::from_millis(5),
+            })
+            .unwrap();
+
+        let quote = commit("jetstream_commit_post_quote_record.json");
+        let quote_seq = quote.seq;
+        let quote_uri = "at://did:plc:quoterdid0000000000000000/app.bsky.feed.post/3mvqsnhquote1";
+        let original_uri = "at://did:plc:originaldid00000000000000/app.bsky.feed.post/original0001";
+        let like = like_commit(quote_seq + 1, original_uri);
+
+        // Phase 1: the quote and a like on its original land InsertPair and
+        // Incr{Likes}.
+        {
+            let writer_task = writer.clone();
+            let cfg = test_config();
+            let (source, drained) =
+                VecSource::with_drained_signal(vec![Event::Commit(quote), Event::Commit(like)]);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(async move {
+                let mut hot = HotSet::new();
+                let result = run_ingest_periodic(
+                    &cfg,
+                    source,
+                    &writer_task,
+                    &mut hot,
+                    shutdown_rx,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                )
+                .await;
+                (result, hot)
+            });
+
+            drained.await.expect("the source should drain");
+            shutdown_tx.send(true).unwrap();
+            let (result, hot) =
+                tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap();
+            result.unwrap();
+
+            assert!(hot.contains(quote_uri), "the quote's own uri should be hot");
+            assert!(hot.contains(original_uri), "the quoted original should be hot");
+
+            writer.flush().await.unwrap();
+            let candidates = store.dirty_candidates(unix_now(), 999_999).unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].quote_uri, quote_uri);
+            assert_eq!(candidates[0].original_uri, original_uri);
+            assert_eq!(
+                candidates[0].counts_o.likes, 1,
+                "the like should have landed on the original"
+            );
+        }
+
+        // Phase 2: a postgate detach on the quote lands `Op::Detach`,
+        // dropping the pair out of the candidate set.
+        {
+            let writer_task = writer.clone();
+            let cfg = test_config();
+            let (source, drained) = VecSource::with_drained_signal(vec![Event::Commit(
+                postgate_commit(quote_seq + 2, &[quote_uri]),
+            )]);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(async move {
+                let mut hot = HotSet::new();
+                hot.insert(quote_uri);
+                run_ingest_periodic(
+                    &cfg,
+                    source,
+                    &writer_task,
+                    &mut hot,
+                    shutdown_rx,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                )
+                .await
+            });
+
+            drained.await.expect("the source should drain");
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap().unwrap();
+
+            writer.flush().await.unwrap();
+            let candidates = store.dirty_candidates(unix_now(), 999_999).unwrap();
+            assert!(candidates.is_empty(), "a detached pair must not be a candidate any longer");
+        }
     }
 }
