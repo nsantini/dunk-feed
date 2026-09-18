@@ -11,7 +11,7 @@
 //! No raw SQL lives outside `src/store/` (AGENTS.md); every other module
 //! calls through the functions this module re-exports.
 
-#![allow(dead_code)] // First callers are the ingest task (story 06) and the scorer (story 07).
+#![allow(dead_code)] // ingest (story 06) now calls this module; the promote/demote/expire/feed/author path still awaits its first caller: story 07's scorer.
 
 pub mod authors;
 pub mod counts;

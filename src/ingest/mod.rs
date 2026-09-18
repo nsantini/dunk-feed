@@ -563,13 +563,17 @@ async fn run_ingest_periodic<S: EventSource>(
                 match event.map_err(IngestError::Jetstream)? {
                     Event::Commit(commit) => {
                         let translation = translate(&commit, hot);
-                        for op in &translation.ops {
-                            send_op(writer, op.clone()).await?;
+                        // Stats first, so a `send` failure below still
+                        // leaves this commit counted; then `ops` by value
+                        // rather than `&translation.ops` + `.clone()`, so
+                        // no `Op` is cloned per event on the hot path.
+                        stats.record_commit(&commit, &translation);
+                        for op in translation.ops {
+                            send_op(writer, op).await?;
                         }
                         for change in &translation.hot {
                             apply_hot_change(hot, change);
                         }
-                        stats.record_commit(&commit, &translation);
                     }
                     Event::Info { name, message } => {
                         tracing::warn!(name = %name, message = %message, "jetstream: info frame");
@@ -585,6 +589,84 @@ async fn run_ingest_periodic<S: EventSource>(
             }
         }
     }
+}
+
+/// Waits for SIGINT or SIGTERM, TECH-DESIGN section 13's shutdown contract
+/// (BC33). `ctrl_c` covers SIGINT everywhere `tokio` runs; `tokio::signal`
+/// has no portable SIGTERM, so that half is `#[cfg(unix)]` and never fires
+/// on a non-Unix target, which this binary does not ship for (`AGENTS.md`'s
+/// only build target is the container's Linux, and development is macOS).
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("installing a SIGINT handler should not fail");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing a SIGTERM handler should not fail")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+/// `dunk run`'s entry point (slice 6.0), TECH-DESIGN section 5.1 end to
+/// end: opens `cfg.db_path` (BC35), starts the writer, rebuilds the hot set
+/// from `pairs` and logs its size and the elapsed time at `info` (BC22),
+/// reads the stored cursor and connects to Jetstream at it, then runs
+/// [`run_ingest`] until SIGINT or SIGTERM flips the shutdown watch (BC33).
+/// Once `run_ingest` returns, `writer.flush()` then `writer.shutdown()` run
+/// so every committed op reaches the database before the process exits; a
+/// failure on either is logged, not raised, since the original result from
+/// `run_ingest` (success or `IngestError`) is the one this function
+/// returns. The scorer task (story 07) and the HTTP server (story 08) each
+/// have their place named below, spawned alongside `run_ingest`; neither
+/// has code yet (`## Non-goals`).
+pub async fn run(cfg: &Config) -> Result<(), IngestError> {
+    let store = crate::store::Store::open(cfg)?;
+    let writer = store.writer()?;
+
+    let mut hot = HotSet::new();
+    let rebuild_start = std::time::Instant::now();
+    store.for_each_hot_uri(|uri| {
+        hot.insert(uri);
+    })?;
+    tracing::info!(
+        hot_set_len = hot.len(),
+        elapsed_ms = rebuild_start.elapsed().as_millis() as u64,
+        "ingest: hot set rebuilt from pairs"
+    );
+
+    let cursor = store.cursor()?;
+    tracing::info!(cursor = ?cursor, "ingest: connecting to jetstream");
+    let source = crate::jetstream::JetstreamClient::connect(cfg, cursor).await?;
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let _signal_task = tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    // Story 07's scorer task and story 08's HTTP server start here,
+    // spawned alongside `run_ingest` and sharing this same `shutdown_rx`
+    // (cloned). Neither exists yet.
+
+    let result = run_ingest(cfg, source, &writer, &mut hot, shutdown_rx).await;
+
+    if let Err(err) = writer.flush().await {
+        tracing::warn!(error = %err, "ingest: writer flush failed during shutdown");
+    }
+    if let Err(err) = writer.shutdown().await {
+        tracing::warn!(error = %err, "ingest: writer shutdown failed");
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1598,5 +1680,37 @@ mod tests {
             let candidates = store.dirty_candidates(unix_now(), 999_999).unwrap();
             assert!(candidates.is_empty(), "a detached pair must not be a candidate any longer");
         }
+    }
+
+    // AC10: a live run against the real Jetstream host survives without
+    // panicking. `AGENTS.md`: a test that needs the network is `#[ignore]`
+    // and run by hand: `cargo test --all-features -- --ignored
+    // ingest_live_smoke`. `test_config`'s default `jetstream_urls` point at
+    // the real hosts, so this connects for real, runs for a few seconds,
+    // then asks for the same shutdown `run` uses.
+    #[tokio::test]
+    #[ignore]
+    async fn ingest_live_smoke() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        let cfg = test_config();
+        let source = crate::jetstream::JetstreamClient::connect(&cfg, None)
+            .await
+            .expect("connecting to the real jetstream host should not fail");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            let mut hot = HotSet::new();
+            run_ingest(&cfg, source, &writer, &mut hot, shutdown_rx).await
+        });
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        shutdown_tx.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run_ingest should return once shutdown is requested")
+            .expect("the run_ingest task should not panic");
+
+        assert!(result.is_ok(), "a live run should not error: {result:?}");
     }
 }

@@ -26,9 +26,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("config::load already validates DUNK_LOG with EnvFilter::try_new");
     tracing_subscriber::fmt().json().with_env_filter(filter).init();
 
-    cli::dispatch(&cli.command, &config)
-        .await
-        .map_err(|err| anyhow::anyhow!("validate error: {err}"))?;
+    cli::dispatch(&cli.command, &config).await.map_err(|err| anyhow::anyhow!("dunk: {err}"))?;
 
     Ok(())
 }

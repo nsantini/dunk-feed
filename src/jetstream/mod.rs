@@ -7,7 +7,7 @@
 //! in `event`; `client` gains its connect, decode and reconnect loop over
 //! the slices that follow. The ingest task of story 06 is the first caller.
 
-#![allow(dead_code, unused_imports)] // First caller is the ingest task, story 06.
+#![allow(dead_code)] // ingest (story 06) now calls this module; dictionary_id and time_micros still await a caller: story 07 or 08.
 
 pub mod client;
 pub mod event;

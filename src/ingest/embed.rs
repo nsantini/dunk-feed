@@ -3,8 +3,6 @@
 //! path already holds for a `post` create. `validate` (story 03) and the
 //! Jetstream consumer (story 06) call this exact function.
 
-#![allow(dead_code)] // First caller is `dunk validate`, story 03.
-
 /// A validated `at://` URI: `at://<did>/app.bsky.feed.post/<rkey>`. The only
 /// place a URI is validated in this story; the App View client (`src/appview`)
 /// passes URIs through as `&str` instead.
