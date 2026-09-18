@@ -8,6 +8,7 @@ mod config;
 mod ingest;
 mod jetstream;
 mod score;
+mod store;
 mod validate;
 
 use clap::Parser;
