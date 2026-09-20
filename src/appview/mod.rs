@@ -130,6 +130,44 @@ fn merge_chunk_outcome(
     }
 }
 
+/// The result of one lenient, chunked `getProfiles` call, mirroring
+/// [`PostsOutcome`] for the same reason (story 10's guard needs every DID's
+/// outcome, not one `Err` for the whole call): every chunk of at most
+/// [`AppViewClient::PROFILES_BATCH`] DIDs is attempted, a chunk that fails
+/// after the client's own retries is logged at `warn` and its DIDs collected
+/// into `failed_dids`, but every other chunk's profiles still land in
+/// `profiles`. `calls` counts every chunk attempted, failed or not.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProfilesOutcome {
+    pub profiles: HashMap<String, ProfileView>,
+    pub failed_dids: HashSet<String>,
+    pub calls: usize,
+}
+
+/// Folds one chunk's `getProfiles` result into `outcome`, the `ProfileView`
+/// counterpart of [`merge_chunk_outcome`]. Kept separate from
+/// `AppViewClient::get_profiles_lenient` so the merge and failed-DID
+/// bookkeeping can be tested with synthetic chunk results, with no live
+/// chunk boundary of exactly `PROFILES_BATCH` and no network required.
+fn merge_profile_chunk_outcome(
+    outcome: &mut ProfilesOutcome,
+    chunk: &[String],
+    result: Result<HashMap<String, ProfileView>, AppViewError>,
+) {
+    outcome.calls += 1;
+    match result {
+        Ok(map) => outcome.profiles.extend(map),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                chunk_len = chunk.len(),
+                "appview: getProfiles chunk failed after retries"
+            );
+            outcome.failed_dids.extend(chunk.iter().cloned());
+        }
+    }
+}
+
 /// A typed client over `app.bsky.feed.getPosts`, `app.bsky.actor.getProfiles`,
 /// `app.bsky.feed.getQuotes` and `app.bsky.feed.getFeed`. Unauthenticated;
 /// the authenticated calls (`createSession`, `uploadBlob`, `putRecord`) are
@@ -293,6 +331,19 @@ impl AppViewClient {
             );
         }
         Ok(result)
+    }
+
+    /// `getProfiles`, chunked at [`Self::PROFILES_BATCH`], tolerant of a
+    /// chunk that fails after its retries, the `getProfiles` counterpart of
+    /// [`Self::get_posts_lenient`]. Story 10's guard calls this instead of
+    /// chunking `dids` itself and calling `get_profiles` once per chunk.
+    pub async fn get_profiles_lenient(&self, dids: &[String]) -> ProfilesOutcome {
+        let mut outcome = ProfilesOutcome::default();
+        for chunk in dids.chunks(Self::PROFILES_BATCH) {
+            let result = self.get_profiles(chunk).await;
+            merge_profile_chunk_outcome(&mut outcome, chunk, result);
+        }
+        outcome
     }
 
     /// `app.bsky.feed.getQuotes`. One page of at most [`Self::PAGE_LIMIT`]
@@ -463,6 +514,45 @@ mod tests {
                 .expect("positive rate builds a client");
         let outcome = client.get_posts_lenient(&[]).await;
         assert_eq!(outcome, PostsOutcome::default());
+    }
+
+    // The `getProfiles` counterpart of `merge_chunk_outcome_keeps_good_chunk_
+    // and_names_failed_chunk`: a good chunk's profiles land in `profiles`, a
+    // failed chunk's DIDs land in `failed_dids`, and every chunk attempted is
+    // counted.
+    #[test]
+    fn merge_profile_chunk_outcome_keeps_good_chunk_and_names_failed_chunk() {
+        let decoded: GetProfilesResponse =
+            serde_json::from_str(GETPROFILES_OK).expect("fixture decodes");
+        let good_profile = decoded.profiles[0].clone();
+        let good_chunk = vec![good_profile.did.clone()];
+        let bad_chunk = vec!["did:plc:b".to_string(), "did:plc:c".to_string()];
+
+        let mut outcome = ProfilesOutcome::default();
+        merge_profile_chunk_outcome(
+            &mut outcome,
+            &good_chunk,
+            Ok(HashMap::from([(good_profile.did.clone(), good_profile.clone())])),
+        );
+        merge_profile_chunk_outcome(
+            &mut outcome,
+            &bad_chunk,
+            Err(AppViewError::Failed { method: "getProfiles", status: None, attempts: 3 }),
+        );
+
+        assert_eq!(outcome.calls, 2);
+        assert_eq!(outcome.profiles.len(), 1);
+        assert_eq!(outcome.profiles.get(&good_profile.did), Some(&good_profile));
+        assert_eq!(outcome.failed_dids, bad_chunk.into_iter().collect::<HashSet<_>>());
+    }
+
+    #[tokio::test]
+    async fn get_profiles_lenient_makes_no_request_on_empty_input() {
+        let client =
+            AppViewClient::with_base_url("http://appview.invalid.example".to_string(), 1.0)
+                .expect("positive rate builds a client");
+        let outcome = client.get_profiles_lenient(&[]).await;
+        assert_eq!(outcome, ProfilesOutcome::default());
     }
 
     #[test]

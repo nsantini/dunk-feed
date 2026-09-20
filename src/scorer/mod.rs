@@ -31,7 +31,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
 
-use crate::appview::{AppViewClient, PostsOutcome};
+use crate::appview::{AppViewClient, PostsOutcome, ProfilesOutcome};
 use crate::config::Config;
 use crate::health::HealthState;
 use crate::score::{self, Counts, Thresholds, Weights};
@@ -96,6 +96,27 @@ pub trait PostSource {
 impl PostSource for AppViewClient {
     fn get_posts_lenient(&self, uris: &[String]) -> impl Future<Output = PostsOutcome> + Send {
         AppViewClient::get_posts_lenient(self, uris)
+    }
+}
+
+/// The App View surface story 10's guard needs: one lenient, chunked
+/// `getProfiles` call, the `ProfileSource` counterpart of [`PostSource`] and
+/// for the same reason (`## Approach`: no test HTTP server in this crate).
+/// `AppViewClient` implements it by forwarding to its own
+/// `get_profiles_lenient`; `guards::check_batch` (slice 3.0) is its first
+/// caller through `verify_and_apply`'s `S: PostSource + ProfileSource` bound.
+#[allow(dead_code)] // No caller yet; slice 3.0's `verify_and_apply` is the first.
+pub trait ProfileSource {
+    fn get_profiles_lenient(&self, dids: &[String])
+        -> impl Future<Output = ProfilesOutcome> + Send;
+}
+
+impl ProfileSource for AppViewClient {
+    fn get_profiles_lenient(
+        &self,
+        dids: &[String],
+    ) -> impl Future<Output = ProfilesOutcome> + Send {
+        AppViewClient::get_profiles_lenient(self, dids)
     }
 }
 
@@ -301,6 +322,12 @@ async fn verify_and_apply<S: PostSource>(
                     // VerifyPhase::First and does not qualify: BC17, the
                     // pair simply stays `candidate`.
                 }
+                // `check` (this slice) never constructs `Defer`; only
+                // `check_batch` (slice 3.0) does, on a failed `getProfiles`
+                // chunk. This arm exists only so the match is exhaustive.
+                // Slice 3.0 moves the guard call ahead of `clear_rows` so a
+                // deferred pair's dirty flag is left untouched too (BC21).
+                GuardResult::Defer => {}
             },
         }
     }

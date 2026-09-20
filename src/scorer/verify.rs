@@ -26,6 +26,13 @@ pub struct VerifiedPair {
     pub quoted_at: i64,
     pub counts_q: Counts,
     pub counts_o: Counts,
+    /// `Q`'s own `postView.labels[].val`, story 10's label guard (BC9,
+    /// BC37). Empty, not absent, when the App View sends no `labels` key:
+    /// `PostView.labels` already defaults to empty.
+    pub labels_q: Vec<String>,
+    /// `O`'s own `postView.labels[].val`, story 10's label guard (BC10,
+    /// BC37).
+    pub labels_o: Vec<String>,
 }
 
 /// The result of verifying one pair, TECH-DESIGN section 8.2 and 8.3.
@@ -86,6 +93,8 @@ pub fn verify_pair(
         quoted_at,
         counts_q: Counts::from(q),
         counts_o: Counts::from(o),
+        labels_q: q.labels.iter().map(|l| l.val.clone()).collect(),
+        labels_o: o.labels.iter().map(|l| l.val.clone()).collect(),
     })
 }
 
@@ -419,6 +428,32 @@ mod tests {
                 assert_eq!(verified.counts_q, Counts { likes: 200, reposts: 40, replies: 3 });
                 assert_eq!(verified.counts_o, Counts { likes: 60, reposts: 5, replies: 1 });
                 assert_eq!(verified.quoted_at, 42);
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    // BC37: each side's `postView.labels[].val` lands on `VerifiedPair`
+    // unmodified; a post with no `labels` key decodes to an empty vector via
+    // `PostView`'s own `#[serde(default)]`, not an error, so `labels_q` and
+    // `labels_o` are simply empty rather than absent.
+    #[test]
+    fn carries_labels_onto_verified_pair() {
+        use crate::appview::types::Label;
+
+        let quote_uri = "at://did:plc:quoter/app.bsky.feed.post/q";
+        let original_uri = "at://did:plc:original/app.bsky.feed.post/o";
+        let mut q = post(quote_uri, "did:plc:quoter", Some(view_record_embed(original_uri)));
+        q.labels = vec![Label { val: "spam".to_string() }];
+        let o = post(original_uri, "did:plc:original", None);
+        let posts = map(vec![q, o]);
+
+        let verdict = verify_pair(quote_uri, original_uri, 0, &posts);
+
+        match verdict {
+            Verdict::Continue(verified) => {
+                assert_eq!(verified.labels_q, vec!["spam".to_string()]);
+                assert!(verified.labels_o.is_empty());
             }
             other => panic!("expected Continue, got {other:?}"),
         }
