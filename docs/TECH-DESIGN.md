@@ -478,18 +478,29 @@ forwards to the VM. `DUNK_HOSTNAME` is the Cloudflare hostname.
 
 - `feed` must equal the configured feed URI, else 400 `{"error":"UnknownFeed"}`.
 - `limit` clamped to 1..=100, default 50. Non-numeric → 400 `InvalidRequest`.
-- `cursor` is `base64url(rank_bits_hex ":" quote_cid)`. Decode failure → 400
-  `InvalidRequest`. A cursor that no longer matches an item still works: the
-  page starts at the first item with `(rank, cid)` strictly after it.
-- Read the snapshot `Arc` once, binary-search or scan to the cursor, take
-  `limit` items, return `{"feed":[{"post":uri}...],"cursor":next}`. Omit
-  `cursor` when the page is the last.
+- `cursor` is `base64url(generation ":" index ":" rank_bits_hex ":" quote_cid)`.
+  `generation` is the scorer pass counter the snapshot was built in, `index`
+  the position of the last item served in that generation's list. Decode
+  failure → 400 `InvalidRequest`.
+- The snapshot handle keeps the current generation and the one before it.
+  Resolution, in order: (1) the cursor's generation is still held and
+  `items[index]` has that `quote_cid` → the page is `items[index+1..]` of
+  THAT generation, exact and O(1), so a client paging across one swap sees
+  stable pages; (2) otherwise scan the current list for the item with that
+  `quote_cid` → the page starts after it; (3) otherwise the page starts at
+  the first item in list order that sorts strictly after `(rank, cid)`.
+  Cap 2 leaves the list not totally ordered, so (3) can repeat or drop an
+  item; it only runs when a cursor is older than two passes, and the client
+  fixes it with a refresh from the top.
+- Read one snapshot `Arc` once, resolve the cursor, take `limit` items,
+  return `{"feed":[{"post":uri}...],"cursor":next}`. Omit `cursor` when the
+  page is the last.
 - `feedContext` carries `"r=<ratio, 1 decimal>"`, under 2,000 chars, for the
   interaction events.
 - No auth. The service JWT, if present, is ignored. The feed does not personalise.
 - `Cache-Control: public, max-age=30`. Cloudflare may cache it.
 
-Budget: a request is one `Arc` clone, one scan of at most 100k items, one
+Budget: a request is one `Arc` clone, at most one scan of 100k items, one
 serialisation. Well under 5 ms.
 
 ### 11.2 Publishing, `dunk publish`
