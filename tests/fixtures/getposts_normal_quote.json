@@ -1,0 +1,122 @@
+{
+  "posts": [
+    {
+      "uri": "at://did:plc:o7xt7svg2xtjbb4e2xqahqqc/app.bsky.feed.post/3mvxhe7uuck2n",
+      "cid": "bafyreiejwua7rojnglaepyixnc6xygs4tohjo2yccxxnslhlktemptwuzm",
+      "author": {
+        "did": "did:plc:o7xt7svg2xtjbb4e2xqahqqc",
+        "handle": "spavel.bsky.social",
+        "displayName": "Pavel",
+        "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:o7xt7svg2xtjbb4e2xqahqqc/bafkreia33xjzvm4m4z3gbqv7dqui3gbnwl5dy2d67ar3kryaqhzv35bqly",
+        "associated": {
+          "chat": {
+            "allowIncoming": "none"
+          },
+          "activitySubscription": {
+            "allowSubscriptions": "followers"
+          }
+        },
+        "labels": [],
+        "createdAt": "2023-04-23T15:29:30.548Z"
+      },
+      "record": {
+        "$type": "app.bsky.feed.post",
+        "createdAt": "2026-09-20T14:55:51.114Z",
+        "embed": {
+          "$type": "app.bsky.embed.record",
+          "record": {
+            "cid": "bafyreif5pdmhtqn7xxa7ri3jc3is2ckoqe2umleyiyfypon7543hupgxce",
+            "uri": "at://did:plc:ofzkhjyyh4kl4a35wxgmobmm/app.bsky.feed.post/3mvxb5n76u22b"
+          }
+        },
+        "langs": [
+          "en"
+        ],
+        "text": "Software developers think \"if AI automates coding, I will be able to spend less time on producing widgets, and more time on strategy and architecture.\"\n\nBosses think \"if AI automates coding, I can get my devs to produce 100x more widgets.\""
+      },
+      "embed": {
+        "record": {
+          "uri": "at://did:plc:ofzkhjyyh4kl4a35wxgmobmm/app.bsky.feed.post/3mvxb5n76u22b",
+          "cid": "bafyreif5pdmhtqn7xxa7ri3jc3is2ckoqe2umleyiyfypon7543hupgxce",
+          "author": {
+            "did": "did:plc:ofzkhjyyh4kl4a35wxgmobmm",
+            "handle": "sonjadrimmer.bsky.social",
+            "displayName": "Sonja Drimmer",
+            "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:ofzkhjyyh4kl4a35wxgmobmm/bafkreiezdrkwnju63iuh74asnfj5divzr7ioobessijto6t7v6srfimodm",
+            "associated": {
+              "chat": {
+                "allowIncoming": "following",
+                "allowGroupInvites": "none"
+              },
+              "activitySubscription": {
+                "allowSubscriptions": "followers"
+              }
+            },
+            "labels": [],
+            "createdAt": "2023-08-19T14:21:25.410Z"
+          },
+          "value": {
+            "$type": "app.bsky.feed.post",
+            "createdAt": "2026-09-20T13:04:47.752Z",
+            "langs": [
+              "en"
+            ],
+            "text": "Historically, automation tech has commonly made more work for people: the issue is WHICH people. Whether as an excuse for owners to increase the requirements for expectations in a given day, lessen the labor expected of men while raising the expectations for women, etc. \"AI\" isn't exceptional."
+          },
+          "labels": [],
+          "likeCount": 125,
+          "replyCount": 2,
+          "repostCount": 17,
+          "quoteCount": 1,
+          "indexedAt": "2026-09-20T13:04:48.071Z",
+          "embeds": [],
+          "$type": "app.bsky.embed.record#viewRecord"
+        },
+        "$type": "app.bsky.embed.record#view"
+      },
+      "bookmarkCount": 15,
+      "replyCount": 6,
+      "repostCount": 101,
+      "likeCount": 514,
+      "quoteCount": 6,
+      "indexedAt": "2026-09-20T14:55:51.666Z",
+      "labels": []
+    },
+    {
+      "uri": "at://did:plc:ofzkhjyyh4kl4a35wxgmobmm/app.bsky.feed.post/3mvxb5n76u22b",
+      "cid": "bafyreif5pdmhtqn7xxa7ri3jc3is2ckoqe2umleyiyfypon7543hupgxce",
+      "author": {
+        "did": "did:plc:ofzkhjyyh4kl4a35wxgmobmm",
+        "handle": "sonjadrimmer.bsky.social",
+        "displayName": "Sonja Drimmer",
+        "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:ofzkhjyyh4kl4a35wxgmobmm/bafkreiezdrkwnju63iuh74asnfj5divzr7ioobessijto6t7v6srfimodm",
+        "associated": {
+          "chat": {
+            "allowIncoming": "following",
+            "allowGroupInvites": "none"
+          },
+          "activitySubscription": {
+            "allowSubscriptions": "followers"
+          }
+        },
+        "labels": [],
+        "createdAt": "2023-08-19T14:21:25.410Z"
+      },
+      "record": {
+        "$type": "app.bsky.feed.post",
+        "createdAt": "2026-09-20T13:04:47.752Z",
+        "langs": [
+          "en"
+        ],
+        "text": "Historically, automation tech has commonly made more work for people: the issue is WHICH people. Whether as an excuse for owners to increase the requirements for expectations in a given day, lessen the labor expected of men while raising the expectations for women, etc. \"AI\" isn't exceptional."
+      },
+      "bookmarkCount": 1,
+      "replyCount": 2,
+      "repostCount": 17,
+      "likeCount": 125,
+      "quoteCount": 1,
+      "indexedAt": "2026-09-20T13:04:48.071Z",
+      "labels": []
+    }
+  ]
+}

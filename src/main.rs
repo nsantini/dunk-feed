@@ -8,6 +8,7 @@ mod config;
 mod ingest;
 mod jetstream;
 mod score;
+mod scorer;
 mod store;
 mod validate;
 
