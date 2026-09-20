@@ -1115,5 +1115,16 @@ mod tests {
             "verified counts must be non-zero"
         );
         assert!(row.ratio >= 1.25, "D must clear the M=1.25 margin");
+        println!(
+            "v_likes_q={} v_reposts_q={} v_replies_q={} v_likes_o={} v_reposts_o={} v_replies_o={} ratio={} rank={}",
+            row.v_likes_q,
+            row.v_reposts_q,
+            row.v_replies_q,
+            row.v_likes_o,
+            row.v_reposts_o,
+            row.v_replies_o,
+            row.ratio,
+            row.rank
+        );
     }
 }
