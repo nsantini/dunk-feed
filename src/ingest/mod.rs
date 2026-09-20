@@ -944,23 +944,38 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
 /// their three different underlying error types.
 type SupervisedHandle = tokio::task::JoinHandle<Result<(), IngestError>>;
 
+/// A single task's name carried alongside its own `JoinHandle`'s result,
+/// boxed so `supervise` can race tasks whose names must survive
+/// `select_all`'s own reordering of the remaining futures (see `supervise`).
+type NamedTaskResult = (&'static str, Result<Result<(), IngestError>, tokio::task::JoinError>);
+type NamedHandleFuture = std::pin::Pin<Box<dyn Future<Output = NamedTaskResult> + Send>>;
+
 async fn supervise(
     tasks: Vec<(&'static str, SupervisedHandle)>,
     shutdown_tx: watch::Sender<bool>,
     writer: WriterHandle,
 ) -> Result<(), IngestError> {
-    let (names, handles): (Vec<&'static str>, Vec<SupervisedHandle>) = tasks.into_iter().unzip();
+    // Each task's name travels inside its own future rather than in a
+    // parallel `names` vec: `select_all` resolves the winner with
+    // `Vec::swap_remove`, which moves the *last* handle into the winner's
+    // slot, so a `names`/`remaining_handles` zip pairs the wrong name with a
+    // remaining handle whenever the winner is not the last task (round 2's
+    // finding, BC29). Carrying `(name, result)` out of the awaited future
+    // keeps the two together no matter how `select_all` reorders the list.
+    let named_handles: Vec<NamedHandleFuture> = tasks
+        .into_iter()
+        .map(|(name, handle)| Box::pin(async move { (name, handle.await) }) as NamedHandleFuture)
+        .collect();
 
-    let (result, index, remaining_handles) = futures_util::future::select_all(handles).await;
+    let ((first_name, result), _index, remaining) =
+        futures_util::future::select_all(named_handles).await;
     let _ = shutdown_tx.send(true);
-    let first_name = names[index];
     let first_result: Result<(), IngestError> =
         result.unwrap_or_else(|err| panic!("the {first_name} task should not panic: {err}"));
 
-    let remaining_names: Vec<&'static str> =
-        names.into_iter().enumerate().filter(|(i, _)| *i != index).map(|(_, name)| name).collect();
-    for (name, handle) in remaining_names.into_iter().zip(remaining_handles) {
-        match handle.await {
+    for remaining_future in remaining {
+        let (name, handle_result) = remaining_future.await;
+        match handle_result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 tracing::warn!(error = %err, task = name, "ingest: a task failed after another task finished")
@@ -1127,6 +1142,105 @@ mod tests {
         );
 
         assert!(matches!(result, Err(IngestError::Http(_))));
+    }
+
+    /// A `tracing_subscriber::fmt::MakeWriter` that appends every formatted
+    /// event to a shared buffer, so a test can assert on the `task` field
+    /// `supervise`'s `warn!` lines carry for the tasks that finish after the
+    /// winner.
+    #[derive(Clone)]
+    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // Round 2 finding 2: `select_all` resolves its winner with
+    // `Vec::swap_remove`, which moves the *last* handle into the winner's
+    // slot. The old code zipped a separately filtered `names` list against
+    // `remaining_handles`, so whenever the winner was not the last task, a
+    // remaining task's `warn!` line carried another task's name. Here
+    // "ingest", the FIRST of three, wins, so the old bug would have swapped
+    // "scorer" and "http"'s names on their `warn!` lines. Each remaining
+    // task fails with a distinct, identifiable error so the fix is visible:
+    // every `task` field must carry its own task's error, never the other's.
+    #[tokio::test]
+    async fn supervise_names_each_remaining_task_correctly_when_the_winner_is_not_last() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+
+        // Ingest wins immediately. Scorer and http each finish shortly after,
+        // on their own account (not because the shutdown watch flipped), so
+        // the race's winner is deterministic and non-last while both
+        // remaining results are still real, distinct errors.
+        let ingest_handle = finishing_task(Err(IngestError::WriterFailed));
+        let scorer_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err(IngestError::Scorer(crate::scorer::ScorerError::Store(
+                crate::store::StoreError::Poisoned,
+            )))
+        });
+        let http_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err(IngestError::Http(crate::http::HttpError::Bind {
+                addr: "127.0.0.1:0".to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use"),
+            }))
+        });
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::fmt().json().with_writer(CapturingWriter(buf.clone())).finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise(
+                vec![("ingest", ingest_handle), ("scorer", scorer_handle), ("http", http_handle)],
+                shutdown_tx,
+                writer,
+            ),
+        )
+        .await
+        .expect("supervise must return promptly once ingest finishes");
+        assert!(matches!(result, Err(IngestError::WriterFailed)));
+
+        drop(dispatch);
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let scorer_line = output
+            .lines()
+            .find(|line| line.contains("\"task\":\"scorer\""))
+            .unwrap_or_else(|| panic!("no warn line named \"scorer\" in: {output}"));
+        assert!(
+            scorer_line.contains("scorer error"),
+            "the \"scorer\" line must carry the scorer's own error, not another task's: {scorer_line}"
+        );
+
+        let http_line = output
+            .lines()
+            .find(|line| line.contains("\"task\":\"http\""))
+            .unwrap_or_else(|| panic!("no warn line named \"http\" in: {output}"));
+        assert!(
+            http_line.contains("http error"),
+            "the \"http\" line must carry the http task's own error, not another task's: {http_line}"
+        );
     }
 
     // BC1: post create, embed is a post quote (`app.bsky.embed.record`),
