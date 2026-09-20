@@ -337,7 +337,11 @@ config, never literals.
 1. **Select.** Pairs in state `candidate`, `first_seen_at` within 48 h, where
    either side's `counts` row is `dirty`. Compute local `E` for both sides. Keep
    pairs where `max(E_local) >= P * prefilter_fraction` and
-   `D_local >= M * prefilter_fraction`. Clear `dirty` on every row read.
+   `D_local >= M * prefilter_fraction`. Clear `dirty` only where the counts
+   still equal what was read (`clear_dirty_if_unchanged`): right away for
+   pairs the prefilter excluded, after verify for pairs whose `getPosts`
+   chunk succeeded. A row the writer moved in between stays dirty, and a
+   failed chunk's rows are never cleared, so no pass loses a pair.
 2. **Verify.** Batch the `Q` and `O` URIs, 25 per `getPosts` call, at most
    `DUNK_APPVIEW_RPS`. Section 8.
 3. **Guard.** Section 9.
@@ -382,9 +386,11 @@ reads from it only.
 | `com.atproto.server.createSession`, `com.atproto.repo.uploadBlob`, `com.atproto.repo.putRecord` | publish only | | app password |
 
 All calls go through one `reqwest::Client` with a token-bucket rate limit, a 10 s
-timeout, and retry with backoff on 429 and 5xx, three attempts. On a fourth
-failure the pass logs and moves on. A pair is never promoted on a partial
-result.
+timeout, and retry with backoff on 429 and 5xx, three attempts. The scorer
+uses `get_posts_lenient`, which chunks at 25 inside the client and reports a
+failed chunk's URIs instead of failing the call; those pairs stay `candidate`
+and dirty for the next pass. `validate` uses the strict `get_posts`. A pair is
+never promoted on a partial result.
 
 ### 8.2 What `verify.rs` reads from a `postView`
 
@@ -407,7 +413,7 @@ is deactivated. Drop with `quote_gone` or `original_gone`.
 ### 8.3 Drop reasons
 
 `self_quote`, `not_a_post`, `quote_gone`, `original_gone`, `detached`,
-`blocked`, `labelled`, `author_inactive`, `follower_floor`, `demoted`. Each is a
+`blocked`, `labelled`, `author_inactive`, `follower_floor`. Each is a
 column value and a counter in the pass log. Reasons are the tuning data.
 
 ## 9. Guards
@@ -517,7 +523,7 @@ Prints the feed URL. Never runs inside `dunk run`.
 - **Backup.** `sqlite3 /data/dunk.db ".backup /data/backup.db"` nightly is enough. Losing the DB loses 30 days of feed history and nothing else. The hot set and counters rebuild within 48 h.
 - **Logs.** `tracing` JSON to stdout. The ingest and scorer stats lines are the dashboards.
 - **Upgrades.** `docker compose pull && up -d`. The Jetstream cursor makes a restart under 36 h gapless.
-- **Failure modes.** One Jetstream host down: the client rotates to the next host within one backoff step. All hosts down: ingest backs off, `/healthz` goes 503 after 300 s, the feed keeps serving the last snapshot. App View down: no promotions, feed keeps serving. Disk full: writer thread errors, process exits, Docker restarts it, cursor resumes. OOM: memory limit trips at 512 MB, same recovery.
+- **Failure modes.** One Jetstream host down: the client rotates to the next host within one backoff step. All hosts down: ingest backs off, `/healthz` goes 503 after 300 s, the feed keeps serving the last snapshot. App View down: no promotions, feed keeps serving. Disk full: writer thread errors, process exits, Docker restarts it, cursor resumes. `dunk run` supervises the ingest and scorer tasks: the first to stop flips the shutdown watch, the other is awaited, the writer is flushed, and the first error is the exit reason. OOM: memory limit trips at 512 MB, same recovery.
 
 ## 14. Testing strategy
 
