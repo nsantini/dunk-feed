@@ -1,20 +1,23 @@
 //! HTTP serving for the AT Protocol feed generator, story 08. Slice 1.0
-//! declared `cursor`, the pure pagination helper. This slice (2.0) adds the
+//! declared `cursor`, the pure pagination helper. Slice 2.0 added the
 //! router, `AppState`, `HttpError`, and the three routes with no serving-path
-//! store dependency: `did`, `describe`, and `health`. Slice 3.0 adds
+//! store dependency: `did`, `describe`, and `health`. This slice (3.0) adds
 //! `skeleton` and `interactions`, and the `IntoResponse` impl for
-//! `SkeletonError` this module will then carry (BC17).
+//! `SkeletonError` (BC17).
 
 pub mod cursor;
 pub mod describe;
 pub mod did;
 pub mod health;
+pub mod interactions;
+pub mod skeleton;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::{get, post};
 use axum::Router;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -26,29 +29,18 @@ use crate::health::HealthState;
 use crate::scorer::snapshot::SnapshotHandle;
 use crate::store::writer::WriterHandle;
 
-/// Every dependency a route handler needs. Complete as of this slice: slice
-/// 3.0's `skeleton` and `interactions` routes read `writer` (through
-/// `WriterHandle::try_send`, added there) and `snapshot`, already present
-/// here.
-///
-/// No non-test caller yet: `run` (`src/ingest/mod.rs`) builds one and calls
-/// `serve` with it in slice 3.0.
-#[allow(dead_code)]
+/// Every dependency a route handler needs. `run` (`src/ingest/mod.rs`)
+/// builds one and calls `serve` with it.
 pub struct AppState {
     pub snapshot: SnapshotHandle,
-    /// No caller yet in this slice; slice 3.0's `interactions` handler is
-    /// the first, through `WriterHandle::try_send`.
-    #[allow(dead_code)]
     pub writer: WriterHandle,
     pub health: HealthState,
     pub cfg: Config,
 }
 
-/// Every way `serve` can fail. `run` (`src/ingest/mod.rs`, slice 3.0) wraps
-/// this as `IngestError::Http`; `main.rs` prints it and `dunk run` exits
-/// non-zero (BC23).
-/// No non-test caller yet: `IngestError::Http` (slice 3.0) wraps this.
-#[allow(dead_code)]
+/// Every way `serve` can fail. `run` (`src/ingest/mod.rs`) wraps this as
+/// `IngestError::Http`; `main.rs` prints it and `dunk run` exits non-zero
+/// (BC23).
 #[derive(Debug, Error)]
 pub enum HttpError {
     /// `DUNK_HTTP_ADDR` is already taken, or otherwise unbindable.
@@ -56,22 +48,34 @@ pub enum HttpError {
     Bind { addr: String, source: std::io::Error },
 }
 
+/// BC17: `SkeletonError::UnknownFeed` and `SkeletonError::InvalidRequest`
+/// (`src/http/skeleton.rs`) both map to a 400 with the shape BC3, BC4 and
+/// BC6 name. `src/http/skeleton.rs`'s own `handler` still adds the
+/// `Cache-Control` header (BC11, BC33) after this runs, since that applies
+/// to every response, not only an error one.
+impl IntoResponse for skeleton::SkeletonError {
+    fn into_response(self) -> Response {
+        let error = match self {
+            skeleton::SkeletonError::UnknownFeed => "UnknownFeed",
+            skeleton::SkeletonError::InvalidRequest => "InvalidRequest",
+        };
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": error }))).into_response()
+    }
+}
+
 /// The five-second request timeout every route sits behind, applied by
 /// `TimeoutLayer` in `router` rather than a per-handler deadline, so every
 /// route gets it for free and none can forget it.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Builds the router over `state`. Slice 3.0 adds `getFeedSkeleton` and
-/// `sendInteractions` to the three routes wired here.
-///
-/// No non-test caller yet: `serve` below is the only production caller, and
-/// `serve` itself has none until `run` (slice 3.0) spawns the HTTP task.
-#[allow(dead_code)]
+/// Builds the router over `state`: the five routes BC1 to BC15 name.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/.well-known/did.json", get(did::handler))
         .route("/xrpc/app.bsky.feed.describeFeedGenerator", get(describe::handler))
         .route("/healthz", get(health::handler))
+        .route("/xrpc/app.bsky.feed.getFeedSkeleton", get(skeleton::handler))
+        .route("/xrpc/app.bsky.feed.sendInteractions", post(interactions::handler))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, REQUEST_TIMEOUT))
         .with_state(state)
@@ -82,9 +86,8 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// (`axum::serve`'s graceful shutdown). `HttpError::Bind` (BC23), never a
 /// panic, when the address is already taken.
 ///
-/// No non-test caller yet: `run` (`src/ingest/mod.rs`, slice 3.0) spawns
-/// this as the third supervised task.
-#[allow(dead_code)]
+/// `run` (`src/ingest/mod.rs`) spawns this as one of the three supervised
+/// tasks.
 pub async fn serve(
     cfg: &Config,
     state: Arc<AppState>,

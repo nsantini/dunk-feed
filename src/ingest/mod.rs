@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::config::Config;
+use crate::health::HealthState;
 use crate::jetstream::event::{parse_rfc3339_secs, CommitEvent, Operation};
 use crate::jetstream::{Event, JetstreamError};
 use crate::store::writer::{CountField, Op, WriterHandle, WriterState};
@@ -526,6 +527,12 @@ pub enum IngestError {
     /// (BC35).
     #[error("scorer error: {0}")]
     Scorer(#[from] crate::scorer::ScorerError),
+    /// The HTTP task failed: `crate::http::serve` could not bind
+    /// `DUNK_HTTP_ADDR` (BC23). `run` (slice 3.0) spawns the HTTP server as
+    /// the third supervised task and wraps its `HttpError` here the same way
+    /// `Scorer` wraps `ScorerError`.
+    #[error("http error: {0}")]
+    Http(#[from] crate::http::HttpError),
 }
 
 /// Sends one `Op` to the writer, mapping the only error `WriterHandle::send`
@@ -635,6 +642,7 @@ pub async fn run_ingest<S: EventSource + Send + 'static>(
     hot: &mut HotSet,
     shutdown: watch::Receiver<bool>,
     evict_rx: mpsc::UnboundedReceiver<Vec<String>>,
+    health: &HealthState,
 ) -> Result<(), IngestError> {
     run_ingest_periodic(
         cfg,
@@ -645,6 +653,7 @@ pub async fn run_ingest<S: EventSource + Send + 'static>(
         Duration::from_secs(CHECKPOINT_PERIOD_SECS),
         Duration::from_secs_f64(STATS_PERIOD_SECS),
         evict_rx,
+        health,
     )
     .await
 }
@@ -666,6 +675,11 @@ async fn run_ingest_periodic<S: EventSource + Send + 'static>(
     checkpoint_period: Duration,
     stats_period: Duration,
     mut evict_rx: mpsc::UnboundedReceiver<Vec<String>>,
+    // Named apart from the `health` local below (`writer.health()`, the
+    // writer thread's own liveness watch): this is `HealthState`, the
+    // cross-task `/healthz` clock the ingest loop records the last commit
+    // time on (BC25), a different thing entirely.
+    liveness: &HealthState,
 ) -> Result<(), IngestError> {
     // Round 1 finding 1: read once, before the source is handed to the
     // pump, since the loop below can no longer reach the source itself.
@@ -746,6 +760,9 @@ async fn run_ingest_periodic<S: EventSource + Send + 'static>(
                         // rather than `&translation.ops` + `.clone()`, so
                         // no `Op` is cloned per event on the hot path.
                         stats.record_commit(&commit, &translation);
+                        if let Some(t) = commit.time_secs() {
+                            liveness.set_commit_time(t);
+                        }
                         for op in translation.ops {
                             apply_op_to_hot_set(hot, &op);
                             send_op(writer, op).await?;
@@ -789,27 +806,27 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-/// `dunk run`'s entry point (slice 6.0), TECH-DESIGN section 5.1 end to
-/// end: opens `cfg.db_path` (BC35), starts the writer wired to the eviction
-/// channel (round 1 finding 2), rebuilds the hot set from `pairs` and logs
-/// its size and the elapsed time at `info` (BC22), reads the stored cursor
-/// and connects to Jetstream at it, then spawns [`run_ingest`] on its own
-/// task, running until SIGINT or SIGTERM flips the shutdown watch (BC33).
-/// Once that task returns, `writer.flush()` then `writer.shutdown()` run on
-/// this handle (a clone of the one the spawned task holds) so every
-/// committed op reaches the database before the process exits; a failure on
-/// either is logged, not raised, since the original result from
-/// `run_ingest` (success or `IngestError`) is the one this function
-/// returns. The scorer task (story 07) and the HTTP server (story 08) each
-/// have their place named below, spawned alongside `run_ingest` and sharing
-/// a clone of `shutdown_rx`; neither has code yet (`## Non-goals`).
+/// `dunk run`'s entry point, TECH-DESIGN section 5.1 end to end: opens
+/// `cfg.db_path` (BC35), starts the writer wired to the eviction channel
+/// (round 1 finding 2), rebuilds the hot set from `pairs` and logs its size
+/// and the elapsed time at `info` (BC22), reads the stored cursor and
+/// connects to Jetstream at it, then spawns [`run_ingest`], the scorer
+/// (story 07) and the HTTP server (story 08, slice 3.0) as three supervised
+/// tasks sharing one `SnapshotHandle` (scorer writes, HTTP reads) and one
+/// `HealthState` (ingest and scorer write, HTTP reads), running until
+/// SIGINT or SIGTERM flips the shutdown watch (BC33). Once every task
+/// returns, `writer.flush()` then `writer.shutdown()` run on this handle (a
+/// clone of the one the spawned tasks hold) so every committed op reaches
+/// the database before the process exits; a failure on either is logged,
+/// not raised, since the first task's own result (success or
+/// `IngestError`) is the one this function returns (BC29).
 pub async fn run(cfg: &Config) -> Result<(), IngestError> {
     let store = crate::store::Store::open(cfg)?;
 
     // Round 1 finding 2 (BC38, BC39): `evict_tx`'s clone goes to the
     // writer, which sends every batch's evicted URIs on it once committed;
-    // `evict_tx` itself stays in scope below, for story 07's scorer task to
-    // send `expire`'s `ExpireReport::evicted_uris` through its own clone.
+    // `evict_tx` itself stays in scope below, for the scorer task to send
+    // `expire`'s `ExpireReport::evicted_uris` through its own clone.
     let (evict_tx, evict_rx) = mpsc::unbounded_channel::<Vec<String>>();
     let writer = store.writer_evicting(evict_tx.clone())?;
 
@@ -833,87 +850,126 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
         let _ = signal_shutdown_tx.send(true);
     });
 
-    // The scorer task (story 07) starts here, spawned alongside
-    // `run_ingest` below, sharing a clone of `shutdown_rx` and sending
-    // through its own clone of `evict_tx` (BC39). Story 08's HTTP server
-    // has its place named here too; it has no code yet (`## Non-goals`).
-    // `AppViewClient::new` only fails on a non-positive or non-finite
-    // `appview_rps`, which `config::load` already rejects, so `cfg` here
-    // can never trigger it.
+    // Shared across all three tasks (BC25): the scorer's snapshot step
+    // swaps a freshly built list into `snapshot`; the HTTP server's
+    // `getFeedSkeleton` reads it. `liveness` is written by the ingest loop
+    // (the last Jetstream commit) and the scorer (the last successful
+    // pass), and read by `/healthz`.
+    let snapshot = crate::scorer::snapshot::SnapshotHandle::new();
+    let liveness = HealthState::new();
+
+    // The scorer task, spawned alongside `run_ingest` and the HTTP server
+    // below, sharing a clone of `shutdown_rx` and sending through its own
+    // clone of `evict_tx` (BC39). `AppViewClient::new` only fails on a
+    // non-positive or non-finite `appview_rps`, which `config::load`
+    // already rejects, so `cfg` here can never trigger it.
     let scorer_store = store.clone();
     let scorer_client = crate::appview::AppViewClient::new(cfg)
         .expect("cfg.appview_rps is validated positive and finite by config::load");
     let scorer_cfg = cfg.clone();
     let scorer_evict_tx = evict_tx.clone();
     let scorer_shutdown_rx = shutdown_rx.clone();
-    let scorer_snapshot = crate::scorer::snapshot::SnapshotHandle::new();
-    let scorer_handle = tokio::spawn(async move {
-        crate::scorer::run(
-            scorer_store,
-            scorer_client,
-            scorer_cfg,
-            scorer_evict_tx,
-            scorer_shutdown_rx,
-            scorer_snapshot,
-        )
-        .await
-    });
+    let scorer_snapshot = snapshot.clone();
+    let scorer_liveness = liveness.clone();
+    let scorer_handle: tokio::task::JoinHandle<Result<(), IngestError>> =
+        tokio::spawn(async move {
+            crate::scorer::run(
+                scorer_store,
+                scorer_client,
+                scorer_cfg,
+                scorer_evict_tx,
+                scorer_shutdown_rx,
+                scorer_snapshot,
+                scorer_liveness,
+            )
+            .await
+            .map_err(IngestError::Scorer)
+        });
 
     let ingest_cfg = cfg.clone();
     let ingest_writer = writer.clone();
-    let ingest_handle = tokio::spawn(async move {
-        run_ingest(&ingest_cfg, source, &ingest_writer, &mut hot, shutdown_rx, evict_rx).await
+    let ingest_liveness = liveness.clone();
+    let ingest_handle: tokio::task::JoinHandle<Result<(), IngestError>> =
+        tokio::spawn(async move {
+            run_ingest(
+                &ingest_cfg,
+                source,
+                &ingest_writer,
+                &mut hot,
+                shutdown_rx,
+                evict_rx,
+                &ingest_liveness,
+            )
+            .await
+        });
+
+    // The HTTP server (story 08, slice 3.0): reads `snapshot` and
+    // `liveness`, never the store (`## Non-goals`: no store read on the
+    // serving path).
+    let http_cfg = cfg.clone();
+    // A fresh receiver off `shutdown_tx`: every supervised task needs its
+    // own (each is moved into its own `tokio::spawn`), and `shutdown_rx`
+    // itself is already moved into the ingest task above.
+    let http_shutdown_rx = shutdown_tx.subscribe();
+    let http_state = std::sync::Arc::new(crate::http::AppState {
+        snapshot,
+        writer: writer.clone(),
+        health: liveness,
+        cfg: cfg.clone(),
+    });
+    let http_handle: tokio::task::JoinHandle<Result<(), IngestError>> = tokio::spawn(async move {
+        crate::http::serve(&http_cfg, http_state, http_shutdown_rx).await.map_err(IngestError::Http)
     });
 
-    supervise(ingest_handle, scorer_handle, shutdown_tx, writer).await
+    supervise(
+        vec![("ingest", ingest_handle), ("scorer", scorer_handle), ("http", http_handle)],
+        shutdown_tx,
+        writer,
+    )
+    .await
 }
 
-/// Round 2 finding 1 (BC42): races `ingest` and `scorer` with
-/// `tokio::select!` on `&mut handle` (the standard trick for keeping both
-/// `JoinHandle`s alive past the branch that wins, since `&mut JoinHandle<T>`
-/// is itself `Future + Unpin`). Whichever finishes first — with an error or
-/// not — flips `shutdown_tx` so the other task stops on its own next check,
-/// then this awaits the other to let it wind down cleanly, logging its
-/// error at `warn` if it has one (never dropped, never returned: the first
-/// task's own result is always what `run` returns). Once both have
-/// finished, `writer.flush()` then `writer.shutdown()` run here, so every
-/// committed op reaches the database before `run` returns either way.
+/// Races every task in `tasks` with `futures_util::future::select_all`
+/// (round 2's generalisation of round 1 finding 1's two-task
+/// `tokio::select!`, BC29): whichever finishes first — with an error or not
+/// — flips `shutdown_tx` so the others stop on their own next check, then
+/// this awaits every other task in turn to let it wind down cleanly,
+/// logging its error at `warn` if it has one (never dropped, never
+/// returned: the first task's own result is always what `supervise`
+/// returns). Once every task has finished, `writer.flush()` then
+/// `writer.shutdown()` run here, so every committed op reaches the database
+/// before `run` returns either way.
+/// One supervised task's `JoinHandle`, its `Ok` always `IngestError` so
+/// `supervise` can race the ingest, scorer and HTTP tasks together despite
+/// their three different underlying error types.
+type SupervisedHandle = tokio::task::JoinHandle<Result<(), IngestError>>;
+
 async fn supervise(
-    mut ingest: tokio::task::JoinHandle<Result<(), IngestError>>,
-    mut scorer: tokio::task::JoinHandle<Result<(), crate::scorer::ScorerError>>,
+    tasks: Vec<(&'static str, SupervisedHandle)>,
     shutdown_tx: watch::Sender<bool>,
     writer: WriterHandle,
 ) -> Result<(), IngestError> {
-    let first_result: Result<(), IngestError> = tokio::select! {
-        result = &mut ingest => {
-            let _ = shutdown_tx.send(true);
-            let outcome = result.expect("the run_ingest task should not panic");
-            match scorer.await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!(error = %err, "ingest: scorer task failed after ingest finished")
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "ingest: scorer task panicked after ingest finished")
-                }
+    let (names, handles): (Vec<&'static str>, Vec<SupervisedHandle>) = tasks.into_iter().unzip();
+
+    let (result, index, remaining_handles) = futures_util::future::select_all(handles).await;
+    let _ = shutdown_tx.send(true);
+    let first_name = names[index];
+    let first_result: Result<(), IngestError> =
+        result.unwrap_or_else(|err| panic!("the {first_name} task should not panic: {err}"));
+
+    let remaining_names: Vec<&'static str> =
+        names.into_iter().enumerate().filter(|(i, _)| *i != index).map(|(_, name)| name).collect();
+    for (name, handle) in remaining_names.into_iter().zip(remaining_handles) {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, task = name, "ingest: a task failed after another task finished")
             }
-            outcome
-        }
-        result = &mut scorer => {
-            let _ = shutdown_tx.send(true);
-            let scorer_outcome = result.expect("the scorer task should not panic");
-            match ingest.await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!(error = %err, "ingest: ingest task failed after scorer finished")
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "ingest: ingest task panicked after scorer finished")
-                }
+            Err(err) => {
+                tracing::warn!(error = %err, task = name, "ingest: a task panicked after another task finished")
             }
-            scorer_outcome.map_err(IngestError::Scorer)
         }
-    };
+    }
 
     if let Err(err) = writer.flush().await {
         tracing::warn!(error = %err, "ingest: writer flush failed during shutdown");
@@ -962,63 +1018,115 @@ mod tests {
         }
     }
 
-    // BC42: ingest finishing first (with an error) flips the shutdown watch
-    // so the scorer — which would otherwise run forever — stops too, and
-    // `supervise` returns ingest's own error.
+    /// A task that finishes immediately with `result`, standing in for
+    /// whichever of the three supervised tasks the test wants to finish
+    /// first.
+    fn finishing_task(
+        result: Result<(), IngestError>,
+    ) -> tokio::task::JoinHandle<Result<(), IngestError>> {
+        tokio::spawn(async move { result })
+    }
+
+    /// A task that runs until `shutdown_rx` flips, standing in for a task
+    /// that would otherwise run forever — round 2's three-task counterpart
+    /// of round 1 finding 1's two-task stand-in.
+    fn forever_task(
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<Result<(), IngestError>> {
+        tokio::spawn(async move {
+            run_until_shutdown(shutdown_rx).await;
+            Ok(())
+        })
+    }
+
+    // BC29: ingest finishing first (with an error) flips the shutdown watch
+    // so the other two tasks — which would otherwise run forever — stop
+    // too, and `supervise` returns ingest's own error.
     #[tokio::test]
-    async fn supervise_returns_ingest_error_and_stops_the_scorer() {
+    async fn supervise_returns_ingest_error_and_stops_the_others() {
         let store = crate::store::Store::open_memory().unwrap();
         let writer = store.writer().unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let ingest_handle: tokio::task::JoinHandle<Result<(), IngestError>> =
-            tokio::spawn(async { Err(IngestError::WriterFailed) });
-        let scorer_rx = shutdown_rx.clone();
-        let scorer_handle: tokio::task::JoinHandle<Result<(), crate::scorer::ScorerError>> =
-            tokio::spawn(async move {
-                run_until_shutdown(scorer_rx).await;
-                Ok(())
-            });
+        let ingest_handle = finishing_task(Err(IngestError::WriterFailed));
+        let scorer_handle = forever_task(shutdown_rx.clone());
+        let http_handle = forever_task(shutdown_rx);
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            supervise(ingest_handle, scorer_handle, shutdown_tx, writer),
+            supervise(
+                vec![("ingest", ingest_handle), ("scorer", scorer_handle), ("http", http_handle)],
+                shutdown_tx,
+                writer,
+            ),
         )
         .await
-        .expect("supervise must return promptly once ingest finishes, not wait on the scorer");
+        .expect("supervise must return promptly once ingest finishes, not wait on the others");
 
         assert!(matches!(result, Err(IngestError::WriterFailed)));
     }
 
-    // BC42, the reverse: the scorer finishing first (with an error) flips
-    // the shutdown watch so ingest — which would otherwise run forever —
-    // stops too, and `supervise` returns the scorer's error, mapped through
-    // `IngestError::Scorer`.
+    // BC29, the reverse: the scorer finishing first (with an error) flips
+    // the shutdown watch so the other two tasks stop too, and `supervise`
+    // returns the scorer's error.
     #[tokio::test]
-    async fn supervise_returns_scorer_error_and_stops_ingest() {
+    async fn supervise_returns_scorer_error_and_stops_the_others() {
         let store = crate::store::Store::open_memory().unwrap();
         let writer = store.writer().unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let ingest_rx = shutdown_rx.clone();
-        let ingest_handle: tokio::task::JoinHandle<Result<(), IngestError>> =
-            tokio::spawn(async move {
-                run_until_shutdown(ingest_rx).await;
-                Ok(())
-            });
-        let scorer_handle: tokio::task::JoinHandle<Result<(), crate::scorer::ScorerError>> =
-            tokio::spawn(async {
-                Err(crate::scorer::ScorerError::Store(crate::store::StoreError::Poisoned))
-            });
+        let ingest_handle = forever_task(shutdown_rx.clone());
+        let scorer_handle = finishing_task(Err(IngestError::Scorer(
+            crate::scorer::ScorerError::Store(crate::store::StoreError::Poisoned),
+        )));
+        let http_handle = forever_task(shutdown_rx);
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            supervise(ingest_handle, scorer_handle, shutdown_tx, writer),
+            supervise(
+                vec![("ingest", ingest_handle), ("scorer", scorer_handle), ("http", http_handle)],
+                shutdown_tx,
+                writer,
+            ),
         )
         .await
-        .expect("supervise must return promptly once the scorer finishes, not wait on ingest");
+        .expect("supervise must return promptly once the scorer finishes, not wait on the others");
 
         assert!(matches!(result, Err(IngestError::Scorer(_))));
+    }
+
+    // BC29, a third case: the HTTP task finishing first (a bind failure)
+    // flips the shutdown watch so ingest and the scorer — both of which
+    // would otherwise run forever — stop too, and `supervise` returns the
+    // HTTP task's own error. This is the case round 1's two-task
+    // `supervise` had no room for.
+    #[tokio::test]
+    async fn supervise_returns_http_error_and_stops_the_others() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let ingest_handle = forever_task(shutdown_rx.clone());
+        let scorer_handle = forever_task(shutdown_rx);
+        let http_handle = finishing_task(Err(IngestError::Http(crate::http::HttpError::Bind {
+            addr: "127.0.0.1:0".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use"),
+        })));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise(
+                vec![("ingest", ingest_handle), ("scorer", scorer_handle), ("http", http_handle)],
+                shutdown_tx,
+                writer,
+            ),
+        )
+        .await
+        .expect(
+            "supervise must return promptly once the http task finishes, not wait on the others",
+        );
+
+        assert!(matches!(result, Err(IngestError::Http(_))));
     }
 
     // BC1: post create, embed is a post quote (`app.bsky.embed.record`),
@@ -1765,6 +1873,7 @@ mod tests {
         let writer = store.writer().unwrap();
         let writer_task = writer.clone();
         let cfg = test_config();
+        let health = crate::health::HealthState::new();
         let like = like_commit(1, "at://did:plc:cold0000000000000000000/app.bsky.feed.post/cold1");
         let source = SlowSource { event: Some(Event::Commit(like)), last_seq: None };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1783,6 +1892,7 @@ mod tests {
                 Duration::from_millis(50),
                 Duration::from_secs(3600),
                 evict_rx,
+                &health,
             )
             .await
         });
@@ -1806,6 +1916,7 @@ mod tests {
         let store = crate::store::Store::open_memory().unwrap();
         let writer = store.writer().unwrap();
         let cfg = test_config();
+        let health = crate::health::HealthState::new();
         let source = VecSource::new(vec![]);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1821,6 +1932,7 @@ mod tests {
                 Duration::from_secs(3600),
                 Duration::from_secs(3600),
                 evict_rx,
+                &health,
             )
             .await
         });
@@ -1844,6 +1956,7 @@ mod tests {
         let writer = store.writer().unwrap();
         let writer_task = writer.clone();
         let cfg = test_config();
+        let health = crate::health::HealthState::new();
         // A cold like: `translate` returns `Translation::default()` (BC13),
         // but `VecSource` still records its `seq` as `last_seq`.
         let cold_like =
@@ -1863,6 +1976,7 @@ mod tests {
                 Duration::from_millis(20),
                 Duration::from_secs(3600),
                 evict_rx,
+                &health,
             )
             .await
         });
@@ -1895,6 +2009,7 @@ mod tests {
         let writer = store.writer().unwrap();
         let writer_task = writer.clone();
         let cfg = test_config();
+        let health = crate::health::HealthState::new();
         let (mut source, drained) = VecSource::with_drained_signal(events);
         source.initial_cursor = initial_cursor;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1911,6 +2026,7 @@ mod tests {
                 Duration::from_secs(3600),
                 Duration::from_secs(3600),
                 evict_rx,
+                &health,
             )
             .await
         });
@@ -1987,6 +2103,7 @@ mod tests {
         let writer = store.writer().unwrap();
         writer.shutdown().await.unwrap(); // the thread exits; a later send is WriterGone
         let cfg = test_config();
+        let health = crate::health::HealthState::new();
         let quote = commit("jetstream_commit_post_quote_record.json");
         let source = VecSource::new(vec![Event::Commit(quote)]);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2002,6 +2119,7 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(3600),
             evict_rx,
+            &health,
         )
         .await;
 
@@ -2023,6 +2141,7 @@ mod tests {
         writer.shutdown().await.unwrap();
 
         let cfg = test_config();
+        let health = crate::health::HealthState::new();
         let source = VecSource::new(vec![]);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut hot = HotSet::new();
@@ -2037,6 +2156,7 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(3600),
             evict_rx,
+            &health,
         )
         .await;
 
@@ -2068,6 +2188,7 @@ mod tests {
         {
             let writer_task = writer.clone();
             let cfg = test_config();
+            let health = crate::health::HealthState::new();
             let (source, drained) =
                 VecSource::with_drained_signal(vec![Event::Commit(quote), Event::Commit(like)]);
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2084,6 +2205,7 @@ mod tests {
                     Duration::from_secs(3600),
                     Duration::from_secs(3600),
                     evict_rx,
+                    &health,
                 )
                 .await;
                 (result, hot)
@@ -2120,6 +2242,7 @@ mod tests {
         {
             let writer_task = writer.clone();
             let cfg = test_config();
+            let health = crate::health::HealthState::new();
             let (source, drained) = VecSource::with_drained_signal(vec![Event::Commit(
                 postgate_commit(quote_seq + 2, &[quote_uri]),
             )]);
@@ -2138,6 +2261,7 @@ mod tests {
                     Duration::from_secs(3600),
                     Duration::from_secs(3600),
                     evict_rx,
+                    &health,
                 )
                 .await
             });
@@ -2214,6 +2338,7 @@ mod tests {
         let (source, drained) = VecSource::with_drained_signal(vec![Event::Commit(delete_commit)]);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let cfg = test_config();
+        let health = crate::health::HealthState::new();
         let writer_task = writer.clone();
 
         let handle = tokio::spawn(async move {
@@ -2226,6 +2351,7 @@ mod tests {
                 Duration::from_secs(3600),
                 Duration::from_secs(3600),
                 evict_rx,
+                &health,
             )
             .await;
             (result, hot)
@@ -2266,6 +2392,7 @@ mod tests {
         let store = crate::store::Store::open_memory().unwrap();
         let writer = store.writer().unwrap();
         let cfg = test_config();
+        let health = crate::health::HealthState::new();
         let source = crate::jetstream::JetstreamClient::connect(&cfg, None)
             .await
             .expect("connecting to the real jetstream host should not fail");
@@ -2274,7 +2401,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let mut hot = HotSet::new();
-            run_ingest(&cfg, source, &writer, &mut hot, shutdown_rx, evict_rx).await
+            run_ingest(&cfg, source, &writer, &mut hot, shutdown_rx, evict_rx, &health).await
         });
 
         tokio::time::sleep(Duration::from_secs(5)).await;

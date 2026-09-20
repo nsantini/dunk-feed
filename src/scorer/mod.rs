@@ -33,6 +33,7 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use crate::appview::{AppViewClient, PostsOutcome};
 use crate::config::Config;
+use crate::health::HealthState;
 use crate::score::{self, Counts, Thresholds, Weights};
 use crate::store::pairs::{PairOutcome, PairWithCounts};
 use crate::store::{feed, unix_now, Store, StoreError};
@@ -464,6 +465,7 @@ pub async fn run<S>(
     evict_tx: mpsc::UnboundedSender<Vec<String>>,
     mut shutdown_rx: watch::Receiver<bool>,
     snapshot: SnapshotHandle,
+    health: HealthState,
 ) -> Result<(), ScorerError>
 where
     S: PostSource + Send + Sync + 'static,
@@ -485,6 +487,10 @@ where
                     last_reverify = now;
                 }
                 one_pass(&store, &source, &cfg, &evict_tx, now, do_reverify, &snapshot).await?;
+                // BC25, BC34: recorded after the pass has fully committed
+                // and swapped its snapshot in, matching TECH-DESIGN section
+                // 7.2 step 7's order.
+                health.set_scorer_pass(now);
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -1027,7 +1033,8 @@ mod tests {
         shutdown_tx.send(true).unwrap();
 
         let snapshot = SnapshotHandle::new();
-        let result = run(store, source.clone(), cfg, evict_tx, shutdown_rx, snapshot).await;
+        let health = HealthState::new();
+        let result = run(store, source.clone(), cfg, evict_tx, shutdown_rx, snapshot, health).await;
 
         assert!(result.is_ok());
         assert_eq!(source.call_count(), 0, "no pass ran after shutdown");

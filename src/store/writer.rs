@@ -54,11 +54,8 @@ pub enum Op {
     Checkpoint {
         seq: u64,
     },
-    // Story 08's `sendInteractions` endpoint is the first production
-    // constructor; no caller yet, so this narrowed allow replaces the
-    // `store` module's old blanket `#![allow(dead_code)]` (round 2
-    // finding 9) for this one variant.
-    #[allow(dead_code)]
+    /// The row `sendInteractions` (`src/http/interactions.rs`, slice 3.0)
+    /// writes, one per event, through `WriterHandle::try_send` (BC12, BC28).
     Interaction {
         item: Option<String>,
         event: Option<String>,
@@ -239,6 +236,20 @@ impl WriterHandle {
     /// thread has exited and dropped its receiver.
     pub async fn send(&self, op: Op) -> Result<(), StoreError> {
         self.tx.send(WriterMsg::Op(op)).await.map_err(|_| StoreError::WriterGone)
+    }
+
+    /// Queues one `Op` without waiting: `StoreError::WriterFull` (BC28) when
+    /// the bounded channel is already at capacity, rather than blocking the
+    /// caller the way `send` does. `src/http/interactions.rs`'s
+    /// `sendInteractions` handler is the one caller (BC28): a request must
+    /// never wait on a stalled writer thread. `StoreError::WriterGone` once
+    /// the writer thread has exited and dropped its receiver, the same as
+    /// `send`.
+    pub fn try_send(&self, op: Op) -> Result<(), StoreError> {
+        self.tx.try_send(WriterMsg::Op(op)).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => StoreError::WriterFull,
+            mpsc::error::TrySendError::Closed(_) => StoreError::WriterGone,
+        })
     }
 
     /// Returns once every op sent before this call is committed (BC38).
@@ -790,6 +801,59 @@ mod tests {
         let _handle = store.writer().unwrap();
         let err = store.writer().unwrap_err();
         assert!(matches!(err, StoreError::WriterAlreadyStarted));
+    }
+
+    #[tokio::test]
+    async fn try_send_succeeds_when_the_channel_has_room() {
+        let conn = shared_conn();
+        let handle = spawn(Arc::clone(&conn), WriterConfig::default(), None);
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+
+        handle.try_send(incr_op(uri, 1)).unwrap();
+        handle.flush().await.unwrap();
+
+        assert_eq!(likes(&conn.lock().unwrap(), uri), 1);
+    }
+
+    #[tokio::test]
+    // BC28: a full channel makes `try_send` return `WriterFull` rather than
+    // waiting, unlike `send`.
+    #[allow(clippy::await_holding_lock)]
+    async fn try_send_returns_writer_full_when_the_channel_is_full() {
+        let conn = shared_conn();
+        let cfg = WriterConfig { capacity: 2, max_ops: 1, interval: Duration::from_secs(30) };
+        let handle = spawn(Arc::clone(&conn), cfg, None);
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+
+        // Hold the connection so the writer thread, which pulls this first
+        // op off the channel right away (`max_ops` is 1), blocks trying to
+        // commit it instead of draining any more of the channel.
+        let guard = conn.lock().unwrap();
+        handle.try_send(incr_op(uri, 1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The channel's capacity is 2; these two fit without the channel
+        // reporting full.
+        handle.try_send(incr_op(uri, 2)).unwrap();
+        handle.try_send(incr_op(uri, 3)).unwrap();
+
+        // A further try_send finds the channel full and returns
+        // `WriterFull` rather than waiting (BC28).
+        let err = handle.try_send(incr_op(uri, 4)).unwrap_err();
+        assert!(matches!(err, StoreError::WriterFull));
+
+        drop(guard);
+        handle.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_send_returns_writer_gone_after_shutdown() {
+        let conn = shared_conn();
+        let handle = spawn(Arc::clone(&conn), WriterConfig::default(), None);
+        handle.shutdown().await.unwrap();
+
+        let err = handle.try_send(incr_op("at://did:plc:o/app.bsky.feed.post/o1", 1)).unwrap_err();
+        assert!(matches!(err, StoreError::WriterGone));
     }
 
     #[test]

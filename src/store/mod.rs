@@ -68,6 +68,11 @@ pub enum StoreError {
     Poisoned,
     #[error("Store::writer was already called on this store")]
     WriterAlreadyStarted,
+    /// `WriterHandle::try_send` (story 08's `sendInteractions`, BC28) found
+    /// the writer's bounded channel already full. The caller drops the op
+    /// rather than waiting, unlike `WriterHandle::send`.
+    #[error("the writer's bounded channel is full")]
+    WriterFull,
 }
 
 /// A `pairs.state` value, TECH-DESIGN section 6.
