@@ -287,7 +287,7 @@ mod tests {
             labels: None,
             checked_at: 1_700_000_100,
         };
-        authors_put_many(&conn, &[updated.clone()]).unwrap();
+        authors_put_many(&conn, std::slice::from_ref(&updated)).unwrap();
         assert_eq!(author_get(&conn, "did:plc:a").unwrap(), Some(updated));
     }
 
