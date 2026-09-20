@@ -331,11 +331,15 @@ pub fn expire(
     }
     conn.execute("DELETE FROM feed WHERE promoted_at < ?1", [feed_cutoff])?;
     if !expired_feed.is_empty() {
-        let placeholders = vec!["?"; expired_feed.len()].join(",");
-        let sql = format!("DELETE FROM pairs WHERE quote_uri IN ({placeholders})");
         let quote_uris: Vec<&String> =
             expired_feed.iter().map(|(quote_uri, _)| quote_uri).collect();
-        conn.execute(&sql, rusqlite::params_from_iter(quote_uris))?;
+        // BC39: chunked at MAX_BOUND_PARAMS so a large expiry never exceeds
+        // SQLite's bound-parameter limit.
+        for chunk in quote_uris.chunks(crate::store::MAX_BOUND_PARAMS) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("DELETE FROM pairs WHERE quote_uri IN ({placeholders})");
+            conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+        }
     }
 
     // Round 1 finding 1: only a URI no non-dropped pair still names is
@@ -349,9 +353,13 @@ pub fn expire(
         .collect();
     if !orphaned.is_empty() {
         orphaned.sort();
-        let placeholders = vec!["?"; orphaned.len()].join(",");
-        let sql = format!("DELETE FROM counts WHERE post_uri IN ({placeholders})");
-        conn.execute(&sql, rusqlite::params_from_iter(orphaned.iter()))?;
+        // BC39: chunked at MAX_BOUND_PARAMS, the same as the `pairs` delete
+        // above.
+        for chunk in orphaned.chunks(crate::store::MAX_BOUND_PARAMS) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("DELETE FROM counts WHERE post_uri IN ({placeholders})");
+            conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+        }
     }
     report.evicted_uris = orphaned;
 
@@ -895,5 +903,32 @@ mod tests {
             crate::score::Counts { likes: 1, reposts: 0, replies: 0 },
             "the shared original's counts row must survive"
         );
+    }
+
+    // BC39: both of `expire`'s `IN (...)` deletes chunk at
+    // `MAX_BOUND_PARAMS`. An unchunked delete over this many rows would fail
+    // with "too many SQL variables"; success here proves the chunking loop
+    // runs for both the `pairs` delete (expired feed rows) and the `counts`
+    // delete (their orphaned URIs).
+    #[test]
+    fn expire_chunks_deletes_past_the_bound_parameter_limit() {
+        let conn = migrated_conn();
+        let n = crate::store::MAX_BOUND_PARAMS + 10;
+        for i in 0..n {
+            let quote_uri = format!("at://did:plc:q/app.bsky.feed.post/q{i}");
+            let original_uri = format!("at://did:plc:o/app.bsky.feed.post/o{i}");
+            insert_test_pair(&conn, &quote_uri, &original_uri);
+            conn.execute("UPDATE pairs SET state = 'promoted' WHERE quote_uri = ?1", [&quote_uri])
+                .unwrap();
+            insert_feed_row(&conn, &quote_uri);
+            conn.execute("UPDATE feed SET promoted_at = 0 WHERE quote_uri = ?1", [&quote_uri])
+                .unwrap();
+        }
+
+        let report = super::expire(&conn, 1_700_000_000, 48, 30).unwrap();
+
+        assert_eq!(report.feed_expired, n);
+        assert_eq!(feed_count(&conn), 0);
+        assert_eq!(pair_count(&conn), 0);
     }
 }

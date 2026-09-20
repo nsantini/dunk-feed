@@ -144,6 +144,14 @@ pub fn unix_now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// SQLite's limit on the number of bound parameters in one statement
+/// (`SQLITE_MAX_VARIABLE_NUMBER`'s default). `counts::clear_dirty`,
+/// `counts::mark_dirty` and both of `pairs::expire`'s `IN (...)` deletes
+/// split a URI list longer than this into chunks of at most this many, one
+/// statement per chunk (BC39), so a scorer pass over a large snapshot never
+/// exceeds it.
+pub const MAX_BOUND_PARAMS: usize = 32_766;
+
 /// Applies the pragmas TECH-DESIGN section 6 asks for, on every open
 /// (BC18). On a `:memory:` path SQLite reports `journal_mode` as `memory`
 /// instead of `wal`; that is accepted, not an error (BC19), and every other
@@ -343,6 +351,16 @@ impl Store {
     pub fn clear_dirty(&self, post_uris: &[&str]) -> Result<(), StoreError> {
         let conn = self.lock()?;
         counts::clear_dirty(&conn, post_uris)
+    }
+
+    /// Sets the dirty flag on each `post_uri`'s `counts` row again. Used by
+    /// the scorer (BC36) to restore `dirty` for the URIs of a `getPosts`
+    /// chunk that failed after `select` already cleared it, so a later pass
+    /// picks the pair back up. A URI with no `counts` row is skipped, not an
+    /// error, the same as `clear_dirty`.
+    pub fn mark_dirty(&self, post_uris: &[&str]) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        counts::mark_dirty(&conn, post_uris)
     }
 
     /// Reads one `meta` key. `Ok(None)` when the key has no row (BC67).

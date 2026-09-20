@@ -44,14 +44,30 @@ pub fn incr(
 /// Clears `dirty` on every URI in `post_uris` in one set-based `UPDATE`
 /// (BC50, round 1 finding 5), not one statement per URI. A URI with no
 /// `counts` row is skipped, not an error: the `UPDATE` simply touches zero
-/// rows for it.
+/// rows for it. A `post_uris` longer than `MAX_BOUND_PARAMS` is split into
+/// chunks, one `UPDATE` per chunk (BC39), so SQLite's bound-parameter limit
+/// is never exceeded.
 pub fn clear_dirty(conn: &Connection, post_uris: &[&str]) -> Result<(), StoreError> {
-    if post_uris.is_empty() {
-        return Ok(());
+    set_dirty(conn, post_uris, 0)
+}
+
+/// Sets `dirty = 1` on every URI in `post_uris`, the reverse of
+/// `clear_dirty`. Used by the scorer (BC36) to restore `dirty` for the URIs
+/// of a `getPosts` chunk that failed, after `select` already cleared it on
+/// read. Chunked the same way `clear_dirty` is (BC39).
+pub fn mark_dirty(conn: &Connection, post_uris: &[&str]) -> Result<(), StoreError> {
+    set_dirty(conn, post_uris, 1)
+}
+
+/// Shared body of `clear_dirty` and `mark_dirty`: one set-based `UPDATE` per
+/// chunk of at most `MAX_BOUND_PARAMS` URIs (BC39). A URI with no `counts`
+/// row is skipped, not an error.
+fn set_dirty(conn: &Connection, post_uris: &[&str], dirty: i64) -> Result<(), StoreError> {
+    for chunk in post_uris.chunks(crate::store::MAX_BOUND_PARAMS) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("UPDATE counts SET dirty = {dirty} WHERE post_uri IN ({placeholders})");
+        conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
     }
-    let placeholders = vec!["?"; post_uris.len()].join(",");
-    let sql = format!("UPDATE counts SET dirty = 0 WHERE post_uri IN ({placeholders})");
-    conn.execute(&sql, rusqlite::params_from_iter(post_uris.iter()))?;
     Ok(())
 }
 
@@ -156,6 +172,51 @@ mod tests {
         let conn = migrated_conn();
         // No row for this URI; must not error.
         clear_dirty(&conn, &["at://did:plc:o/app.bsky.feed.post/missing"]).unwrap();
+    }
+
+    #[test]
+    fn mark_dirty_sets_the_flag_on_an_existing_row() {
+        let conn = migrated_conn();
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        incr(&conn, uri, CountField::Likes, 1_700_000_000).unwrap();
+        clear_dirty(&conn, &[uri]).unwrap();
+
+        mark_dirty(&conn, &[uri]).unwrap();
+
+        let dirty: i64 = conn
+            .query_row("SELECT dirty FROM counts WHERE post_uri = ?1", [uri], |row| row.get(0))
+            .unwrap();
+        assert_eq!(dirty, 1);
+    }
+
+    #[test]
+    fn mark_dirty_skips_a_uri_with_no_row() {
+        let conn = migrated_conn();
+        // No row for this URI; must not error.
+        mark_dirty(&conn, &["at://did:plc:o/app.bsky.feed.post/missing"]).unwrap();
+    }
+
+    // BC39: a URI list past SQLite's bound-parameter limit must not error.
+    // An unchunked `IN (...)` over this many placeholders would fail with
+    // "too many SQL variables"; success here proves the chunking loop runs.
+    #[test]
+    fn clear_dirty_chunks_a_list_past_the_bound_parameter_limit() {
+        let conn = migrated_conn();
+        let uris: Vec<String> = (0..crate::store::MAX_BOUND_PARAMS + 10)
+            .map(|i| format!("at://did:plc:o/app.bsky.feed.post/o{i}"))
+            .collect();
+        let refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+        clear_dirty(&conn, &refs).unwrap();
+    }
+
+    #[test]
+    fn mark_dirty_chunks_a_list_past_the_bound_parameter_limit() {
+        let conn = migrated_conn();
+        let uris: Vec<String> = (0..crate::store::MAX_BOUND_PARAMS + 10)
+            .map(|i| format!("at://did:plc:o/app.bsky.feed.post/o{i}"))
+            .collect();
+        let refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+        mark_dirty(&conn, &refs).unwrap();
     }
 
     #[test]
