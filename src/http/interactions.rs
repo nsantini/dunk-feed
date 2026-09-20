@@ -32,6 +32,8 @@ pub struct InteractionBody {
     pub event: Option<String>,
     #[serde(rename = "feedContext")]
     pub feed_context: Option<String>,
+    #[serde(rename = "reqId")]
+    pub req_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,9 +68,7 @@ pub async fn handler(State(state): State<Arc<AppState>>, bytes: Bytes) -> Respon
             item: interaction.item,
             event: interaction.event,
             feed_context: interaction.feed_context,
-            // No source is defined for `req_id` in this story's lexicon or
-            // `spec.md`; every row this handler writes carries `None` here.
-            req_id: None,
+            req_id: interaction.req_id,
         };
         // BC28: both `WriterFull` (the channel is at capacity) and
         // `WriterGone` (the writer thread has exited) drop the event and
@@ -85,6 +85,8 @@ pub async fn handler(State(state): State<Arc<AppState>>, bytes: Bytes) -> Respon
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use serde_json::Value;
@@ -189,5 +191,111 @@ mod tests {
         let response = app.oneshot(post_request(serde_json::json!({}))).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // Slice 4.0: `reqId` reaches `Op::Interaction` and lands in the written
+    // row's `req_id` column. A file-backed store, not `test_state`'s
+    // in-memory one, so the row can be read back after `flush` through a
+    // second connection on the same path.
+    #[tokio::test]
+    async fn req_id_reaches_the_written_row() {
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("dunk-interactions-reqid-{nanos}.sqlite3"));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let cfg = test_config("127.0.0.1:0");
+        let store = crate::store::Store::open_path(&path_str).expect("file store must open");
+        let writer = store.writer().expect("writer thread must start");
+        let state = Arc::new(crate::http::AppState {
+            snapshot: crate::scorer::snapshot::SnapshotHandle::new(),
+            writer: writer.clone(),
+            health: crate::health::HealthState::new(),
+            cfg,
+        });
+        let app = router(state);
+
+        let body = serde_json::json!({
+            "interactions": [
+                {
+                    "item": "at://did:plc:q/app.bsky.feed.post/q1",
+                    "event": "app.bsky.feed.defs#requestLess",
+                    "feedContext": "r=4.5",
+                    "reqId": "req-42",
+                }
+            ]
+        });
+        let response = app.oneshot(post_request(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        writer.flush().await.unwrap();
+
+        let conn = rusqlite::Connection::open(&path_str).expect("reopen must succeed");
+        let req_id: Option<String> = conn
+            .query_row("SELECT req_id FROM interactions", [], |row| row.get(0))
+            .expect("one row must exist");
+        assert_eq!(req_id, Some("req-42".to_string()));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    }
+
+    // Slice 4.0 / BC35: an interaction with every field absent, including
+    // `reqId`, still writes exactly one row (the four NULL payload columns
+    // are proven at the store layer by
+    // `src/store/interactions.rs::insert_interaction_allows_null_payload_columns`;
+    // this test covers the HTTP contract that a `reqId`-carrying
+    // `InteractionBody` did not narrow that acceptance).
+    #[tokio::test]
+    async fn all_fields_absent_including_req_id_still_writes_one_row() {
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("dunk-interactions-reqid-absent-{nanos}.sqlite3"));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let cfg = test_config("127.0.0.1:0");
+        let store = crate::store::Store::open_path(&path_str).expect("file store must open");
+        let writer = store.writer().expect("writer thread must start");
+        let state = Arc::new(crate::http::AppState {
+            snapshot: crate::scorer::snapshot::SnapshotHandle::new(),
+            writer: writer.clone(),
+            health: crate::health::HealthState::new(),
+            cfg,
+        });
+        let app = router(state);
+
+        let response =
+            app.oneshot(post_request(serde_json::json!({"interactions": [{}]}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        writer.flush().await.unwrap();
+
+        let conn = rusqlite::Connection::open(&path_str).expect("reopen must succeed");
+        let (count, item, event, feed_context, req_id): (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT count(*), max(item), max(event), max(feed_context), max(req_id) FROM interactions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(item, None);
+        assert_eq!(event, None);
+        assert_eq!(feed_context, None);
+        assert_eq!(req_id, None);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 }
