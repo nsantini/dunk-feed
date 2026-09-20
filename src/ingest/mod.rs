@@ -519,6 +519,13 @@ pub enum IngestError {
     /// found it already gone (BC30).
     #[error("writer thread failed")]
     WriterFailed,
+    /// The scorer task failed. `run` (slice 6.0's counterpart for story 07)
+    /// spawns the scorer alongside `run_ingest`, catches this, and it exits
+    /// `dunk run` non-zero the same way any other `IngestError` does, since
+    /// `cli.rs` already maps every `IngestError` through `CliError::Ingest`
+    /// (BC35).
+    #[error("scorer error: {0}")]
+    Scorer(#[from] crate::scorer::ScorerError),
 }
 
 /// Sends one `Op` to the writer, mapping the only error `WriterHandle::send`
@@ -825,11 +832,31 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
         let _ = shutdown_tx.send(true);
     });
 
-    // Story 07's scorer task and story 08's HTTP server start here, each
-    // spawned alongside `run_ingest` below and sharing a clone of
-    // `shutdown_rx`. Neither exists yet. Story 07's scorer will also send
-    // through `evict_tx.clone()` (BC39).
-    let _evict_tx = evict_tx;
+    // The scorer task (story 07) starts here, spawned alongside
+    // `run_ingest` below, sharing a clone of `shutdown_rx` and sending
+    // through its own clone of `evict_tx` (BC39). Story 08's HTTP server
+    // has its place named here too; it has no code yet (`## Non-goals`).
+    // `AppViewClient::new` only fails on a non-positive or non-finite
+    // `appview_rps`, which `config::load` already rejects, so `cfg` here
+    // can never trigger it.
+    let scorer_store = store.clone();
+    let scorer_client = crate::appview::AppViewClient::new(cfg)
+        .expect("cfg.appview_rps is validated positive and finite by config::load");
+    let scorer_cfg = cfg.clone();
+    let scorer_evict_tx = evict_tx.clone();
+    let scorer_shutdown_rx = shutdown_rx.clone();
+    let scorer_snapshot = crate::scorer::snapshot::SnapshotHandle::new();
+    let scorer_handle = tokio::spawn(async move {
+        crate::scorer::run(
+            scorer_store,
+            scorer_client,
+            scorer_cfg,
+            scorer_evict_tx,
+            scorer_shutdown_rx,
+            scorer_snapshot,
+        )
+        .await
+    });
 
     let ingest_cfg = cfg.clone();
     let ingest_writer = writer.clone();
@@ -837,6 +864,7 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
         run_ingest(&ingest_cfg, source, &ingest_writer, &mut hot, shutdown_rx, evict_rx).await
     });
     let result = ingest_handle.await.expect("the run_ingest task should not panic");
+    let scorer_result = scorer_handle.await.expect("the scorer task should not panic");
 
     if let Err(err) = writer.flush().await {
         tracing::warn!(error = %err, "ingest: writer flush failed during shutdown");
@@ -845,7 +873,9 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
         tracing::warn!(error = %err, "ingest: writer shutdown failed");
     }
 
-    result
+    result?;
+    scorer_result?;
+    Ok(())
 }
 
 #[cfg(test)]

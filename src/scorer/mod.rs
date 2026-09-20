@@ -3,19 +3,21 @@
 //! on local counts, verifies the survivors against the App View, promotes
 //! or drops each on verified counts, re-verifies young promoted pairs on
 //! its own timer, expires stale rows, and swaps a freshly ranked and
-//! capped snapshot into a shared `Arc<RwLock<Arc<Vec<FeedItem>>>>`. This
-//! slice adds `select`, `verify_all` (as `verify_step`), the guard call,
+//! capped snapshot into a shared `Arc<RwLock<Arc<Vec<FeedItem>>>>`. Slice
+//! 2.0 added `select`, `verify_all` (as `verify_step`), the guard call,
 //! `promote_or_drop`, `reverify`, `expire_step`, `one_pass` and the task
-//! loop `run`. The snapshot and cap logic, and `dunk run`'s wiring, are
-//! slice 3.0.
+//! loop `run`. This slice adds the snapshot step inside `one_pass`,
+//! `last_scorer_pass`, and `ingest::run`'s wiring (`src/ingest/mod.rs`).
 
-#![allow(dead_code)] // `run` and `one_pass`'s first real caller is slice 3.0's `ingest::run`.
+#![allow(dead_code)] // `GuardResult::Drop` (story 10) and `SnapshotHandle::current` (story 08) have no caller yet.
 
 pub mod guards;
+pub mod snapshot;
 pub mod verify;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -29,6 +31,7 @@ use crate::score::{self, Thresholds, Weights};
 use crate::store::pairs::PairWithCounts;
 use crate::store::{feed, unix_now, Store, StoreError};
 use guards::GuardResult;
+use snapshot::SnapshotHandle;
 use verify::Verdict;
 
 /// Every way the scorer task can fail. `src/ingest/mod.rs` (slice 3.0)
@@ -58,8 +61,7 @@ where
 /// One pass's counters, TECH-DESIGN section 7.2's closing paragraph and
 /// BC37. `dropped` is keyed by `DropReason::as_str()` rather than
 /// `DropReason` itself, so this type needs no `Hash` impl on `DropReason`.
-/// `snapshot_len` stays `0` in this slice: slice 3.0's snapshot step is the
-/// only writer of a real value.
+/// `snapshot_len` is written by `snapshot_step`, the pass's step 7.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PassCounters {
     pub selected: usize,
@@ -338,11 +340,36 @@ async fn expire_step(
     Ok(())
 }
 
-/// One full pass, TECH-DESIGN section 7.2 steps 1 to 6 (step 7, the
-/// snapshot, is slice 3.0). `do_reverify` is the caller's decision, made
-/// against `cfg.reverify_interval_s`'s own timer (BC19); `one_pass` itself
-/// never reads a clock beyond the `now` it is given, so it stays testable
-/// without real time passing.
+/// Step 7, TECH-DESIGN section 7.2 and 7.3: rebuild the ranked, capped
+/// snapshot from the current `feed` rows and swap it in. `snapshot::build`
+/// does every bit of ranking and capping work on plain, owned data before
+/// this function ever touches the lock, so `SnapshotHandle::swap` (BC33)
+/// holds the write lock only for the pointer replacement. `last_scorer_pass`
+/// is written after the swap, matching TECH-DESIGN section 7.2 step 7's
+/// order (BC34).
+async fn snapshot_step(
+    store: &Store,
+    snapshot: &SnapshotHandle,
+    weights: &Weights,
+    now: i64,
+    counters: &mut PassCounters,
+) -> Result<(), ScorerError> {
+    let store_read = store.clone();
+    let rows = blocking(move || store_read.feed_rows()).await?;
+    let items = snapshot::build(rows, weights, now);
+    counters.snapshot_len = items.len();
+    snapshot.swap(Arc::new(items));
+
+    let store_meta = store.clone();
+    let now_str = now.to_string();
+    blocking(move || store_meta.meta_set("last_scorer_pass", &now_str)).await?;
+    Ok(())
+}
+
+/// One full pass, TECH-DESIGN section 7.2 steps 1 to 7. `do_reverify` is
+/// the caller's decision, made against `cfg.reverify_interval_s`'s own
+/// timer (BC19); `one_pass` itself never reads a clock beyond the `now` it
+/// is given, so it stays testable without real time passing.
 pub async fn one_pass<S: PostSource>(
     store: &Store,
     source: &S,
@@ -350,6 +377,7 @@ pub async fn one_pass<S: PostSource>(
     evict_tx: &mpsc::UnboundedSender<Vec<String>>,
     now: i64,
     do_reverify: bool,
+    snapshot: &SnapshotHandle,
 ) -> Result<PassCounters, ScorerError> {
     let start = Instant::now();
     let mut counters = PassCounters::default();
@@ -401,6 +429,9 @@ pub async fn one_pass<S: PostSource>(
     // Step 6: expire.
     expire_step(store, now, cfg, evict_tx, &mut counters).await?;
 
+    // Step 7: snapshot.
+    snapshot_step(store, snapshot, &weights, now, &mut counters).await?;
+
     counters.duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // BC37: one `info` line with every counter.
@@ -434,6 +465,7 @@ pub async fn run<S>(
     cfg: Config,
     evict_tx: mpsc::UnboundedSender<Vec<String>>,
     mut shutdown_rx: watch::Receiver<bool>,
+    snapshot: SnapshotHandle,
 ) -> Result<(), ScorerError>
 where
     S: PostSource + Send + Sync + 'static,
@@ -454,7 +486,7 @@ where
                 if do_reverify {
                     last_reverify = now;
                 }
-                one_pass(&store, &source, &cfg, &evict_tx, now, do_reverify).await?;
+                one_pass(&store, &source, &cfg, &evict_tx, now, do_reverify, &snapshot).await?;
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -685,7 +717,9 @@ mod tests {
         ]);
         let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
 
-        let counters = one_pass(&store, &source, &cfg, &evict_tx, now, false).await.unwrap();
+        let snapshot = SnapshotHandle::new();
+        let counters =
+            one_pass(&store, &source, &cfg, &evict_tx, now, false, &snapshot).await.unwrap();
 
         assert_eq!(counters.promoted, 1);
         let feed_rows = store.feed_rows().unwrap();
@@ -726,7 +760,9 @@ mod tests {
         ]);
         let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
 
-        let counters = one_pass(&store, &source, &cfg, &evict_tx, now, false).await.unwrap();
+        let snapshot = SnapshotHandle::new();
+        let counters =
+            one_pass(&store, &source, &cfg, &evict_tx, now, false, &snapshot).await.unwrap();
 
         assert_eq!(counters.promoted, 0);
         assert!(counters.dropped.is_empty());
@@ -803,7 +839,9 @@ mod tests {
         ]);
         let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
 
-        let counters = one_pass(&store, &source, &cfg, &evict_tx, now, true).await.unwrap();
+        let snapshot = SnapshotHandle::new();
+        let counters =
+            one_pass(&store, &source, &cfg, &evict_tx, now, true, &snapshot).await.unwrap();
 
         assert_eq!(counters.demoted, 1);
         assert!(store.feed_rows().unwrap().is_empty());
@@ -851,7 +889,9 @@ mod tests {
         ]);
         let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
 
-        let counters = one_pass(&store, &source, &cfg, &evict_tx, now, true).await.unwrap();
+        let snapshot = SnapshotHandle::new();
+        let counters =
+            one_pass(&store, &source, &cfg, &evict_tx, now, true, &snapshot).await.unwrap();
 
         assert_eq!(counters.demoted, 0);
         assert_eq!(source.call_count(), 0, "an old promoted pair is never re-verified");
@@ -878,7 +918,9 @@ mod tests {
         let source = FakeSource::new(vec![]);
         let (evict_tx, mut evict_rx) = mpsc::unbounded_channel();
 
-        let counters = one_pass(&store, &source, &cfg, &evict_tx, now, false).await.unwrap();
+        let snapshot = SnapshotHandle::new();
+        let counters =
+            one_pass(&store, &source, &cfg, &evict_tx, now, false, &snapshot).await.unwrap();
 
         assert_eq!(counters.expired, 1);
         let mut evicted = evict_rx.try_recv().unwrap();
@@ -908,7 +950,9 @@ mod tests {
         let source = FakeSource::new(vec![]);
         let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
 
-        let counters = one_pass(&store, &source, &cfg, &evict_tx, now, false).await.unwrap();
+        let snapshot = SnapshotHandle::new();
+        let counters =
+            one_pass(&store, &source, &cfg, &evict_tx, now, false, &snapshot).await.unwrap();
 
         assert_eq!(counters.selected, 0);
         assert_eq!(counters.appview_calls, 0);
@@ -947,7 +991,9 @@ mod tests {
         .failing(&[quote_uri]);
         let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
 
-        let counters = one_pass(&store, &source, &cfg, &evict_tx, now, false).await.unwrap();
+        let snapshot = SnapshotHandle::new();
+        let counters =
+            one_pass(&store, &source, &cfg, &evict_tx, now, false, &snapshot).await.unwrap();
 
         assert_eq!(counters.promoted, 0);
         assert!(counters.dropped.is_empty());
@@ -973,9 +1019,101 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
 
-        let result = run(store, source.clone(), cfg, evict_tx, shutdown_rx).await;
+        let snapshot = SnapshotHandle::new();
+        let result = run(store, source.clone(), cfg, evict_tx, shutdown_rx, snapshot).await;
 
         assert!(result.is_ok());
         assert_eq!(source.call_count(), 0, "no pass ran after shutdown");
+    }
+
+    // AC8, BC33, BC34: the snapshot handle reads empty before the first
+    // pass, holds the freshly built list right after it, and
+    // `last_scorer_pass` is written (after the swap, by construction: it is
+    // the last thing `snapshot_step` does).
+    #[tokio::test]
+    async fn snapshot_swap_is_atomic() {
+        let (store, writer) = test_store_with_writer().await;
+        let cfg = cfg(&[]);
+        let now = 1_700_100_000;
+        let quote_uri = "at://did:plc:quoter/app.bsky.feed.post/q";
+        let original_uri = "at://did:plc:original/app.bsky.feed.post/o";
+        insert_pair_op(
+            &writer,
+            quote_uri,
+            "did:plc:quoter",
+            original_uri,
+            "did:plc:original",
+            now,
+            now - 3600,
+            1,
+        )
+        .await;
+        incr_n(&writer, quote_uri, CountField::Likes, 60, 2).await;
+        writer.flush().await.unwrap();
+
+        let source = FakeSource::new(vec![
+            post(quote_uri, "did:plc:quoter", 60, Some(view_record_embed(original_uri))),
+            post(original_uri, "did:plc:original", 0, None),
+        ]);
+        let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
+        let snapshot = SnapshotHandle::new();
+
+        assert!(snapshot.current().is_empty(), "BC41: empty before the first pass");
+
+        let counters =
+            one_pass(&store, &source, &cfg, &evict_tx, now, false, &snapshot).await.unwrap();
+
+        assert_eq!(counters.snapshot_len, 1);
+        let current = snapshot.current();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].quote_uri, quote_uri);
+        assert_eq!(store.meta_get("last_scorer_pass").unwrap(), Some(now.to_string()));
+    }
+
+    // AC10: a live pass against the real App View promotes the
+    // TECH-DESIGN section 1 reference pair. `#[ignore]`, per `AGENTS.md`:
+    // run by hand with `cargo test -- --ignored scorer_live_pass`. Local
+    // counts are seeded high enough to clear the prefilter on their own;
+    // what actually decides promotion here is the real App View response
+    // fetched through a genuine `AppViewClient`.
+    #[tokio::test]
+    #[ignore]
+    async fn scorer_live_pass() {
+        let (store, writer) = test_store_with_writer().await;
+        let cfg = cfg(&[]);
+        let now = unix_now();
+        let quote_uri = "at://did:plc:o7xt7svg2xtjbb4e2xqahqqc/app.bsky.feed.post/3mvxhe7uuck2n";
+        let original_uri = "at://did:plc:ofzkhjyyh4kl4a35wxgmobmm/app.bsky.feed.post/3mvxb5n76u22b";
+        insert_pair_op(
+            &writer,
+            quote_uri,
+            "did:plc:o7xt7svg2xtjbb4e2xqahqqc",
+            original_uri,
+            "did:plc:ofzkhjyyh4kl4a35wxgmobmm",
+            now - 3600,
+            now,
+            1,
+        )
+        .await;
+        incr_n(&writer, quote_uri, CountField::Likes, 1000, 2).await;
+        writer.flush().await.unwrap();
+
+        let client =
+            AppViewClient::new(&cfg).expect("cfg.appview_rps is validated by config::load");
+        let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
+        let snapshot = SnapshotHandle::new();
+
+        let counters =
+            one_pass(&store, &client, &cfg, &evict_tx, now, false, &snapshot).await.unwrap();
+
+        assert_eq!(counters.promoted, 1, "the reference pair should promote");
+        let rows = store.feed_rows().unwrap();
+        let row =
+            rows.iter().find(|r| r.quote_uri == quote_uri).expect("the reference pair's feed row");
+        assert!(
+            row.v_likes_q > 0 || row.v_reposts_q > 0 || row.v_replies_q > 0,
+            "verified counts must be non-zero"
+        );
+        assert!(row.ratio >= 1.25, "D must clear the M=1.25 margin");
     }
 }
