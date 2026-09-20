@@ -366,11 +366,16 @@ mod tests {
 
     // --- preflight ---------------------------------------------------
 
-    #[test]
-    fn missing_credentials_fails_fast() {
-        // AC1, BC1: no BSKY_HANDLE or BSKY_APP_PASSWORD set at all.
+    #[tokio::test]
+    async fn missing_credentials_fails_fast() {
+        // AC1, BC1: no BSKY_HANDLE or BSKY_APP_PASSWORD set at all. This
+        // goes through `run`, not `preflight`, so it proves the ordering
+        // inside `run` too: the check returns before `HttpPdsClient::new`
+        // is built and before any network is reachable. A `run` that built
+        // its client first would reach `BSKY_PDS_URL` here and fail with a
+        // different variant, or hang for the 10 s timeout.
         let cfg = config_with(&[]);
-        let err = preflight(&cfg, None).unwrap_err();
+        let err = run(&cfg, None).await.unwrap_err();
         match err {
             PublishError::MissingCredentials { var } => assert_eq!(var, "BSKY_HANDLE"),
             other => panic!("expected MissingCredentials, got {other:?}"),
@@ -388,17 +393,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn missing_avatar_fails_fast() {
-        // AC2, BC2: a path that names no file.
+    #[tokio::test]
+    async fn missing_avatar_fails_fast() {
+        // AC2, BC2: a path that names no file. Credentials are present, so
+        // only the avatar check can stop this. It goes through `run`, not
+        // `preflight`, for the same reason as `missing_credentials_fails_fast`:
+        // it proves `run` checks the file before it builds a client.
         let cfg =
             config_with(&[("BSKY_HANDLE", "dunk.bsky.social"), ("BSKY_APP_PASSWORD", "app-pass")]);
         let path = std::env::temp_dir().join("dunk-publish-test-no-such-avatar.png");
         let _ = std::fs::remove_file(&path);
-        let err = preflight(&cfg, Some(&path)).unwrap_err();
+        let err = run(&cfg, Some(&path)).await.unwrap_err();
         match err {
             PublishError::AvatarNotFound { path: got } => assert_eq!(got, path),
             other => panic!("expected AvatarNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_missing_credentials_on_its_own() {
+        // BC1: the same check at the `preflight` level, so a later refactor
+        // that moves the call site still has the unit covered.
+        let cfg = config_with(&[]);
+        match preflight(&cfg, None).unwrap_err() {
+            PublishError::MissingCredentials { var } => assert_eq!(var, "BSKY_HANDLE"),
+            other => panic!("expected MissingCredentials, got {other:?}"),
         }
     }
 
