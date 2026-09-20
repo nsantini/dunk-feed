@@ -370,6 +370,24 @@ impl Store {
         authors::author_put(&conn, row)
     }
 
+    /// Reads the `authors` rows for `dids` on the read connection, skipping
+    /// any DID with no row (BC20). No caller yet; slice 3.0's `check_batch`
+    /// is the first.
+    #[allow(dead_code)]
+    pub fn authors_get_many(&self, dids: &[&str]) -> Result<Vec<authors::AuthorRow>, StoreError> {
+        let conn = self.read_lock()?;
+        authors::authors_get_many(&conn, dids)
+    }
+
+    /// Inserts or replaces every row in `rows` on the write connection,
+    /// inside one transaction (BC19). No caller yet; slice 3.0's
+    /// `check_batch` is the first.
+    #[allow(dead_code)]
+    pub fn authors_put_many(&self, rows: &[authors::AuthorRow]) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        authors::authors_put_many(&conn, rows)
+    }
+
     /// Clears the dirty flag on each row in `rows` only when its counts
     /// still match what the caller read at select time (round 2 finding 2,
     /// BC43, BC44, BC45). A URI with no `counts` row is skipped, not an
@@ -611,6 +629,33 @@ mod tests {
         let store = Store::open_memory().unwrap();
         store.meta_set("zstd_dict_id", "abc123").unwrap();
         assert_eq!(store.meta_get("zstd_dict_id").unwrap(), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn authors_put_many_then_authors_get_many_reads_through_the_store() {
+        let store = Store::open_memory().unwrap();
+        let rows = vec![
+            authors::AuthorRow {
+                did: "did:plc:a".to_string(),
+                followers: Some(10),
+                active: true,
+                labels: None,
+                checked_at: 1_700_000_000,
+            },
+            authors::AuthorRow {
+                did: "did:plc:b".to_string(),
+                followers: None,
+                active: false,
+                labels: Some(vec!["spam".to_string()]),
+                checked_at: 1_700_000_000,
+            },
+        ];
+        store.authors_put_many(&rows).unwrap();
+
+        let mut got =
+            store.authors_get_many(&["did:plc:a", "did:plc:b", "did:plc:missing"]).unwrap();
+        got.sort_by(|a, b| a.did.cmp(&b.did));
+        assert_eq!(got, rows);
     }
 
     #[test]
