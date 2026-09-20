@@ -21,6 +21,11 @@ pub struct FeedItem {
     pub quote_uri: String,
     pub quote_cid: String,
     pub rank: f64,
+    /// `D`, the dunk ratio `recompute_ranks` computed for this row on the
+    /// same pass, not `FeedRow.ratio` (the promotion-time record, left
+    /// untouched). `getFeedSkeleton`'s `feedContext` (story 08, BC24) reads
+    /// this field.
+    pub ratio: f64,
 }
 
 /// The shared snapshot pointer. Cloning `SnapshotHandle` clones the `Arc`
@@ -73,7 +78,19 @@ impl Default for SnapshotHandle {
 /// function feeds `score::rank`. `age_hours` uses the current age. A
 /// `quoted_at` in the future clamps `age_hours` at `0.0` rather than handing
 /// `score::rank` a negative age (BC27).
-fn recompute_ranks(rows: &mut [FeedRow], weights: &Weights, now: i64, k: f64) {
+///
+/// Also returns the recomputed `D` for every row, keyed by `quote_cid`
+/// (unique per row), so `push_kept` can fill `FeedItem.ratio` (story 08,
+/// BC24) without re-deriving `D` from counts the snapshot does not carry.
+/// A `HashMap` survives the `sort_by_rank` and both caps that reorder and
+/// drop rows after this function returns.
+fn recompute_ranks(
+    rows: &mut [FeedRow],
+    weights: &Weights,
+    now: i64,
+    k: f64,
+) -> HashMap<String, f64> {
+    let mut ratios = HashMap::with_capacity(rows.len());
     for row in rows.iter_mut() {
         let counts_q = Counts {
             likes: row.v_likes_q.max(0) as u32,
@@ -90,7 +107,9 @@ fn recompute_ranks(rows: &mut [FeedRow], weights: &Weights, now: i64, k: f64) {
         let d = score::ratio(eq, eo, k);
         let age_hours = ((now - row.quoted_at) as f64 / 3600.0).max(0.0);
         row.rank = score::rank(d, eq, age_hours);
+        ratios.insert(row.quote_cid.clone(), d);
     }
+    ratios
 }
 
 /// `rank DESC, quote_cid ASC` (BC26), the same tie rule `Store::feed_rows`
@@ -131,6 +150,7 @@ fn push_kept(
     window_queue: &mut VecDeque<String>,
     window_counts: &mut HashMap<String, usize>,
     window: usize,
+    ratios: &HashMap<String, f64>,
 ) {
     window_queue.push_back(row.quote_did.clone());
     *window_counts.entry(row.quote_did.clone()).or_insert(0) += 1;
@@ -144,7 +164,16 @@ fn push_kept(
             }
         }
     }
-    output.push(FeedItem { quote_uri: row.quote_uri, quote_cid: row.quote_cid, rank: row.rank });
+    // `ratios` is keyed by every row `recompute_ranks` saw this pass, so a
+    // row reaching `push_kept` always has an entry; `unwrap_or(0.0)` is
+    // defence in depth only, never expected to fire.
+    let ratio = ratios.get(&row.quote_cid).copied().unwrap_or(0.0);
+    output.push(FeedItem {
+        quote_uri: row.quote_uri,
+        quote_cid: row.quote_cid,
+        rank: row.rank,
+        ratio,
+    });
 }
 
 /// Cap 2: one item per quoting DID per 50 items (BC29 to BC32). The window
@@ -165,7 +194,10 @@ fn push_kept(
 /// entry per deferred row, in the order it was deferred — so the row
 /// actually released at each step, and the whole output order, are
 /// identical to the previous scan-based version.
-fn apply_cap_one_per_quoter_per_50(rows: Vec<FeedRow>) -> Vec<FeedItem> {
+fn apply_cap_one_per_quoter_per_50(
+    rows: Vec<FeedRow>,
+    ratios: &HashMap<String, f64>,
+) -> Vec<FeedItem> {
     const WINDOW: usize = 49;
     let mut window_queue: VecDeque<String> = VecDeque::with_capacity(WINDOW);
     let mut window_counts: HashMap<String, usize> = HashMap::new();
@@ -186,7 +218,7 @@ fn apply_cap_one_per_quoter_per_50(rows: Vec<FeedRow>) -> Vec<FeedItem> {
             if bucket.is_empty() {
                 deferred.remove(&did);
             }
-            push_kept(row, &mut output, &mut window_queue, &mut window_counts, WINDOW);
+            push_kept(row, &mut output, &mut window_queue, &mut window_counts, WINDOW, ratios);
             continue;
         }
 
@@ -194,7 +226,7 @@ fn apply_cap_one_per_quoter_per_50(rows: Vec<FeedRow>) -> Vec<FeedItem> {
             let row = rows[main_idx].clone();
             main_idx += 1;
             if is_legal(&row.quote_did, &window_counts) {
-                push_kept(row, &mut output, &mut window_queue, &mut window_counts, WINDOW);
+                push_kept(row, &mut output, &mut window_queue, &mut window_counts, WINDOW, ratios);
             } else {
                 let did = row.quote_did.clone();
                 deferred.entry(did.clone()).or_default().push_back(row);
@@ -215,10 +247,10 @@ fn apply_cap_one_per_quoter_per_50(rows: Vec<FeedRow>) -> Vec<FeedItem> {
 /// the `SnapshotHandle`'s lock (BC33). `k` reaches here from `Config`
 /// (round 2 finding 7, BC50), never a literal.
 pub fn build(mut rows: Vec<FeedRow>, weights: &Weights, now: i64, k: f64) -> Vec<FeedItem> {
-    recompute_ranks(&mut rows, weights, now, k);
+    let ratios = recompute_ranks(&mut rows, weights, now, k);
     sort_by_rank(&mut rows);
     let capped_by_author = apply_cap_one_per_author_per_day(rows);
-    apply_cap_one_per_quoter_per_50(capped_by_author)
+    apply_cap_one_per_quoter_per_50(capped_by_author, &ratios)
 }
 
 #[cfg(test)]
@@ -270,6 +302,7 @@ mod tests {
             quote_uri: "at://did:plc:q/app.bsky.feed.post/q".to_string(),
             quote_cid: "cid-q".to_string(),
             rank: 1.0,
+            ratio: 4.0,
         }];
         handle.swap(Arc::new(items.clone()));
         assert_eq!(*handle.current(), items);
@@ -311,6 +344,23 @@ mod tests {
         let expected_rank = score::rank(4.0, 100.0, 0.0);
         assert_eq!(rows[0].rank, expected_rank);
         assert_eq!(rows[0].ratio, 999.0, "ratio itself is left untouched");
+    }
+
+    // BC24: `build`'s output `FeedItem.ratio` is the `D` this pass
+    // recomputed from the row's counts, not the stale stored `FeedRow.ratio`.
+    #[test]
+    fn build_sets_feed_item_ratio_from_recomputed_d_not_stored_ratio() {
+        let now = 1_700_000_000;
+        let mut r = row("at://did:plc:q/app.bsky.feed.post/q", "did:plc:q", "did:plc:o", now, 0.0);
+        r.ratio = 999.0; // Stale; `FeedItem.ratio` must not come from here.
+        r.v_likes_q = 100;
+        r.v_likes_o = 20;
+
+        let items = build(vec![r], &weights(), now, 5.0);
+
+        // D = eq / (eo + k) = 100 / (20 + 5) = 4.0.
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].ratio, 4.0);
     }
 
     // AC6, BC28: two items sharing (original_did, UTC day) keep only the
@@ -415,7 +465,7 @@ mod tests {
             1.0,
         ));
 
-        let kept = apply_cap_one_per_quoter_per_50(rows);
+        let kept = apply_cap_one_per_quoter_per_50(rows, &HashMap::new());
 
         assert_eq!(kept.len(), 6, "the still-blocked row is dropped, the other 6 rows are kept");
         assert!(!kept
@@ -474,7 +524,7 @@ mod tests {
             -100.0,
         ));
 
-        let kept = apply_cap_one_per_quoter_per_50(rows);
+        let kept = apply_cap_one_per_quoter_per_50(rows, &HashMap::new());
 
         let uris: Vec<&str> = kept.iter().map(|item| item.quote_uri.as_str()).collect();
         assert_eq!(uris.len(), 52, "every row is eventually kept, none dropped");
@@ -520,7 +570,7 @@ mod tests {
             1.0,
         ));
 
-        let kept = apply_cap_one_per_quoter_per_50(rows);
+        let kept = apply_cap_one_per_quoter_per_50(rows, &HashMap::new());
 
         assert_eq!(kept.len(), 51);
         assert_eq!(kept.last().unwrap().quote_uri, "at://did:plc:q/app.bsky.feed.post/50th");
@@ -563,7 +613,7 @@ mod tests {
             ));
         }
 
-        let kept = apply_cap_one_per_quoter_per_50(rows);
+        let kept = apply_cap_one_per_quoter_per_50(rows, &HashMap::new());
 
         let uris: Vec<&str> = kept.iter().map(|item| item.quote_uri.as_str()).collect();
         let first_idx =

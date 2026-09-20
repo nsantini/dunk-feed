@@ -63,6 +63,9 @@ pub struct Config {
     pub log: String,
     pub bsky_handle: Option<String>,
     pub bsky_app_password: Option<Secret>,
+    /// `/healthz`'s lag threshold, in seconds (story 08, BC27): past this
+    /// age on either `HealthState` atomic, `/healthz` returns 503.
+    pub health_max_lag_s: u32,
 }
 
 /// Reads a required string variable. `Missing` if unset, and also `Missing`
@@ -307,6 +310,7 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         log: log_filter_or_default(&lookup, "DUNK_LOG", "info")?,
         bsky_handle: optional(&lookup, "BSKY_HANDLE"),
         bsky_app_password: optional(&lookup, "BSKY_APP_PASSWORD").map(Secret),
+        health_max_lag_s: positive_u32_or_default(&lookup, "DUNK_HEALTH_MAX_LAG_S", 300)?,
     })
 }
 
@@ -410,6 +414,7 @@ mod tests {
         assert_eq!(config.prefilter_fraction, 0.5);
         assert_eq!(config.appview_rps, 1.0);
         assert_eq!(config.log, "info");
+        assert_eq!(config.health_max_lag_s, 300);
         assert_eq!(
             config.drop_labels,
             vec!["porn", "sexual", "graphic-media", "nudity", "!hide", "!warn", "spam"]
@@ -639,6 +644,54 @@ mod tests {
                 other => panic!("expected Invalid for {bad}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn zero_health_max_lag_is_invalid() {
+        // BC27: DUNK_HEALTH_MAX_LAG_S rejects zero, same as the other
+        // positive_u32_or_default fields.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_HEALTH_MAX_LAG_S", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "DUNK_HEALTH_MAX_LAG_S");
+                assert_eq!(reason, "must be greater than zero");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_health_max_lag_is_invalid() {
+        // BC27: empty is malformed, not the default.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_HEALTH_MAX_LAG_S", ""));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_HEALTH_MAX_LAG_S"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_numeric_health_max_lag_is_invalid() {
+        // BC27.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_HEALTH_MAX_LAG_S", "soon"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_HEALTH_MAX_LAG_S"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_health_max_lag_is_read() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_HEALTH_MAX_LAG_S", "120"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.health_max_lag_s, 120);
     }
 
     #[test]
