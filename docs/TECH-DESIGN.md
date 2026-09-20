@@ -20,6 +20,22 @@ lists the deviation and the reason. Numbers come from
 | Serving path | Reads an in-memory snapshot, never SQLite | p99 under 300 ms is a product constraint |
 | Truth | App View counts promote a pair. Local counts only pick candidates | PRD rule, kept |
 
+**What the feed is, in one line (Nico, 2026-09-21).** Quote posts that got more
+engagement than the post they quoted. Tone is not a criterion. A quote that
+agrees, extends or reframes the original counts exactly as much as one that
+mocks it. The PRD's words "dunk", "victim" and "funny" are shorthand for the
+engagement rule, not extra filters, and no story adds a tone or sentiment
+check. Reference pair, counts read from the App View on 2026-09-21:
+
+| Side | Post | likes | reposts | replies | `E` |
+|---|---|---|---|---|---|
+| `Q` | `at://did:plc:o7xt7svg2xtjbb4e2xqahqqc/app.bsky.feed.post/3mvxhe7uuck2n` ([bsky.app](https://bsky.app/profile/spavel.bsky.social/post/3mvxhe7uuck2n)) | 513 | 99 | 6 | 714 |
+| `O` | `at://did:plc:ofzkhjyyh4kl4a35wxgmobmm/app.bsky.feed.post/3mvxb5n76u22b` | 125 | 17 | 2 | 160 |
+
+`D = 714 / (160 + 5) = 4.33`, both sides clear `P = 50`, so the pair
+qualifies under the defaults. Story 07's live test and its recorded
+`getposts_normal_quote.json` fixture use this pair.
+
 **Rust versus Go, in full.** Both languages handle 400 events per second at under
 10% of one core. Go has `bluesky-social/jetstream` Go packages and `indigo`,
 which are first-party and current. The Rust Jetstream crates are thin:
@@ -492,6 +508,7 @@ Prints the feed URL. Never runs inside `dunk run`.
 | D7 | Feed retention 7 d | 30 d | Agreed 2026-09-18 |
 | D8 | "Non-post embed check discards a meaningful slice" | Kept for correctness | It is 0.3% of quotes |
 | D9 | `age_hours` cap 48 h | Counts freeze at 48 h, rank keeps decaying to 30 d | Otherwise 30-day items would never leave the top |
+| D10 | Phase 0 asks whether the feed is "funny"; the original's author is the "victim" | Tone is not a criterion. Phase 0 is judged on out-engagement alone; no sentiment or keyword filter is built | Nico, 2026-09-21: the product is quote posts that out-engaged their original, whatever their tone. Section 1 has the reference pair. Section 9 guards stay, they are about safety |
 
 ## 13. Operations
 
@@ -538,9 +555,11 @@ PRD's phases with phase 0 first, as the PRD insists.
 | 11 | Docker, Compose, Cloudflare, runbook | 2 | 08 |
 | 12 | `dunk dump` and tuning notes | 4 | 07 |
 
-**Stop after 03 and read the output.** If the top 30 are not funny, change the
-score before writing the pipeline. That is the PRD's kill point and it costs one
-afternoon.
+**Stop after 03 and read the output.** If the top 30 are not quote posts that
+clearly out-engaged their original, change the score before writing the
+pipeline. That is the PRD's kill point and it costs one afternoon. Whether they
+are funny is not the test (section 1, product intent). Done 2026-09-18: the
+top pairs were all real out-engagements, so the score stood.
 
 ## 16. Open questions
 
@@ -551,6 +570,9 @@ one env var or one line.
 2. `DUNK_DROP_LABELS` default list. Section 9.
 3. Whether the feed should also require `E(O) >= P_O` for a separate, lower
    floor on the original, so the feed is not only "small post, big quote".
-   Traffic-analysis §6 finding 3. Decide after story 03.
+   Traffic-analysis §6 finding 3. Under the product intent in section 1 a
+   quote of a zero-engagement post does qualify, so the default stays "no
+   floor on `O`". Revisit with `dunk dump` output in story 12 if the feed
+   reads as noise.
 4. Cloudflare Tunnel or proxied DNS. Both work with the same container. Story 11
    ships both compose variants.

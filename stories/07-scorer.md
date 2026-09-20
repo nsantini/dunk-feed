@@ -41,7 +41,7 @@ fills with stale items nor ages 30-day items out overnight.
 | `src/scorer/verify.rs` | Turns App View views into a `VerifiedPair` or a drop reason |
 | `src/scorer/guards.rs` | Pass-through stub; real guards ship in story 10 |
 | `src/scorer/snapshot.rs` | Ranked `Vec<FeedItem>`, page-cap ordering |
-| `tests/fixtures/getposts_view{detached,blocked,notfound}.json`, `getposts_normal_quote.json` | Recorded `getPosts` bodies for the §8.2 embed-view table |
+| `tests/fixtures/getposts_view{detached,blocked,notfound}.json`, `getposts_normal_quote.json` | Recorded `getPosts` bodies for the §8.2 embed-view table. `getposts_view_*` already exist from story 02. Record `getposts_normal_quote.json` live from the reference pair in TECH-DESIGN §1 before slice 1.0 |
 
 ## Behaviour contracts
 
@@ -80,7 +80,7 @@ fills with stale items nor ages 30-day items out overnight.
 - [ ] AC7 — Cap 2 defers and drops at the 50-item boundary. Checked by: `cargo test scorer::snapshot::tests::cap_one_per_quoter_per_50`
 - [ ] AC8 — The snapshot swap is atomic. Checked by: `cargo test scorer::tests::snapshot_swap_is_atomic`
 - [ ] AC9 — All four gates pass.
-- [ ] AC10 — A live pass promotes at least one known pair. Checked by: run by hand: `cargo test -- --ignored scorer_live_pass`
+- [ ] AC10 — A live pass promotes at least one known pair. Checked by: run by hand: `cargo test -- --ignored scorer_live_pass`, seeded with the reference pair in TECH-DESIGN §1 (`Q` = `at://did:plc:o7xt7svg2xtjbb4e2xqahqqc/app.bsky.feed.post/3mvxhe7uuck2n`, `O` = `at://did:plc:ofzkhjyyh4kl4a35wxgmobmm/app.bsky.feed.post/3mvxb5n76u22b`)
 
 ## Defaults taken
 

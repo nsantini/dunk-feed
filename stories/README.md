@@ -23,8 +23,10 @@ phase 0 first.
 | 12 | [`dunk dump` and tuning notes](12-dump-and-tuning.md) | 4 | 07 |
 
 **Stop after story 03 and read the output.** TECH-DESIGN §15's kill point:
-if the top 30 pairs from `dunk validate` are not funny, change the score
-before writing the ingest pipeline. That check costs one afternoon.
+if the top 30 pairs from `dunk validate` are not quote posts that clearly
+out-engaged their original, change the score before writing the ingest
+pipeline. Tone does not matter (TECH-DESIGN §1, D10). Done 2026-09-18, the
+score stood.
 
 Run stories in number order. A story only starts once every story in its
 `Follows` list is merged, because it reads or extends files those stories
