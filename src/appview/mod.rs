@@ -23,8 +23,25 @@ use types::{
     ProfileView,
 };
 
-/// The HTTP timeout every request carries, TECH-DESIGN section 8.1.
+/// The HTTP timeout every request carries, TECH-DESIGN section 8.1. It
+/// applies to `dunk publish`'s writes against the PDS too, through
+/// [`http_client`], so one edit moves the whole binary's outbound budget.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The one outbound `reqwest::Client` builder in the binary. `AppViewClient`
+/// and `publish::HttpPdsClient` both call it, so rustls (by Cargo feature)
+/// and [`REQUEST_TIMEOUT`] are stated once instead of copied. It lives here
+/// rather than in a new `src/http_client.rs` because `src/http/` is already
+/// the inbound axum server, and a second module one letter away from it
+/// reads as a typo; AGENTS.md also already names `publish` a caller of
+/// `appview/`. Panics only if `reqwest` cannot build a client with a
+/// timeout and nothing else, which it always can.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("reqwest::Client::builder with only a timeout never fails to build")
+}
 
 /// An App View call that did not produce a usable result: every attempt
 /// failed, or the body did not decode. The caller never sees a partial map
@@ -153,11 +170,7 @@ impl AppViewClient {
         let period = Duration::from_secs_f64(1.0 / rps);
         let mut interval = time::interval(period);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("reqwest::Client::builder with only a timeout never fails to build");
-        Ok(Self { base_url, http, limiter: Mutex::new(interval) })
+        Ok(Self { base_url, http: http_client(), limiter: Mutex::new(interval) })
     }
 
     /// Waits for the rate limiter's next tick before a request goes out.

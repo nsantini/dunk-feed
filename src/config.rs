@@ -24,6 +24,13 @@ pub enum ConfigError {
 pub struct Secret(String);
 
 impl Secret {
+    /// Wraps a value read from somewhere other than `load`. `dunk publish`
+    /// carries the session's `accessJwt` in one of these, so a token never
+    /// sits in a plain `String` that a `Debug` line could print.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
     /// Returns the plain value. Use only when building the request that needs it.
     pub fn expose(&self) -> &str {
         &self.0

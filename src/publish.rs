@@ -15,13 +15,13 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::config::Config;
+use crate::appview::http_client;
+use crate::config::{Config, Secret};
 
 /// The PDS every session, upload and record write goes against. A constant,
 /// not `cfg.appview_url`, matching TECH-DESIGN section 11.2: publishing is a
@@ -37,11 +37,6 @@ pub const DISPLAY_NAME: &str = "Out-Quoted";
 /// tone, sentiment or keyword wording (TECH-DESIGN D10).
 pub const DESCRIPTION: &str = "Quote posts that got more engagement than the post they quoted.";
 
-/// The HTTP timeout every request carries, matching
-/// `AppViewClient::with_base_url` (TECH-DESIGN section 8.1's budget applies
-/// here too, BC10).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Every way `dunk publish` can fail. `main.rs` prints this and exits 1. No
 /// variant carries `accessJwt` or `BSKY_APP_PASSWORD` (BC11): `Auth`,
 /// `Upload` and `PutRecord` carry only the server's own status and body
@@ -54,6 +49,12 @@ pub enum PublishError {
     AvatarNotFound { path: PathBuf },
     #[error("avatar file {path} has an unsupported extension; expected png, jpg or jpeg")]
     AvatarType { path: PathBuf },
+    #[error("avatar file {path} could not be read: {source}")]
+    AvatarRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("createSession failed, status {status}: {body}")]
     Auth { status: u16, body: String },
     #[error(
@@ -68,13 +69,15 @@ pub enum PublishError {
     Transport(#[from] reqwest::Error),
 }
 
-/// The two credentials `preflight` reads, plain strings once past the check:
-/// nothing downstream of `preflight` reads `BSKY_HANDLE` or
-/// `BSKY_APP_PASSWORD` from `Config` again.
+/// The two credentials `preflight` reads: nothing downstream of `preflight`
+/// reads `BSKY_HANDLE` or `BSKY_APP_PASSWORD` from `Config` again. The
+/// password stays inside a [`Secret`], so the derived `Debug` on this struct
+/// prints `[redacted]` for it; it is exposed at one place only, the
+/// `createSession` request body (BC11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
     pub handle: String,
-    pub app_password: String,
+    pub app_password: Secret,
 }
 
 /// An avatar file read off disk during preflight, with the `Content-Type`
@@ -87,13 +90,17 @@ pub struct Avatar {
 
 /// Reads `BSKY_HANDLE` and `BSKY_APP_PASSWORD` off `cfg`, then `avatar_path`
 /// off disk, before any `reqwest::Client` is built. `BSKY_HANDLE` or
-/// `BSKY_APP_PASSWORD` missing or empty after trim fails first
-/// (`MissingCredentials`, BC1); trimming happens in `config::load` already,
-/// so a value present here is never empty. A given `--avatar` path that does
-/// not exist fails with `AvatarNotFound` (BC2); an extension other than
-/// `png`, `jpg` or `jpeg`, compared lowercased, fails with `AvatarType`
-/// (BC4). No `--avatar` at all returns `Ok((credentials, None))` and reads no
-/// file (BC3).
+/// `BSKY_APP_PASSWORD` missing, or empty once trimmed, fails first
+/// (`MissingCredentials`, BC1). The trim here is the only guard:
+/// `config::required` trims, but `config::optional` is a bare `lookup(name)`
+/// and both `BSKY_*` variables come through `optional`, so
+/// `BSKY_APP_PASSWORD="   "` reaches this function as `Some("   ")` (BC18).
+/// A given `--avatar` path that does not exist fails with `AvatarNotFound`
+/// (BC2); an extension other than `png`, `jpg` or `jpeg`, compared
+/// lowercased, fails with `AvatarType` (BC4); a file that exists but cannot
+/// be read fails with `AvatarRead`, carrying the OS error (BC19). No
+/// `--avatar` at all returns `Ok((credentials, None))` and reads no file
+/// (BC3).
 pub fn preflight(
     cfg: &Config,
     avatar_path: Option<&Path>,
@@ -107,9 +114,8 @@ pub fn preflight(
     let app_password = cfg
         .bsky_app_password
         .as_ref()
-        .map(crate::config::Secret::expose)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
+        .filter(|value| !value.expose().trim().is_empty())
+        .cloned()
         .ok_or(PublishError::MissingCredentials { var: "BSKY_APP_PASSWORD" })?;
     let credentials = Credentials { handle, app_password };
 
@@ -130,7 +136,7 @@ pub fn preflight(
                 _ => return Err(PublishError::AvatarType { path: path.to_path_buf() }),
             };
             let bytes = std::fs::read(path)
-                .map_err(|_err| PublishError::AvatarNotFound { path: path.to_path_buf() })?;
+                .map_err(|source| PublishError::AvatarRead { path: path.to_path_buf(), source })?;
             Some(Avatar { bytes, content_type })
         }
     };
@@ -167,11 +173,55 @@ pub fn record_body(
     })
 }
 
-/// One `createSession` response, the fields `publish_with` needs.
+/// One `createSession` response, the fields `publish_with` needs. The
+/// `accessJwt` stays inside a [`Secret`], so the derived `Debug` prints
+/// `[redacted]` for it and no log or panic message can carry a live token
+/// (BC11). It is exposed at two places only: the `Authorization` header on
+/// `uploadBlob` and the one on `putRecord`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub did: String,
-    pub access_jwt: String,
+    pub access_jwt: Secret,
+}
+
+/// One `uploadBlob` response, before [`validate_blob`] has looked at it: the
+/// HTTP status the PDS answered with, and the decoded JSON body. The trait
+/// hands both back rather than the blob itself, so the shape check is a pure
+/// function `publish_with` runs and a fake can exercise (BC17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadResponse {
+    pub status: u16,
+    pub body: Value,
+}
+
+/// Checks that `uploadBlob` really returned a blob before it is written into
+/// a record (BC17). `createSession` already refuses a 2xx whose body carries
+/// no `did` or no `accessJwt`; this is the same check one call later. A
+/// `blob` that is absent, is not an object, or is missing `$type == "blob"`,
+/// `ref`, `mimeType` or `size` becomes `PublishError::Upload` naming the
+/// field at fault, so a malformed upload fails here instead of writing a
+/// record whose `avatar` the Bluesky app cannot render.
+pub fn validate_blob(response: &UploadResponse) -> Result<Value, PublishError> {
+    let fail = |reason: &str| PublishError::Upload {
+        status: response.status,
+        body: format!("uploadBlob returned a 2xx body that is not a blob: {reason}"),
+    };
+
+    let blob = response.body.get("blob").ok_or_else(|| fail("no `blob` field"))?;
+    let object = blob.as_object().ok_or_else(|| fail("`blob` is not an object"))?;
+
+    match object.get("$type").and_then(Value::as_str) {
+        Some("blob") => {}
+        Some(other) => return Err(fail(&format!("`blob.$type` is {other:?}, expected \"blob\""))),
+        None => return Err(fail("`blob` has no `$type` field")),
+    }
+    for field in ["ref", "mimeType", "size"] {
+        if !object.contains_key(field) {
+            return Err(fail(&format!("`blob` has no `{field}` field")));
+        }
+    }
+
+    Ok(blob.clone())
 }
 
 /// The PDS surface `dunk publish` needs: session creation, blob upload and
@@ -184,18 +234,22 @@ pub trait PdsClient {
     fn create_session(
         &self,
         handle: &str,
-        app_password: &str,
+        app_password: &Secret,
     ) -> impl Future<Output = Result<Session, PublishError>> + Send;
 
+    /// Returns the status and the decoded body, not the blob. The shape
+    /// check is [`validate_blob`], which `publish_with` runs, so a fake can
+    /// return a 2xx body with no `blob` and the test still exercises the
+    /// real check (BC17).
     fn upload_blob(
         &self,
-        access_jwt: &str,
+        access_jwt: &Secret,
         avatar: &Avatar,
-    ) -> impl Future<Output = Result<Value, PublishError>> + Send;
+    ) -> impl Future<Output = Result<UploadResponse, PublishError>> + Send;
 
     fn put_record(
         &self,
-        access_jwt: &str,
+        access_jwt: &Secret,
         body: &Value,
     ) -> impl Future<Output = Result<(), PublishError>> + Send;
 }
@@ -219,11 +273,7 @@ impl HttpPdsClient {
     /// `new`'s body, taking the base URL directly so tests can point the
     /// client at an unreachable address without touching [`BSKY_PDS_URL`].
     fn with_base_url(base_url: String) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("reqwest::Client::builder with only a timeout never fails to build");
-        Self { base_url, http }
+        Self { base_url, http: http_client() }
     }
 }
 
@@ -237,13 +287,13 @@ impl PdsClient for HttpPdsClient {
     async fn create_session(
         &self,
         handle: &str,
-        app_password: &str,
+        app_password: &Secret,
     ) -> Result<Session, PublishError> {
         let url = format!("{}/xrpc/com.atproto.server.createSession", self.base_url);
         let response = self
             .http
             .post(&url)
-            .json(&json!({ "identifier": handle, "password": app_password }))
+            .json(&json!({ "identifier": handle, "password": app_password.expose() }))
             .send()
             .await?;
         let status = response.status();
@@ -258,22 +308,27 @@ impl PdsClient for HttpPdsClient {
                 body: "createSession response carried no did".to_string(),
             }
         })?;
-        let access_jwt =
-            body.get("accessJwt").and_then(Value::as_str).map(str::to_string).ok_or_else(|| {
-                PublishError::Auth {
-                    status: status.as_u16(),
-                    body: "createSession response carried no accessJwt".to_string(),
-                }
+        let access_jwt = body
+            .get("accessJwt")
+            .and_then(Value::as_str)
+            .map(|value| Secret::new(value.to_string()))
+            .ok_or_else(|| PublishError::Auth {
+                status: status.as_u16(),
+                body: "createSession response carried no accessJwt".to_string(),
             })?;
         Ok(Session { did, access_jwt })
     }
 
-    async fn upload_blob(&self, access_jwt: &str, avatar: &Avatar) -> Result<Value, PublishError> {
+    async fn upload_blob(
+        &self,
+        access_jwt: &Secret,
+        avatar: &Avatar,
+    ) -> Result<UploadResponse, PublishError> {
         let url = format!("{}/xrpc/com.atproto.repo.uploadBlob", self.base_url);
         let response = self
             .http
             .post(&url)
-            .bearer_auth(access_jwt)
+            .bearer_auth(access_jwt.expose())
             .header(reqwest::header::CONTENT_TYPE, avatar.content_type)
             .body(avatar.bytes.clone())
             .send()
@@ -284,12 +339,13 @@ impl PdsClient for HttpPdsClient {
             return Err(PublishError::Upload { status: status.as_u16(), body });
         }
         let body: Value = response.json().await?;
-        Ok(body["blob"].clone())
+        Ok(UploadResponse { status: status.as_u16(), body })
     }
 
-    async fn put_record(&self, access_jwt: &str, body: &Value) -> Result<(), PublishError> {
+    async fn put_record(&self, access_jwt: &Secret, body: &Value) -> Result<(), PublishError> {
         let url = format!("{}/xrpc/com.atproto.repo.putRecord", self.base_url);
-        let response = self.http.post(&url).bearer_auth(access_jwt).json(body).send().await?;
+        let response =
+            self.http.post(&url).bearer_auth(access_jwt.expose()).json(body).send().await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -322,7 +378,10 @@ pub async fn publish_with(
 
     let blob = match avatar {
         None => None,
-        Some(avatar) => Some(client.upload_blob(&session.access_jwt, avatar).await?),
+        Some(avatar) => {
+            let response = client.upload_blob(&session.access_jwt, avatar).await?;
+            Some(validate_blob(&response)?)
+        }
     };
 
     let body = record_body(cfg, &session.did, blob, Utc::now());
@@ -361,7 +420,21 @@ mod tests {
     }
 
     fn creds() -> Credentials {
-        Credentials { handle: "dunk.bsky.social".to_string(), app_password: "app-pass".to_string() }
+        Credentials {
+            handle: "dunk.bsky.social".to_string(),
+            app_password: Secret::new("app-pass".to_string()),
+        }
+    }
+
+    /// A well-formed `uploadBlob` blob: every field [`validate_blob`] insists
+    /// on.
+    fn good_blob() -> Value {
+        json!({
+            "$type": "blob",
+            "ref": {"$link": "bafyreiexample"},
+            "mimeType": "image/png",
+            "size": 1234,
+        })
     }
 
     // --- preflight ---------------------------------------------------
@@ -502,7 +575,7 @@ mod tests {
     /// assert a later call in the sequence never ran (BC6, BC7, BC8).
     struct FakePds {
         session: Result<Session, PublishError>,
-        upload: Result<Value, PublishError>,
+        upload: Result<UploadResponse, PublishError>,
         put_result: Result<(), PublishError>,
         create_session_calls: AtomicUsize,
         upload_blob_calls: AtomicUsize,
@@ -515,9 +588,9 @@ mod tests {
             Self {
                 session: Ok(Session {
                     did: session_did.to_string(),
-                    access_jwt: "access-jwt".to_string(),
+                    access_jwt: Secret::new("access-jwt".to_string()),
                 }),
-                upload: Ok(json!({"$type": "blob"})),
+                upload: Ok(UploadResponse { status: 200, body: json!({ "blob": good_blob() }) }),
                 put_result: Ok(()),
                 create_session_calls: AtomicUsize::new(0),
                 upload_blob_calls: AtomicUsize::new(0),
@@ -531,7 +604,7 @@ mod tests {
         async fn create_session(
             &self,
             _handle: &str,
-            _app_password: &str,
+            _app_password: &Secret,
         ) -> Result<Session, PublishError> {
             self.create_session_calls.fetch_add(1, AtomicOrdering::SeqCst);
             match &self.session {
@@ -545,9 +618,9 @@ mod tests {
 
         async fn upload_blob(
             &self,
-            _access_jwt: &str,
+            _access_jwt: &Secret,
             _avatar: &Avatar,
-        ) -> Result<Value, PublishError> {
+        ) -> Result<UploadResponse, PublishError> {
             self.upload_blob_calls.fetch_add(1, AtomicOrdering::SeqCst);
             match &self.upload {
                 Ok(value) => Ok(value.clone()),
@@ -558,7 +631,7 @@ mod tests {
             }
         }
 
-        async fn put_record(&self, _access_jwt: &str, body: &Value) -> Result<(), PublishError> {
+        async fn put_record(&self, _access_jwt: &Secret, body: &Value) -> Result<(), PublishError> {
             self.put_record_calls.fetch_add(1, AtomicOrdering::SeqCst);
             *self.last_put_body.lock().expect("lock") = Some(body.clone());
             match &self.put_result {
@@ -654,7 +727,74 @@ mod tests {
         publish_with(&client, &cfg, &creds(), Some(&avatar)).await.expect("publish succeeds");
         assert_eq!(client.upload_blob_calls.load(AtomicOrdering::SeqCst), 1);
         let body = client.last_put_body.lock().expect("lock").clone().expect("body recorded");
-        assert_eq!(body["record"]["avatar"], json!({"$type": "blob"}));
+        assert_eq!(body["record"]["avatar"], good_blob());
+    }
+
+    #[tokio::test]
+    async fn upload_blob_without_a_blob_field_fails_before_put_record() {
+        // BC17: a 2xx uploadBlob body that carries no `blob` never reaches a
+        // record. The fake answers 200 with an unrelated object, so only
+        // `validate_blob` can stop this.
+        let cfg = config_with(&[]);
+        let mut client = FakePds::ok("did:plc:abc");
+        client.upload = Ok(UploadResponse { status: 200, body: json!({ "ok": true }) });
+        let avatar = Avatar { bytes: vec![1, 2, 3], content_type: "image/png" };
+
+        let err = publish_with(&client, &cfg, &creds(), Some(&avatar)).await.unwrap_err();
+
+        match err {
+            PublishError::Upload { status, body } => {
+                assert_eq!(status, 200);
+                assert!(body.contains("no `blob` field"), "message names the field: {body}");
+            }
+            other => panic!("expected Upload, got {other:?}"),
+        }
+        assert_eq!(client.upload_blob_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(client.put_record_calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(client.last_put_body.lock().expect("lock").is_none());
+    }
+
+    #[test]
+    fn validate_blob_names_every_field_it_rejects() {
+        // BC17: each malformed shape, and the message that names its cause.
+        let cases: Vec<(Value, &str)> = vec![
+            (json!({}), "no `blob` field"),
+            (json!({ "blob": "not-an-object" }), "`blob` is not an object"),
+            (json!({ "blob": { "ref": {}, "mimeType": "image/png", "size": 1 } }), "no `$type`"),
+            (
+                json!({ "blob": { "$type": "other", "ref": {}, "mimeType": "image/png", "size": 1 } }),
+                "expected \"blob\"",
+            ),
+            (
+                json!({ "blob": { "$type": "blob", "mimeType": "image/png", "size": 1 } }),
+                "no `ref` field",
+            ),
+            (json!({ "blob": { "$type": "blob", "ref": {}, "size": 1 } }), "no `mimeType` field"),
+            (
+                json!({ "blob": { "$type": "blob", "ref": {}, "mimeType": "image/png" } }),
+                "no `size` field",
+            ),
+        ];
+        for (body, expected) in cases {
+            let response = UploadResponse { status: 201, body: body.clone() };
+            match validate_blob(&response) {
+                Err(PublishError::Upload { status, body: message }) => {
+                    assert_eq!(status, 201);
+                    assert!(
+                        message.contains(expected),
+                        "{body} should report {expected}: {message}"
+                    );
+                }
+                other => panic!("expected Upload for {body}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_blob_accepts_a_well_formed_blob() {
+        // BC17: the happy path returns the blob itself, not the envelope.
+        let response = UploadResponse { status: 200, body: json!({ "blob": good_blob() }) };
+        assert_eq!(validate_blob(&response).expect("valid blob"), good_blob());
     }
 
     #[tokio::test]
@@ -670,12 +810,89 @@ mod tests {
 
     #[test]
     fn debug_on_publish_error_never_contains_a_password_or_token() {
-        // BC11: no variant type even has a field for either, so this guards
-        // the shape rather than a redaction step.
+        // BC11, three ways. No PublishError variant has a field for either
+        // secret, and the two structs that do hold one keep it in `Secret`,
+        // whose Debug prints `[redacted]`. A future field added as a plain
+        // String fails this test.
         let err = PublishError::Auth { status: 401, body: "invalid password".to_string() };
         let printed = format!("{err:?}");
         assert!(!printed.contains("app-pass"));
         assert!(!printed.contains("access-jwt"));
+
+        let credentials = format!("{:?}", creds());
+        assert!(!credentials.contains("app-pass"), "Credentials Debug leaked: {credentials}");
+        assert!(credentials.contains("[redacted]"), "Credentials Debug: {credentials}");
+
+        let session = format!(
+            "{:?}",
+            Session {
+                did: "did:plc:abc".to_string(),
+                access_jwt: Secret::new("access-jwt".to_string()),
+            }
+        );
+        assert!(!session.contains("access-jwt"), "Session Debug leaked: {session}");
+        assert!(session.contains("[redacted]"), "Session Debug: {session}");
+    }
+
+    #[test]
+    fn whitespace_app_password_fails_fast_as_missing() {
+        // BC18: `config::optional` is a bare lookup and does not trim, so a
+        // password of three spaces arrives here as Some("   "). The filter
+        // in `preflight` is the only thing that rejects it.
+        let cfg = config_with(&[("BSKY_HANDLE", "dunk.bsky.social"), ("BSKY_APP_PASSWORD", "   ")]);
+        assert_eq!(cfg.bsky_app_password.as_ref().map(Secret::expose), Some("   "));
+        match preflight(&cfg, None).unwrap_err() {
+            PublishError::MissingCredentials { var } => assert_eq!(var, "BSKY_APP_PASSWORD"),
+            other => panic!("expected MissingCredentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whitespace_handle_fails_fast_as_missing() {
+        // BC18, the same guard on the other variable.
+        let cfg = config_with(&[("BSKY_HANDLE", "  "), ("BSKY_APP_PASSWORD", "app-pass")]);
+        match preflight(&cfg, None).unwrap_err() {
+            PublishError::MissingCredentials { var } => assert_eq!(var, "BSKY_HANDLE"),
+            other => panic!("expected MissingCredentials, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_avatar_is_an_avatar_read_error() {
+        // BC19: the file exists, so `is_file` passes and the extension is
+        // fine; only the read fails. The OS error is carried, not discarded
+        // into AvatarNotFound.
+        use std::os::unix::fs::PermissionsExt;
+
+        let cfg =
+            config_with(&[("BSKY_HANDLE", "dunk.bsky.social"), ("BSKY_APP_PASSWORD", "app-pass")]);
+        let path = std::env::temp_dir().join("dunk-publish-test-unreadable-avatar.png");
+        let _ = std::fs::remove_file(&path);
+        let mut file = std::fs::File::create(&path).expect("create the avatar");
+        file.write_all(b"not really a png").expect("write the avatar");
+        drop(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 the avatar");
+
+        // Root ignores the mode bits, so the read would succeed and there
+        // would be nothing to assert. Skip rather than fail.
+        if std::fs::read(&path).is_ok() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        let err = preflight(&cfg, Some(&path)).unwrap_err();
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_file(&path);
+
+        match err {
+            PublishError::AvatarRead { path: got, source } => {
+                assert_eq!(got, path);
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected AvatarRead, got {other:?}"),
+        }
     }
 }
 
