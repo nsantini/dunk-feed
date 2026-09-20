@@ -137,6 +137,7 @@ once at start and fails fast on a bad value.
 |---|---|---|
 | `DUNK_DB_PATH` | `/data/dunk.db` | SQLite file |
 | `DUNK_HTTP_ADDR` | `0.0.0.0:3000` | Listen address |
+| `DUNK_HEALTH_MAX_LAG_S` | `300` | `/healthz` goes 503 when the Jetstream lag or the last scorer pass age passes this |
 | `DUNK_HOSTNAME` | required | Public hostname, forms `did:web:<hostname>` |
 | `DUNK_PUBLISHER_DID` | required | Your account DID. Forms the feed at-URI |
 | `DUNK_FEED_RKEY` | `dunks` | Record key of the generator record |
@@ -472,7 +473,7 @@ forwards to the VM. `DUNK_HOSTNAME` is the Cloudflare hostname.
 | `GET /xrpc/app.bsky.feed.describeFeedGenerator` | `{"did":"did:web:<host>","feeds":[{"uri":"at://<publisher_did>/app.bsky.feed.generator/<rkey>"}]}` |
 | `GET /xrpc/app.bsky.feed.getFeedSkeleton?feed=&limit=&cursor=` | Section 11.1 |
 | `POST /xrpc/app.bsky.feed.sendInteractions` | `{}`; rows appended to `interactions` |
-| `GET /healthz` | 200 with `{jetstream_lag_s, last_pass_age_s, snapshot_len}`; 503 if lag over 300 s or last pass over 300 s ago |
+| `GET /healthz` | 200 with `{jetstream_lag_s, last_pass_age_s, snapshot_len}`; 503 if either age passes `DUNK_HEALTH_MAX_LAG_S`, or is `null` because no commit or no scorer pass has been seen yet since start. Docker's `start_period` covers boot |
 
 ### 11.1 `getFeedSkeleton`
 
@@ -534,7 +535,7 @@ Prints the feed URL. Never runs inside `dunk run`.
 - **Backup.** `sqlite3 /data/dunk.db ".backup /data/backup.db"` nightly is enough. Losing the DB loses 30 days of feed history and nothing else. The hot set and counters rebuild within 48 h.
 - **Logs.** `tracing` JSON to stdout. The ingest and scorer stats lines are the dashboards.
 - **Upgrades.** `docker compose pull && up -d`. The Jetstream cursor makes a restart under 36 h gapless.
-- **Failure modes.** One Jetstream host down: the client rotates to the next host within one backoff step. All hosts down: ingest backs off, `/healthz` goes 503 after 300 s, the feed keeps serving the last snapshot. App View down: no promotions, feed keeps serving. Disk full: writer thread errors, process exits, Docker restarts it, cursor resumes. `dunk run` supervises the ingest and scorer tasks: the first to stop flips the shutdown watch, the other is awaited, the writer is flushed, and the first error is the exit reason. OOM: memory limit trips at 512 MB, same recovery.
+- **Failure modes.** One Jetstream host down: the client rotates to the next host within one backoff step. All hosts down: ingest backs off, `/healthz` goes 503 after 300 s, the feed keeps serving the last snapshot. App View down: no promotions, feed keeps serving. Disk full: writer thread errors, process exits, Docker restarts it, cursor resumes. `dunk run` supervises the ingest, scorer and HTTP tasks in one `JoinSet`: the first to stop flips the shutdown watch, the others are awaited and their errors logged, the writer is flushed, and the first error is the exit reason. A panicking task becomes an error, never a re-panic, so the flush always runs. OOM: memory limit trips at 512 MB, same recovery.
 
 ## 14. Testing strategy
 

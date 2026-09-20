@@ -86,8 +86,9 @@ server.
 - Router state: `Arc<AppState>` holding the snapshot
   `Arc<RwLock<Arc<Vec<FeedItem>>>>`, the store writer handle, and config;
   injected with axum's `State` extractor.
-- Cursor lookup uses `Vec::binary_search_by` against `(rank, cid)`, since
-  the snapshot is already sorted that way.
+- Cursor lookup: superseded on 2026-09-21 by TECH-DESIGN §11.1's
+  two-generation cursor (`generation:index:rank:cid`), after review showed
+  cap 2 leaves the snapshot not totally ordered.
 - Error body shape follows the AT Proto convention
   `{"error": "<Name>", "message": "<optional>"}`; only `error` is
   populated here.
