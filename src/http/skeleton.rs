@@ -1,7 +1,17 @@
 //! `GET /xrpc/app.bsky.feed.getFeedSkeleton` (BC3 to BC11, BC17 to BC22,
-//! BC32, BC33): the paginated feed read, served from the in-memory
-//! snapshot with one linear scan to the cursor (TECH-DESIGN section 11.1's
-//! budget line), never a store read.
+//! BC32, BC33, BC53 to BC59): the paginated feed read, served from the
+//! in-memory snapshot, never a store read. TECH-DESIGN section 11.1
+//! (rewritten at `c4c6fbd`, story 08 slice 7.0): the snapshot handle keeps
+//! the current generation and the one before it, and a cursor names both a
+//! generation and an index, so three-path resolution (`resolve_start`)
+//! finds the resume point in this order: (1) the cursor's generation is
+//! still held and its index names the same `quote_cid` there — an exact,
+//! O(1) resume, no scan; (2) otherwise scan the *current* list for that
+//! `quote_cid`; (3) otherwise fall back to the rank/cid scan
+//! (`page_start`) round 1's slice 6.0 built, which can repeat or drop an
+//! item only when reached this way (BC39, rewritten). Path 1 turns the
+//! common case — no swap since the last request — into a lookup with no
+//! scan at all, well under TECH-DESIGN section 11.1's one-scan budget.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +25,7 @@ use thiserror::Error;
 
 use crate::http::cursor::{self, CursorError};
 use crate::http::AppState;
-use crate::scorer::snapshot::{cmp_rank_then_cid, FeedItem};
+use crate::scorer::snapshot::{cmp_rank_then_cid, FeedItem, Snapshot};
 
 /// Every way `getFeedSkeleton` can fail. Mapped to the 400 bodies in BC3,
 /// BC4, BC6 by `SkeletonError`'s `IntoResponse` impl in `src/http/mod.rs`
@@ -94,20 +104,22 @@ fn resolve_limit(raw: Option<&str>) -> Result<usize, SkeletonError> {
     Ok(value.clamp(1, 100) as usize)
 }
 
-/// BC6, BC22: `None` or an empty string is treated as absent (page starts
-/// at index 0); anything else must decode (BC6) or the request is
-/// `InvalidRequest`.
-fn resolve_cursor(raw: Option<&str>) -> Result<Option<(f64, String)>, SkeletonError> {
+/// BC6, BC22, BC52: `None` or an empty string is treated as absent (page
+/// starts at the current generation's index 0); anything else must decode
+/// (BC6, BC52) or the request is `InvalidRequest`.
+fn resolve_cursor(raw: Option<&str>) -> Result<Option<(u64, usize, f64, String)>, SkeletonError> {
     match raw {
         None | Some("") => Ok(None),
         Some(s) => Ok(Some(cursor::decode(s)?)),
     }
 }
 
-/// The index the page starts at, found in one linear scan of `items`
-/// (TECH-DESIGN section 11.1's budget line; `snapshot::apply_cap_one_per_quoter_per_50`
-/// leaves `items` not totally ordered by `(rank DESC, cid ASC)`, so a binary
-/// search has no defined answer over it). `cursor_value: None` (BC22)
+/// Path 3 (BC55): the index the page starts at, found in one linear scan of
+/// `items` (TECH-DESIGN section 11.1's budget line;
+/// `snapshot::apply_cap_one_per_quoter_per_50` leaves `items` not totally
+/// ordered by `(rank DESC, cid ASC)`, so a binary search has no defined
+/// answer over it). Reached only once path 1 and path 2 (`resolve_start`)
+/// have both failed to place the cursor. `cursor_value: None` (BC22, BC57)
 /// always starts at 0 without scanning.
 ///
 /// Round 2 finding 1: an exact `(rank, cid)` match always wins, wherever it
@@ -126,18 +138,19 @@ fn resolve_cursor(raw: Option<&str>) -> Result<Option<(f64, String)>, SkeletonEr
 /// (BC37: exact match at `k` always starts the next page at `k + 1`; BC38:
 /// with no exact match at all, the first-sorts-after fallback stands).
 ///
-/// The accepted cost (BC39) is the one case with no exact match and no
-/// legitimate fallback either: the snapshot regenerates between two
-/// requests in a way that leaves nothing in the new list sorting at or
-/// after the stale cursor (for example, cap 2 had deferred the cursor's own
-/// item behind items that sort after it, and the next generation dropped or
-/// re-ordered around it). The scan then reaches the end having found
-/// neither, and the page truncates: an empty page with no `cursor` in the
-/// response, ending that pagination session early rather than repeating or
-/// looping. A plain refresh — a fresh request with no cursor — still serves
-/// every item in the new snapshot; this is a known limitation of a cursor
-/// that carries no list position, not a hole in the feed (`decisions.md`
-/// carries the proof).
+/// The accepted cost (BC39, rewritten for slice 7.0): this path alone can
+/// still repeat or drop an item, and only when a cursor is older than two
+/// scorer passes — path 1 and path 2 (`resolve_start`) both cover a cursor
+/// from the current or the immediately preceding generation exactly, so
+/// this fallback is reached only once a cursor's own generation has fallen
+/// out of both slots AND its `quote_cid` no longer appears in the current
+/// list at all. In that narrow case the scan may find no exact match and no
+/// legitimate fallback either (for example, cap 2 had deferred the
+/// cursor's own item behind items that sort after it, and the next
+/// generation dropped or re-ordered around it); the page then truncates —
+/// empty, with no `cursor` in the response — rather than repeating or
+/// looping. A plain refresh, a fresh request with no cursor, still serves
+/// every item in the current snapshot.
 fn page_start(items: &[FeedItem], cursor_value: Option<(f64, String)>) -> usize {
     let Some((rank, cid)) = cursor_value else { return 0 };
     let mut after: Option<usize> = None;
@@ -155,16 +168,76 @@ fn page_start(items: &[FeedItem], cursor_value: Option<(f64, String)>) -> usize 
     after.unwrap_or(items.len())
 }
 
-/// The route's pure core: given `state`'s snapshot (already read once by
-/// the caller, BC8, AC5) and the raw query params, builds the response body
-/// or a `SkeletonError`. Split out from `handler` so a test can drive it
-/// without a live router. `items` is a parameter, not read again here
-/// (round 2 finding 7): `SkeletonResponse<'a>`'s items borrow from it, so
-/// the borrow's lifetime is the caller's `Arc<Vec<FeedItem>>`, not one local
-/// to this function.
+/// Three-path page resolution (TECH-DESIGN section 11.1, BC53 to BC57): given
+/// the two generations `SnapshotHandle::generations` returned (BC50, one
+/// call per request) and the decoded cursor, picks which generation's list
+/// to serve from and the index it starts at within that list. `None`
+/// (BC22, BC57) always resolves to `(current, 0)` without scanning.
+///
+/// Path 1 (BC53, BC59): the cursor's `generation` matches `current` or
+/// `previous`, and that generation's `index` is in bounds and names the
+/// same `quote_cid` — an exact O(1) resume at `index + 1` of that same
+/// generation. An out-of-bounds index or a `quote_cid` mismatch at that
+/// index means the generation no longer looks the way the cursor
+/// remembers it (BC59), so path 1 does not apply and resolution falls
+/// through rather than trusting a stale index.
+///
+/// Path 2 (BC54): path 1 did not apply. Scan the *current* list for an
+/// item with the cursor's `quote_cid`; if one is found, start just after
+/// it, in the current generation.
+///
+/// Path 3 (BC55): neither path applied. Fall back to `page_start`'s
+/// rank/cid scan over the current list — the one path BC39 accepts as
+/// capable of repeating or dropping an item, reached only once the
+/// cursor's generation has fallen out of both slots and its `quote_cid` no
+/// longer resolves in the current list either.
+fn resolve_start<'a>(
+    current: &'a Snapshot,
+    previous: &'a Option<Snapshot>,
+    cursor_value: Option<(u64, usize, f64, String)>,
+) -> (&'a Snapshot, usize) {
+    let Some((cursor_generation, cursor_index, cursor_rank, cursor_cid)) = cursor_value else {
+        // BC57: no cursor (or an empty one, BC22) serves the current
+        // generation from index 0.
+        return (current, 0);
+    };
+
+    let matched_generation: Option<&Snapshot> = if current.generation == cursor_generation {
+        Some(current)
+    } else {
+        previous.as_ref().filter(|snap| snap.generation == cursor_generation)
+    };
+
+    if let Some(snap) = matched_generation {
+        // BC59: an out-of-bounds index falls through rather than panicking.
+        if let Some(item) = snap.items.get(cursor_index) {
+            if item.quote_cid == cursor_cid {
+                return (snap, cursor_index + 1);
+            }
+        }
+    }
+
+    // Path 2 (BC54): one scan of the current list by `quote_cid`.
+    if let Some(pos) = current.items.iter().position(|item| item.quote_cid == cursor_cid) {
+        return (current, pos + 1);
+    }
+
+    // Path 3 (BC55, BC39): the rank/cid scan, over the current list only.
+    let start = page_start(&current.items, Some((cursor_rank, cursor_cid)));
+    (current, start)
+}
+
+/// The route's pure core: given `state`, the two generations
+/// `SnapshotHandle::generations` returned (already read once by the caller,
+/// BC50, AC5) and the raw query params, builds the response body or a
+/// `SkeletonError`. Split out from `handler` so a test can drive it without
+/// a live router. `SkeletonResponse<'a>`'s items borrow from whichever
+/// generation `resolve_start` picked (round 2 finding 7), so the borrow's
+/// lifetime is the caller's `Snapshot`, not one local to this function.
 fn build<'a>(
     state: &AppState,
-    items: &'a [FeedItem],
+    current: &'a Snapshot,
+    previous: &'a Option<Snapshot>,
     params: &HashMap<String, String>,
 ) -> Result<SkeletonResponse<'a>, SkeletonError> {
     // BC3, BC21: `feed` missing, or a value other than the configured feed
@@ -180,12 +253,17 @@ fn build<'a>(
     let limit = resolve_limit(params.get("limit").map(String::as_str))?;
     let cursor_value = resolve_cursor(params.get("cursor").map(String::as_str))?;
 
-    let start = page_start(items, cursor_value);
+    let (snapshot, start) = resolve_start(current, previous, cursor_value);
+    let items = snapshot.items.as_slice();
     let page: Vec<&FeedItem> = items.iter().skip(start).take(limit).collect();
 
-    // BC8: omitted once the page reaches the end of the snapshot.
+    // BC8, BC56: omitted once the page reaches the end of that generation's
+    // list; otherwise names the generation it was served from and the
+    // index of the last item served within that generation.
     let cursor = if start + page.len() < items.len() {
-        page.last().map(|item| cursor::encode(item.rank, &item.quote_cid))
+        let last_index = start + page.len() - 1;
+        page.last()
+            .map(|item| cursor::encode(snapshot.generation, last_index, item.rank, &item.quote_cid))
     } else {
         None
     };
@@ -210,10 +288,11 @@ pub async fn handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    // BC8, AC5: the snapshot `Arc` is read exactly once per request, kept
-    // alive here for as long as `build`'s borrowed response needs it.
-    let items = state.snapshot.current();
-    let mut response = match build(&state, &items, &params) {
+    // BC50, AC5: both generations are read exactly once per request, under
+    // a single read lock, kept alive here for as long as `build`'s
+    // borrowed response needs them.
+    let (current, previous) = state.snapshot.generations();
+    let mut response = match build(&state, &current, &previous, &params) {
         Ok(body) => Json(body).into_response(),
         Err(err) => err.into_response(),
     };
@@ -504,10 +583,7 @@ mod tests {
         );
     }
 
-    // AC5: a request against a 100k-item snapshot completes in one scan,
-    // well under a generous budget.
-    #[tokio::test]
-    async fn budget_one_scan() {
+    fn hundred_k_items() -> Vec<FeedItem> {
         let mut items = Vec::with_capacity(100_000);
         for i in 0..100_000i64 {
             items.push(item(
@@ -517,11 +593,21 @@ mod tests {
                 1.0,
             ));
         }
+        items
+    }
+
+    // AC5 (7.9a): path 1's O(1) lookup against a 100k-item snapshot stays
+    // well under budget. `state_with_items` swaps once, so the snapshot is
+    // generation 1; a cursor naming that same generation and the item's own
+    // index resolves through path 1, no scan at all.
+    #[tokio::test]
+    async fn budget_one_scan_path_1() {
+        let items = hundred_k_items();
         let state = state_with_items(items);
         let app = router(state);
         let uri = format!(
             "/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=50&cursor={}",
-            cursor::encode(50_000.0, "cid00050000")
+            cursor::encode(1, 50_000, 50_000.0, "cid00050000")
         );
 
         let start = std::time::Instant::now();
@@ -532,7 +618,206 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
             elapsed < std::time::Duration::from_millis(100),
-            "a single scan over 100k items must stay well under budget, took {elapsed:?}"
+            "path 1's O(1) resume over 100k items must stay well under budget, took {elapsed:?}"
         );
+    }
+
+    // AC5 (7.9b): path 2's one-scan-by-cid against a 100k-item snapshot
+    // stays well under budget. The cursor names generation 999, which
+    // neither the current (1) nor the previous (0) slot holds, so path 1
+    // falls through and path 2's scan for the cid runs instead.
+    #[tokio::test]
+    async fn budget_one_scan_path_2() {
+        let items = hundred_k_items();
+        let state = state_with_items(items);
+        let app = router(state);
+        let uri = format!(
+            "/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=50&cursor={}",
+            cursor::encode(999, 0, 50_000.0, "cid00050000")
+        );
+
+        let start = std::time::Instant::now();
+        let response =
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "path 2's one cid scan over 100k items must stay well under budget, took {elapsed:?}"
+        );
+    }
+
+    // 7.7(a): paging `deferral_snapshot` one item at a time, entirely
+    // through path 1 (no further swap happens after `state_with_items`'s
+    // one swap, so every returned cursor's generation is still `current`),
+    // serves every item exactly once, in array order, and terminates.
+    #[tokio::test]
+    async fn pages_a_deferral_snapshot_exactly_once_via_path_1() {
+        let items = deferral_snapshot();
+        let state = state_with_items(items.clone());
+        let app = router(state);
+        let mut served = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..=items.len() {
+            let uri = match &cursor {
+                Some(c) => {
+                    format!(
+                        "/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=1&cursor={c}"
+                    )
+                }
+                None => format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=1"),
+            };
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            let feed = json["feed"].as_array().unwrap();
+            if feed.is_empty() {
+                break;
+            }
+            served.push(feed[0]["post"].as_str().unwrap().to_string());
+            cursor = json.get("cursor").and_then(|c| c.as_str()).map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        let expected: Vec<String> = items.iter().map(|i| i.quote_uri.clone()).collect();
+        assert_eq!(served, expected, "every item served exactly once, in array order, via path 1");
+    }
+
+    // 7.7(b): a cursor from generation N's page 1 still resolves through
+    // path 1, exactly, after ONE swap displaces generation N into
+    // `previous` — regardless of how differently the new current
+    // generation is composed. Proves paging is stable across a single
+    // scorer pass.
+    #[tokio::test]
+    async fn stable_page_across_one_swap_via_path_1() {
+        let items = deferral_snapshot();
+        let state = state_with_items(items.clone()); // generation 1
+        let app = router(state.clone());
+
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=1");
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["feed"][0]["post"], items[0].quote_uri);
+        let cursor = json["cursor"].as_str().expect("more items remain").to_string();
+
+        // The next pass rebuilds the list from scratch, deferring the
+        // items differently, and swaps generation 1 into `previous`.
+        let regenerated =
+            vec![item("at://q/x", "cid-x", 500.0, 1.0), item("at://q/y", "cid-y", 400.0, 1.0)];
+        state.snapshot.swap(Arc::new(regenerated));
+
+        let uri2 = format!(
+            "/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=100&cursor={cursor}"
+        );
+        let response2 =
+            app.oneshot(Request::builder().uri(uri2).body(Body::empty()).unwrap()).await.unwrap();
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
+        let json2: Value = serde_json::from_slice(&body2).unwrap();
+        let served: Vec<String> = json2["feed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["post"].as_str().unwrap().to_string())
+            .collect();
+
+        // Path 1 resumes exactly inside generation 1's own list, items
+        // 1..8, untouched by whatever the new current generation holds.
+        let expected: Vec<String> = items.iter().skip(1).map(|i| i.quote_uri.clone()).collect();
+        assert_eq!(served, expected, "no repeat and no hole across the swap");
+    }
+
+    // 7.8(c): the cursor's generation has fallen out of both `current` and
+    // `previous` (three swaps since it was issued), but its `quote_cid`
+    // still appears in the current list, so path 2 starts after it.
+    #[tokio::test]
+    async fn path_2_scans_current_list_by_cid_once_the_generation_falls_out() {
+        let state = state_with_items(vec![item("at://q/old", "cid-old", 10.0, 1.0)]); // gen 1
+        state.snapshot.swap(Arc::new(vec![item("at://q/mid", "cid-mid", 5.0, 1.0)])); // gen 2
+        state.snapshot.swap(Arc::new(vec![
+            item("at://q/old", "cid-old", 1.0, 1.0),
+            item("at://q/new", "cid-new", 50.0, 1.0),
+        ])); // gen 3: generation 1 held by neither current (3) nor previous (2)
+
+        let app = router(state);
+        let cursor = cursor::encode(1, 0, 10.0, "cid-old");
+        let uri =
+            format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=10&cursor={cursor}");
+        let response =
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let served: Vec<&str> =
+            json["feed"].as_array().unwrap().iter().map(|f| f["post"].as_str().unwrap()).collect();
+        assert_eq!(
+            served,
+            vec!["at://q/new"],
+            "path 2 starts just after cid-old in the current list"
+        );
+    }
+
+    // 7.8(d): the cursor's generation has fallen out, and its `quote_cid`
+    // is gone from the current list too, so path 3's rank/cid scan runs.
+    #[tokio::test]
+    async fn path_3_rank_scan_runs_once_generation_and_cid_both_fall_out() {
+        let state = state_with_items(vec![item("at://q/old", "cid-old", 10.0, 1.0)]); // gen 1
+        state.snapshot.swap(Arc::new(vec![item("at://q/mid", "cid-mid", 5.0, 1.0)])); // gen 2
+        state.snapshot.swap(Arc::new(vec![
+            item("at://q/high", "cid-high", 20.0, 1.0),
+            item("at://q/low", "cid-low", 1.0, 1.0),
+        ])); // gen 3: cid-old is gone entirely
+
+        let app = router(state);
+        let cursor = cursor::encode(1, 0, 10.0, "cid-old");
+        let uri =
+            format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=10&cursor={cursor}");
+        let response =
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let served: Vec<&str> =
+            json["feed"].as_array().unwrap().iter().map(|f| f["post"].as_str().unwrap()).collect();
+        // page_start over [cid-high(20.0), cid-low(1.0)] against the stale
+        // (10.0, "cid-old"): cid-high sorts before the cursor (higher
+        // rank), cid-low sorts strictly after it, so the page starts at
+        // cid-low.
+        assert_eq!(
+            served,
+            vec!["at://q/low"],
+            "path 3's rank/cid scan finds the first item after it"
+        );
+    }
+
+    // BC59: the cursor names the held current generation, but its `index`
+    // is at or beyond that generation's own list length (the generation
+    // was rebuilt shorter since the cursor was issued). Path 1 must not
+    // panic on the out-of-bounds index; it falls through to path 2, which
+    // still finds `cid-old` in the current list by scanning for it.
+    #[test]
+    fn path_1_index_out_of_bounds_falls_through_without_panicking() {
+        let current = Snapshot {
+            generation: 1,
+            items: Arc::new(vec![item("at://q/old", "cid-old", 10.0, 1.0)]),
+        };
+        let previous = None;
+        // Index 5 does not exist in a one-item list.
+        let cursor_value = Some((1, 5, 99.0, "cid-old".to_string()));
+
+        let (snapshot, start) = resolve_start(&current, &previous, cursor_value);
+
+        assert_eq!(snapshot.generation, 1, "path 2 still serves the current generation");
+        assert_eq!(start, 1, "path 2 found cid-old at index 0 and starts just after it");
     }
 }

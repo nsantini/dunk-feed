@@ -2,11 +2,12 @@
 //! `build` recomputes every `feed` row's `rank` for the current age, then
 //! applies the two page caps in order: one item per original author per UTC
 //! day, then one item per quoting DID per 50 items. `SnapshotHandle` is the
-//! shared `Arc<RwLock<Arc<Vec<FeedItem>>>>` story 08's HTTP server (not
-//! wired up yet, per this slice's `## Non-goals`) will read through
-//! `current()`; the scorer's own snapshot step (`src/scorer/mod.rs`) builds
-//! the new list outside the lock and calls `swap` only for the atomic
-//! pointer replacement (BC33).
+//! shared two-generation pointer (`Snapshot`, `Inner`, TECH-DESIGN section
+//! 11.1, story 08 slice 7.0) story 08's HTTP server reads through
+//! `current()` and `generations()`; the scorer's own snapshot step
+//! (`src/scorer/mod.rs`) builds the new list outside the lock and calls
+//! `swap` only for the atomic pointer replacement (BC33 of story 07,
+//! BC49).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -28,38 +29,85 @@ pub struct FeedItem {
     pub ratio: f64,
 }
 
+/// One generation of the feed list: the items a single scorer pass produced
+/// (or, for `SnapshotHandle::new`'s generation 0, the empty starting list),
+/// tagged with the pass counter that built it. Story 08 slice 7.0's cursor
+/// (`src/http/cursor.rs`) carries this `generation` alongside an index so a
+/// page can resume from an exact position in a list the handle still holds,
+/// without rescanning (BC48, BC53).
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub generation: u64,
+    pub items: Arc<Vec<FeedItem>>,
+}
+
+/// The two generations `SnapshotHandle` keeps: `current` is what `current()`
+/// and a fresh, no-cursor request read; `previous` is the generation `swap`
+/// just displaced, kept only so a cursor issued against it can still resolve
+/// exactly (TECH-DESIGN section 11.1's path 1) until the *next* `swap`
+/// displaces it in turn.
+#[derive(Debug)]
+struct Inner {
+    current: Snapshot,
+    previous: Option<Snapshot>,
+}
+
 /// The shared snapshot pointer. Cloning `SnapshotHandle` clones the `Arc`
 /// around the lock, not the list: every clone reads and writes the same
 /// underlying snapshot.
 #[derive(Debug, Clone)]
 pub struct SnapshotHandle {
-    inner: Arc<RwLock<Arc<Vec<FeedItem>>>>,
+    inner: Arc<RwLock<Inner>>,
 }
 
 impl SnapshotHandle {
-    /// A fresh handle whose `current()` is an empty list, never a panic and
-    /// never `None`, before the first pass ever runs (BC41).
+    /// A fresh handle whose `current()` is an empty list at generation 0,
+    /// never a panic and never `None`, before the first pass ever runs
+    /// (BC41 of story 07, BC48). `previous` starts `None`: there is no
+    /// generation before the first.
     pub fn new() -> Self {
-        SnapshotHandle { inner: Arc::new(RwLock::new(Arc::new(Vec::new()))) }
+        SnapshotHandle {
+            inner: Arc::new(RwLock::new(Inner {
+                current: Snapshot { generation: 0, items: Arc::new(Vec::new()) },
+                previous: None,
+            })),
+        }
     }
 
-    /// The current snapshot. Cloning the returned `Arc` is cheap and never
-    /// blocks a concurrent `swap`. Round 2 finding 9: narrowed from a
-    /// module-wide `#![allow(dead_code)]` in `src/scorer/mod.rs`. No
-    /// non-test caller yet; story 08's HTTP server is the first.
-    #[allow(dead_code)]
+    /// The current generation's items. Cloning the returned `Arc` is cheap
+    /// and never blocks a concurrent `swap`. `src/http/skeleton.rs` and
+    /// `src/http/health.rs` both call this.
     pub fn current(&self) -> Arc<Vec<FeedItem>> {
-        self.inner.read().expect("snapshot lock poisoned").clone()
+        self.inner.read().expect("snapshot lock poisoned").current.items.clone()
     }
 
-    /// Replaces the snapshot with `new` under the write lock. `new` must
+    /// Replaces the snapshot with `new` under the write lock: the
+    /// generation counter increments by one, the outgoing `current` becomes
+    /// `previous` (displacing whatever `previous` held before), and `new`
+    /// becomes `current` at the incremented generation (BC49). `new` must
     /// already be fully built: the caller (the scorer's snapshot step) does
     /// every bit of ranking and capping work outside this call, so the lock
     /// is held only for the pointer swap and a reader never observes a
-    /// partially built list (BC33).
+    /// partially built list (BC33 of story 07). The first pass therefore
+    /// produces generation 1.
     pub fn swap(&self, new: Arc<Vec<FeedItem>>) {
         let mut guard = self.inner.write().expect("snapshot lock poisoned");
-        *guard = new;
+        let next_generation = guard.current.generation + 1;
+        let outgoing = std::mem::replace(
+            &mut guard.current,
+            Snapshot { generation: next_generation, items: new },
+        );
+        guard.previous = Some(outgoing);
+    }
+
+    /// Clones both generations under a single read lock, so `current` and
+    /// `previous` always come from the same instant rather than two
+    /// separate reads that a concurrent `swap` could interleave between
+    /// (BC50). `src/http/skeleton.rs`'s `getFeedSkeleton` calls this exactly
+    /// once per request.
+    pub fn generations(&self) -> (Snapshot, Option<Snapshot>) {
+        let guard = self.inner.read().expect("snapshot lock poisoned");
+        (guard.current.clone(), guard.previous.clone())
     }
 }
 
@@ -321,6 +369,72 @@ mod tests {
         }];
         handle.swap(Arc::new(items.clone()));
         assert_eq!(*handle.current(), items);
+    }
+
+    // BC48: a fresh handle's current generation is 0, with no previous.
+    #[test]
+    fn fresh_handle_is_generation_zero_with_no_previous() {
+        let handle = SnapshotHandle::new();
+        let (current, previous) = handle.generations();
+        assert_eq!(current.generation, 0);
+        assert!(current.items.is_empty());
+        assert!(previous.is_none());
+    }
+
+    // BC49: `swap` increments the generation by one each time, and the
+    // outgoing `current` becomes `previous` — so the first pass produces
+    // generation 1, and a second `swap` displaces generation 1 into
+    // `previous` rather than losing it outright.
+    #[test]
+    fn swap_increments_generation_and_keeps_the_outgoing_as_previous() {
+        let handle = SnapshotHandle::new();
+        let gen1_items = vec![FeedItem {
+            quote_uri: "at://did:plc:q/app.bsky.feed.post/1".to_string(),
+            quote_cid: "cid-1".to_string(),
+            rank: 1.0,
+            ratio: 1.0,
+        }];
+        handle.swap(Arc::new(gen1_items.clone()));
+        let (current, previous) = handle.generations();
+        assert_eq!(current.generation, 1, "the first pass produces generation 1");
+        assert_eq!(*current.items, gen1_items);
+        let previous = previous.expect("generation 0 becomes previous, even though it was empty");
+        assert_eq!(previous.generation, 0);
+        assert!(previous.items.is_empty());
+
+        let gen2_items = vec![FeedItem {
+            quote_uri: "at://did:plc:q/app.bsky.feed.post/2".to_string(),
+            quote_cid: "cid-2".to_string(),
+            rank: 2.0,
+            ratio: 2.0,
+        }];
+        handle.swap(Arc::new(gen2_items.clone()));
+        let (current, previous) = handle.generations();
+        assert_eq!(current.generation, 2);
+        assert_eq!(*current.items, gen2_items);
+        let previous = previous.expect("generation 1 becomes previous");
+        assert_eq!(previous.generation, 1);
+        assert_eq!(*previous.items, gen1_items);
+    }
+
+    // BC50: `generations()` clones both `Arc`s under one read lock, so it
+    // never observes a torn state where `current` moved on but `previous`
+    // still reflects an even earlier swap.
+    #[test]
+    fn generations_reads_current_and_previous_together() {
+        let handle = SnapshotHandle::new();
+        handle.swap(Arc::new(vec![]));
+        handle.swap(Arc::new(vec![FeedItem {
+            quote_uri: "at://did:plc:q/app.bsky.feed.post/only".to_string(),
+            quote_cid: "cid-only".to_string(),
+            rank: 5.0,
+            ratio: 5.0,
+        }]));
+        let (current, previous) = handle.generations();
+        assert_eq!(current.generation, 2);
+        let previous = previous.expect("second swap leaves a previous generation");
+        assert_eq!(previous.generation, 1);
+        assert!(previous.items.is_empty());
     }
 
     // BC27: a `quoted_at` in the future never yields a negative age, so
