@@ -827,9 +827,10 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
     let source = crate::jetstream::JetstreamClient::connect(cfg, cursor).await?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let signal_shutdown_tx = shutdown_tx.clone();
     let _signal_task = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        let _ = shutdown_tx.send(true);
+        let _ = signal_shutdown_tx.send(true);
     });
 
     // The scorer task (story 07) starts here, spawned alongside
@@ -863,8 +864,56 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
     let ingest_handle = tokio::spawn(async move {
         run_ingest(&ingest_cfg, source, &ingest_writer, &mut hot, shutdown_rx, evict_rx).await
     });
-    let result = ingest_handle.await.expect("the run_ingest task should not panic");
-    let scorer_result = scorer_handle.await.expect("the scorer task should not panic");
+
+    supervise(ingest_handle, scorer_handle, shutdown_tx, writer).await
+}
+
+/// Round 2 finding 1 (BC42): races `ingest` and `scorer` with
+/// `tokio::select!` on `&mut handle` (the standard trick for keeping both
+/// `JoinHandle`s alive past the branch that wins, since `&mut JoinHandle<T>`
+/// is itself `Future + Unpin`). Whichever finishes first — with an error or
+/// not — flips `shutdown_tx` so the other task stops on its own next check,
+/// then this awaits the other to let it wind down cleanly, logging its
+/// error at `warn` if it has one (never dropped, never returned: the first
+/// task's own result is always what `run` returns). Once both have
+/// finished, `writer.flush()` then `writer.shutdown()` run here, so every
+/// committed op reaches the database before `run` returns either way.
+async fn supervise(
+    mut ingest: tokio::task::JoinHandle<Result<(), IngestError>>,
+    mut scorer: tokio::task::JoinHandle<Result<(), crate::scorer::ScorerError>>,
+    shutdown_tx: watch::Sender<bool>,
+    writer: WriterHandle,
+) -> Result<(), IngestError> {
+    let first_result: Result<(), IngestError> = tokio::select! {
+        result = &mut ingest => {
+            let _ = shutdown_tx.send(true);
+            let outcome = result.expect("the run_ingest task should not panic");
+            match scorer.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "ingest: scorer task failed after ingest finished")
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "ingest: scorer task panicked after ingest finished")
+                }
+            }
+            outcome
+        }
+        result = &mut scorer => {
+            let _ = shutdown_tx.send(true);
+            let scorer_outcome = result.expect("the scorer task should not panic");
+            match ingest.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "ingest: ingest task failed after scorer finished")
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "ingest: ingest task panicked after scorer finished")
+                }
+            }
+            scorer_outcome.map_err(IngestError::Scorer)
+        }
+    };
 
     if let Err(err) = writer.flush().await {
         tracing::warn!(error = %err, "ingest: writer flush failed during shutdown");
@@ -873,9 +922,7 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
         tracing::warn!(error = %err, "ingest: writer shutdown failed");
     }
 
-    result?;
-    scorer_result?;
-    Ok(())
+    first_result
 }
 
 #[cfg(test)]
@@ -899,6 +946,79 @@ mod tests {
             Payload::Commit(commit) => commit,
             other => panic!("expected Payload::Commit for {name}, got {other:?}"),
         }
+    }
+
+    /// A task that watches `shutdown_rx` and returns `Ok(())` only once it
+    /// flips `true` — round 2 finding 1's stand-in for "the other task would
+    /// run forever" in `supervise`'s two tests below.
+    async fn run_until_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            if shutdown_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    // BC42: ingest finishing first (with an error) flips the shutdown watch
+    // so the scorer — which would otherwise run forever — stops too, and
+    // `supervise` returns ingest's own error.
+    #[tokio::test]
+    async fn supervise_returns_ingest_error_and_stops_the_scorer() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let ingest_handle: tokio::task::JoinHandle<Result<(), IngestError>> =
+            tokio::spawn(async { Err(IngestError::WriterFailed) });
+        let scorer_rx = shutdown_rx.clone();
+        let scorer_handle: tokio::task::JoinHandle<Result<(), crate::scorer::ScorerError>> =
+            tokio::spawn(async move {
+                run_until_shutdown(scorer_rx).await;
+                Ok(())
+            });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise(ingest_handle, scorer_handle, shutdown_tx, writer),
+        )
+        .await
+        .expect("supervise must return promptly once ingest finishes, not wait on the scorer");
+
+        assert!(matches!(result, Err(IngestError::WriterFailed)));
+    }
+
+    // BC42, the reverse: the scorer finishing first (with an error) flips
+    // the shutdown watch so ingest — which would otherwise run forever —
+    // stops too, and `supervise` returns the scorer's error, mapped through
+    // `IngestError::Scorer`.
+    #[tokio::test]
+    async fn supervise_returns_scorer_error_and_stops_ingest() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let ingest_rx = shutdown_rx.clone();
+        let ingest_handle: tokio::task::JoinHandle<Result<(), IngestError>> =
+            tokio::spawn(async move {
+                run_until_shutdown(ingest_rx).await;
+                Ok(())
+            });
+        let scorer_handle: tokio::task::JoinHandle<Result<(), crate::scorer::ScorerError>> =
+            tokio::spawn(async {
+                Err(crate::scorer::ScorerError::Store(crate::store::StoreError::Poisoned))
+            });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise(ingest_handle, scorer_handle, shutdown_tx, writer),
+        )
+        .await
+        .expect("supervise must return promptly once the scorer finishes, not wait on ingest");
+
+        assert!(matches!(result, Err(IngestError::Scorer(_))));
     }
 
     // BC1: post create, embed is a post quote (`app.bsky.embed.record`),

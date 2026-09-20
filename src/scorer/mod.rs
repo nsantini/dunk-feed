@@ -6,10 +6,18 @@
 //! capped snapshot into a shared `Arc<RwLock<Arc<Vec<FeedItem>>>>`. Slice
 //! 2.0 added `select`, `verify_all` (as `verify_step`), the guard call,
 //! `promote_or_drop`, `reverify`, `expire_step`, `one_pass` and the task
-//! loop `run`. This slice adds the snapshot step inside `one_pass`,
+//! loop `run`. Slice 3.0 added the snapshot step inside `one_pass`,
 //! `last_scorer_pass`, and `ingest::run`'s wiring (`src/ingest/mod.rs`).
+//! Round 2 finding 10 folds the first-verify and re-verify branches of
+//! `one_pass` into one `verify_and_apply`, shared by both phases.
 
-#![allow(dead_code)] // `GuardResult::Drop` (story 10) and `SnapshotHandle::current` (story 08) have no caller yet.
+// Round 2 finding 9: narrowed to story 10's guard stub only.
+// `GuardResult::Drop` (`guards.rs`) has no caller yet; this module-level
+// attribute is what suppresses it, since the variant is defined in a child
+// module of this one. `SnapshotHandle::current` (story 08) and every other
+// item that still needs it now carries its own local `#[allow(dead_code)]`
+// instead of relying on this one.
+#![allow(dead_code)]
 
 pub mod guards;
 pub mod snapshot;
@@ -24,11 +32,10 @@ use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
 
-use crate::appview::types::PostView;
-use crate::appview::{AppViewClient, AppViewError};
+use crate::appview::{AppViewClient, PostsOutcome};
 use crate::config::Config;
-use crate::score::{self, Thresholds, Weights};
-use crate::store::pairs::PairWithCounts;
+use crate::score::{self, Counts, Thresholds, Weights};
+use crate::store::pairs::{PairOutcome, PairWithCounts};
 use crate::store::{feed, unix_now, Store, StoreError};
 use guards::GuardResult;
 use snapshot::SnapshotHandle;
@@ -74,35 +81,35 @@ pub struct PassCounters {
     pub duration_ms: u64,
 }
 
-/// The App View surface the scorer needs: one `getPosts` call. A trait
-/// rather than a base URL plus a test HTTP server, per `## Approach`: the
-/// crate has no `axum` or `hyper` dependency, and adding one to serve four
-/// fixtures is not worth the build cost. `AppViewClient` implements it by
-/// forwarding to its own `get_posts`; tests implement it with an in-memory
-/// fake.
+/// The App View surface the scorer needs: one lenient, chunked `getPosts`
+/// call. A trait rather than a base URL plus a test HTTP server, per
+/// `## Approach`: the crate has no `axum` or `hyper` dependency, and adding
+/// one to serve four fixtures is not worth the build cost. `AppViewClient`
+/// implements it by forwarding to its own `get_posts_lenient` (round 2
+/// finding 4), which does the chunking and the per-chunk failure bookkeeping
+/// that used to live in `verify_step` here; tests implement it with an
+/// in-memory fake.
 pub trait PostSource {
-    fn get_posts(
-        &self,
-        uris: &[String],
-    ) -> impl Future<Output = Result<HashMap<String, PostView>, AppViewError>> + Send;
+    fn get_posts_lenient(&self, uris: &[String]) -> impl Future<Output = PostsOutcome> + Send;
 }
 
 impl PostSource for AppViewClient {
-    fn get_posts(
-        &self,
-        uris: &[String],
-    ) -> impl Future<Output = Result<HashMap<String, PostView>, AppViewError>> + Send {
-        AppViewClient::get_posts(self, uris)
+    fn get_posts_lenient(&self, uris: &[String]) -> impl Future<Output = PostsOutcome> + Send {
+        AppViewClient::get_posts_lenient(self, uris)
     }
 }
 
 /// Step 1, TECH-DESIGN section 7.2: `dirty_candidates` within
 /// `candidate_ttl_h`, local `E` and `D` computed for both sides, kept when
 /// `max(E_local) >= P * prefilter_fraction` and `D_local >= M *
-/// prefilter_fraction` (BC1, BC2, BC3). `dirty` is cleared for every row
-/// read, kept or excluded alike (BC2), in one `clear_dirty` call after the
-/// filter runs. An empty result (BC4) makes no App View call and clears no
-/// dirty flag, since there was nothing to read.
+/// prefilter_fraction` (BC1, BC2, BC3). Round 2 finding 2: an excluded
+/// pair's `dirty` flag is cleared right here, through
+/// `clear_dirty_if_unchanged` (BC43, BC44), rather than an eager clear that
+/// `verify_step` used to have to undo with `mark_dirty` on a failed chunk
+/// (BC36's old shape). A kept pair's dirty flag is left untouched until
+/// `verify_and_apply` knows whether its `getPosts` chunk actually succeeded.
+/// An empty result (BC4) makes no App View call and clears no dirty flag,
+/// since there was nothing to read.
 async fn select_step(
     store: &Store,
     now: i64,
@@ -117,101 +124,27 @@ async fn select_step(
     let prefilter_p = thresholds.p * cfg.prefilter_fraction;
     let prefilter_m = thresholds.m * cfg.prefilter_fraction;
 
-    let mut kept = Vec::new();
-    let mut read_uris: Vec<String> = Vec::with_capacity(candidates.len() * 2);
+    let mut kept = Vec::with_capacity(candidates.len());
+    let mut excluded_rows: Vec<(String, Counts)> = Vec::new();
     for pair in candidates {
-        read_uris.push(pair.quote_uri.clone());
-        read_uris.push(pair.original_uri.clone());
         let eq = score::engagement(&pair.counts_q, weights);
         let eo = score::engagement(&pair.counts_o, weights);
         let d = score::ratio(eq, eo, thresholds.k);
         // BC3: both comparisons are `>=`, not `>`.
         if eq.max(eo) >= prefilter_p && d >= prefilter_m {
             kept.push(pair);
+        } else {
+            excluded_rows.push((pair.quote_uri.clone(), pair.counts_q));
+            excluded_rows.push((pair.original_uri.clone(), pair.counts_o));
         }
     }
 
-    if !read_uris.is_empty() {
+    if !excluded_rows.is_empty() {
         let store_clear = store.clone();
-        blocking(move || {
-            let refs: Vec<&str> = read_uris.iter().map(String::as_str).collect();
-            store_clear.clear_dirty(&refs)
-        })
-        .await?;
+        blocking(move || store_clear.clear_dirty_if_unchanged(&excluded_rows)).await?;
     }
 
     Ok(kept)
-}
-
-/// Steps 2 and part of 3, TECH-DESIGN section 7.2 and section 8: dedupes
-/// `Q` and `O` URIs across `pairs`, chunks them at
-/// `AppViewClient::POSTS_BATCH`, and calls `PostSource::get_posts` once per
-/// chunk (BC5). A chunk that fails is logged at `warn` and every one of its
-/// URIs is returned in the second element, so the caller can mark those
-/// pairs' counts dirty again and skip them this pass (BC36) rather than let
-/// `verify_pair` see an artificially empty map and drop them as gone. Every
-/// pair whose `Q` or `O` came from a failed chunk is left out of the
-/// returned verdicts entirely.
-async fn verify_step<S: PostSource>(
-    source: &S,
-    pairs: Vec<PairWithCounts>,
-) -> (Vec<(PairWithCounts, Verdict)>, HashSet<String>, usize) {
-    let mut uris: Vec<String> = Vec::with_capacity(pairs.len() * 2);
-    let mut seen: HashSet<String> = HashSet::with_capacity(pairs.len() * 2);
-    for pair in &pairs {
-        if seen.insert(pair.quote_uri.clone()) {
-            uris.push(pair.quote_uri.clone());
-        }
-        if seen.insert(pair.original_uri.clone()) {
-            uris.push(pair.original_uri.clone());
-        }
-    }
-
-    let mut posts: HashMap<String, PostView> = HashMap::new();
-    let mut failed_uris: HashSet<String> = HashSet::new();
-    let mut appview_calls: usize = 0;
-    for chunk in uris.chunks(AppViewClient::POSTS_BATCH) {
-        appview_calls += 1;
-        let chunk_vec = chunk.to_vec();
-        match source.get_posts(&chunk_vec).await {
-            Ok(map) => posts.extend(map),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    chunk_len = chunk.len(),
-                    "scorer: getPosts chunk failed after retries; its pairs stay candidate"
-                );
-                failed_uris.extend(chunk.iter().cloned());
-            }
-        }
-    }
-
-    let mut verdicts = Vec::with_capacity(pairs.len());
-    for pair in pairs {
-        if failed_uris.contains(&pair.quote_uri) || failed_uris.contains(&pair.original_uri) {
-            continue;
-        }
-        let verdict =
-            verify::verify_pair(&pair.quote_uri, &pair.original_uri, pair.quoted_at, &posts);
-        verdicts.push((pair, verdict));
-    }
-
-    (verdicts, failed_uris, appview_calls)
-}
-
-/// Restores `dirty = 1` on every URI a failed `getPosts` chunk touched
-/// (BC36), through `Store::mark_dirty`. A no-op when nothing failed.
-async fn mark_dirty_step(store: &Store, uris: &HashSet<String>) -> Result<(), ScorerError> {
-    if uris.is_empty() {
-        return Ok(());
-    }
-    let owned: Vec<String> = uris.iter().cloned().collect();
-    let store_mark = store.clone();
-    blocking(move || {
-        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-        store_mark.mark_dirty(&refs)
-    })
-    .await
 }
 
 /// Distinguishes the first verify (from `select`) from a re-verify (BC17
@@ -261,36 +194,95 @@ fn build_feed_row(
     }
 }
 
-/// Steps 3 and 4, TECH-DESIGN section 7.2: guard, then promote or drop each
-/// verdict. A hard check's `Verdict::Drop` (BC6 to BC15) or a guard's
-/// `GuardResult::Drop` both drop through `Store::drop_pair` and count under
-/// their reason (BC17, BC18). A `Verdict::Continue` that passes the guard
-/// and `score::qualifies` promotes (BC16); one that does not qualify stays
-/// `candidate` on a first verify (BC17) and demotes on a re-verify (BC20).
-/// A re-verified pair that still qualifies is promoted again to refresh its
-/// verified counts and `rank`, but is not re-counted as a new promotion.
-async fn promote_or_drop_step(
+/// Steps 2, 3 and 4, TECH-DESIGN section 7.2 and section 8, folded into one
+/// call per verify phase (round 2 finding 10, replacing the old separate
+/// `verify_step` and `promote_or_drop_step`, called once from `select` and
+/// again from re-verify): dedupes `Q` and `O` URIs across `pairs`, calls
+/// `PostSource::get_posts_lenient` once (BC5; it does its own chunking at
+/// `AppViewClient::POSTS_BATCH`, round 2 finding 4), then for every pair
+/// whose chunk succeeded runs `verify_pair`, the guard, and promote/drop/stay
+/// logic, and finally applies every `PairOutcome` in one `Store::apply_verdicts`
+/// call (BC48) and clears dirty on every succeeded pair's local counts in one
+/// `Store::clear_dirty_if_unchanged` call (BC43, BC44). A pair whose chunk
+/// failed is left out of both: no verdict is built for it and its dirty flag
+/// is simply never touched, so it stays dirty with no second write (BC36,
+/// BC45). A hard check's `Verdict::Drop` (BC6 to BC15) or a guard's
+/// `GuardResult::Drop` both drop with their reason (BC17, BC18). A
+/// `Verdict::Continue` that passes the guard and `score::qualifies` promotes
+/// (BC16); one that does not qualify stays `candidate` on a first verify
+/// (BC17) and demotes on a re-verify (BC20). A re-verified pair that still
+/// qualifies is promoted again to refresh its verified counts and `rank`,
+/// but is not re-counted as a new promotion. An empty `pairs` makes no App
+/// View call at all (BC4).
+#[allow(clippy::too_many_arguments)]
+async fn verify_and_apply<S: PostSource>(
     store: &Store,
-    verdicts: Vec<(PairWithCounts, Verdict)>,
+    source: &S,
+    pairs: Vec<PairWithCounts>,
     weights: &Weights,
     thresholds: &Thresholds,
     now: i64,
     phase: VerifyPhase,
     counters: &mut PassCounters,
 ) -> Result<(), ScorerError> {
-    for (pair, verdict) in verdicts {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+
+    // Round 2 finding 5's minor note: checks membership by reference first,
+    // so a URI already seen (the common case once `Q` and `O` sides overlap
+    // across pairs) costs one lookup, not a wasted clone that `insert`
+    // would immediately drop on the duplicate path.
+    let mut uris: Vec<String> = Vec::with_capacity(pairs.len() * 2);
+    let mut seen: HashSet<String> = HashSet::with_capacity(pairs.len() * 2);
+    for pair in &pairs {
+        if !seen.contains(&pair.quote_uri) {
+            seen.insert(pair.quote_uri.clone());
+            uris.push(pair.quote_uri.clone());
+        }
+        if !seen.contains(&pair.original_uri) {
+            seen.insert(pair.original_uri.clone());
+            uris.push(pair.original_uri.clone());
+        }
+    }
+
+    let outcome: PostsOutcome = source.get_posts_lenient(&uris).await;
+    counters.appview_calls += outcome.calls;
+    if !outcome.failed_uris.is_empty() {
+        tracing::warn!(
+            failed_uris = outcome.failed_uris.len(),
+            "scorer: a getPosts chunk failed after retries; its pairs stay candidate"
+        );
+    }
+
+    let mut pair_outcomes: Vec<PairOutcome> = Vec::with_capacity(pairs.len());
+    let mut clear_rows: Vec<(String, Counts)> = Vec::with_capacity(pairs.len() * 2);
+    for pair in pairs {
+        if outcome.failed_uris.contains(&pair.quote_uri)
+            || outcome.failed_uris.contains(&pair.original_uri)
+        {
+            // BC36, BC45: left out of both the clear and the verdicts, so
+            // the pair stays dirty and `candidate` with no second write.
+            continue;
+        }
+        clear_rows.push((pair.quote_uri.clone(), pair.counts_q));
+        clear_rows.push((pair.original_uri.clone(), pair.counts_o));
+
+        let verdict = verify::verify_pair(
+            &pair.quote_uri,
+            &pair.original_uri,
+            pair.quoted_at,
+            &outcome.posts,
+        );
         match verdict {
             Verdict::Drop(reason) => {
-                let store_drop = store.clone();
-                let quote_uri = pair.quote_uri.clone();
-                blocking(move || store_drop.drop_pair(&quote_uri, reason)).await?;
+                pair_outcomes.push(PairOutcome::Drop { quote_uri: pair.quote_uri.clone(), reason });
                 *counters.dropped.entry(reason.as_str()).or_insert(0) += 1;
             }
             Verdict::Continue(verified) => match guards::check(&verified) {
                 GuardResult::Drop(reason) => {
-                    let store_drop = store.clone();
-                    let quote_uri = verified.quote_uri.clone();
-                    blocking(move || store_drop.drop_pair(&quote_uri, reason)).await?;
+                    pair_outcomes
+                        .push(PairOutcome::Drop { quote_uri: verified.quote_uri.clone(), reason });
                     *counters.dropped.entry(reason.as_str()).or_insert(0) += 1;
                 }
                 GuardResult::Pass => {
@@ -298,15 +290,12 @@ async fn promote_or_drop_step(
                     let eo = score::engagement(&verified.counts_o, weights);
                     if score::qualifies(eq, eo, thresholds) {
                         let row = build_feed_row(&verified, weights, thresholds, now);
-                        let store_promote = store.clone();
-                        blocking(move || store_promote.promote(&row)).await?;
+                        pair_outcomes.push(PairOutcome::Promote(row));
                         if phase == VerifyPhase::First {
                             counters.promoted += 1;
                         }
                     } else if phase == VerifyPhase::Reverify {
-                        let store_demote = store.clone();
-                        let quote_uri = verified.quote_uri.clone();
-                        blocking(move || store_demote.demote(&quote_uri)).await?;
+                        pair_outcomes.push(PairOutcome::Demote { quote_uri: verified.quote_uri });
                         counters.demoted += 1;
                     }
                     // VerifyPhase::First and does not qualify: BC17, the
@@ -315,6 +304,16 @@ async fn promote_or_drop_step(
             },
         }
     }
+
+    if !pair_outcomes.is_empty() {
+        let store_apply = store.clone();
+        blocking(move || store_apply.apply_verdicts(&pair_outcomes)).await?;
+    }
+    if !clear_rows.is_empty() {
+        let store_clear = store.clone();
+        blocking(move || store_clear.clear_dirty_if_unchanged(&clear_rows)).await?;
+    }
+
     Ok(())
 }
 
@@ -341,22 +340,30 @@ async fn expire_step(
 }
 
 /// Step 7, TECH-DESIGN section 7.2 and 7.3: rebuild the ranked, capped
-/// snapshot from the current `feed` rows and swap it in. `snapshot::build`
-/// does every bit of ranking and capping work on plain, owned data before
-/// this function ever touches the lock, so `SnapshotHandle::swap` (BC33)
-/// holds the write lock only for the pointer replacement. `last_scorer_pass`
-/// is written after the swap, matching TECH-DESIGN section 7.2 step 7's
-/// order (BC34).
+/// snapshot from the current `feed` rows and swap it in. Round 2 finding 6:
+/// `feed_rows` and `snapshot::build` both run inside the same
+/// `spawn_blocking` closure, since `build` is itself plain, synchronous CPU
+/// work over owned data with no need to hop back onto the async task
+/// between the two. `SnapshotHandle::swap` (BC33) still holds the write lock
+/// only for the pointer replacement, since `build` finishes before `swap` is
+/// ever called. `last_scorer_pass` is written after the swap, matching
+/// TECH-DESIGN section 7.2 step 7's order (BC34). `k` reaches `build` from
+/// `Config` (round 2 finding 7, BC50).
 async fn snapshot_step(
     store: &Store,
     snapshot: &SnapshotHandle,
     weights: &Weights,
     now: i64,
     counters: &mut PassCounters,
+    k: f64,
 ) -> Result<(), ScorerError> {
     let store_read = store.clone();
-    let rows = blocking(move || store_read.feed_rows()).await?;
-    let items = snapshot::build(rows, weights, now);
+    let weights = *weights;
+    let items = blocking(move || {
+        let rows = store_read.feed_rows()?;
+        Ok(snapshot::build(rows, &weights, now, k))
+    })
+    .await?;
     counters.snapshot_len = items.len();
     snapshot.swap(Arc::new(items));
 
@@ -388,49 +395,41 @@ pub async fn one_pass<S: PostSource>(
     // Steps 1 to 4: select, verify, guard, promote or drop.
     let selected = select_step(store, now, cfg, &weights, &thresholds).await?;
     counters.selected = selected.len();
-    if !selected.is_empty() {
-        let (verdicts, failed_uris, calls) = verify_step(source, selected).await;
-        counters.appview_calls += calls;
-        mark_dirty_step(store, &failed_uris).await?;
-        promote_or_drop_step(
-            store,
-            verdicts,
-            &weights,
-            &thresholds,
-            now,
-            VerifyPhase::First,
-            &mut counters,
-        )
-        .await?;
-    }
+    verify_and_apply(
+        store,
+        source,
+        selected,
+        &weights,
+        &thresholds,
+        now,
+        VerifyPhase::First,
+        &mut counters,
+    )
+    .await?;
 
     // Step 5: re-verify, on its own timer (BC19, BC21).
     if do_reverify {
         let store_promoted = store.clone();
         let promoted =
             blocking(move || store_promoted.promoted_within(now, candidate_ttl_h)).await?;
-        if !promoted.is_empty() {
-            let (verdicts, failed_uris, calls) = verify_step(source, promoted).await;
-            counters.appview_calls += calls;
-            mark_dirty_step(store, &failed_uris).await?;
-            promote_or_drop_step(
-                store,
-                verdicts,
-                &weights,
-                &thresholds,
-                now,
-                VerifyPhase::Reverify,
-                &mut counters,
-            )
-            .await?;
-        }
+        verify_and_apply(
+            store,
+            source,
+            promoted,
+            &weights,
+            &thresholds,
+            now,
+            VerifyPhase::Reverify,
+            &mut counters,
+        )
+        .await?;
     }
 
     // Step 6: expire.
     expire_step(store, now, cfg, evict_tx, &mut counters).await?;
 
     // Step 7: snapshot.
-    snapshot_step(store, snapshot, &weights, now, &mut counters).await?;
+    snapshot_step(store, snapshot, &weights, now, &mut counters, thresholds.k).await?;
 
     counters.duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -501,7 +500,7 @@ where
 mod tests {
     use super::*;
     use crate::appview::types::{
-        EmbedRecordViewRecord, EmbedView, PostRecord, PostViewAuthor, RecordViewInner,
+        EmbedRecordViewRecord, EmbedView, PostRecord, PostView, PostViewAuthor, RecordViewInner,
     };
     use crate::store::writer::{CountField, Op, WriterConfig, WriterHandle};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -616,21 +615,23 @@ mod tests {
     }
 
     impl PostSource for FakeSource {
-        fn get_posts(
-            &self,
-            uris: &[String],
-        ) -> impl Future<Output = Result<HashMap<String, PostView>, AppViewError>> + Send {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let hit_fail = uris.iter().any(|u| self.fail_uris.contains(u));
-            let result = if hit_fail {
-                Err(AppViewError::Failed { method: "getPosts", status: None, attempts: 3 })
-            } else {
-                Ok(uris
-                    .iter()
-                    .filter_map(|u| self.posts.get(u).cloned().map(|p| (u.clone(), p)))
-                    .collect())
-            };
-            async move { result }
+        fn get_posts_lenient(&self, uris: &[String]) -> impl Future<Output = PostsOutcome> + Send {
+            let mut outcome = PostsOutcome::default();
+            for chunk in uris.chunks(AppViewClient::POSTS_BATCH) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                outcome.calls += 1;
+                let hit_fail = chunk.iter().any(|u| self.fail_uris.contains(u));
+                if hit_fail {
+                    outcome.failed_uris.extend(chunk.iter().cloned());
+                } else {
+                    outcome.posts.extend(
+                        chunk
+                            .iter()
+                            .filter_map(|u| self.posts.get(u).cloned().map(|p| (u.clone(), p))),
+                    );
+                }
+            }
+            async move { outcome }
         }
     }
 
@@ -683,9 +684,13 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].quote_uri, kept_uri);
 
-        // BC2: dirty is cleared for the excluded pair too.
+        // BC2 (round 2 finding 2's amendment): the excluded pair's dirty
+        // flag is cleared right in `select_step`. The kept pair's flag is
+        // left untouched here — it clears only once `verify_and_apply`
+        // knows its `getPosts` chunk actually succeeded (BC43, BC44, BC45).
         let again = store.dirty_candidates(now, i64::from(cfg.candidate_ttl_h)).unwrap();
-        assert!(again.is_empty(), "dirty must be cleared for both the kept and excluded pair");
+        assert_eq!(again.len(), 1, "only the excluded pair's dirty flag is cleared here");
+        assert_eq!(again[0].quote_uri, kept_uri);
     }
 
     // BC16: a `Continue` verdict that qualifies and passes the guard is
@@ -767,9 +772,10 @@ mod tests {
         assert_eq!(counters.promoted, 0);
         assert!(counters.dropped.is_empty());
         assert!(store.feed_rows().unwrap().is_empty());
-        // Still present and still `candidate`: a further dirty count would
-        // find it again.
-        store.mark_dirty(&[quote_uri]).unwrap();
+        // Still present and still `candidate`: a further local event marks
+        // it dirty again and a later pass would find it.
+        incr_n(&writer, quote_uri, CountField::Likes, 1, 1000).await;
+        writer.flush().await.unwrap();
         let found = store.dirty_candidates(now, i64::from(cfg.candidate_ttl_h)).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].quote_uri, quote_uri);
@@ -960,11 +966,13 @@ mod tests {
         assert_eq!(counters.expired, 1);
     }
 
-    // BC36: a `getPosts` chunk failure leaves every pair whose `Q` or `O`
-    // was in it `candidate`, marks its counts dirty again, and promotes
+    // BC36, BC45 (round 2 finding 2's amendment): a `getPosts` chunk failure
+    // leaves every pair whose `Q` or `O` was in it `candidate`, leaves its
+    // counts dirty with no second write (it was never cleared, since
+    // `select_step` no longer clears a kept pair up front), and promotes
     // nothing from that chunk.
     #[tokio::test]
-    async fn chunk_failure_keeps_pair_candidate_and_remarks_dirty() {
+    async fn chunk_failure_keeps_pair_candidate_and_dirty() {
         let (store, writer) = test_store_with_writer().await;
         let cfg = cfg(&[]);
         let now = 1_700_100_000;
@@ -1000,7 +1008,7 @@ mod tests {
         assert!(store.feed_rows().unwrap().is_empty());
 
         let found = store.dirty_candidates(now, i64::from(cfg.candidate_ttl_h)).unwrap();
-        assert_eq!(found.len(), 1, "the chunk failure re-marked the pair dirty");
+        assert_eq!(found.len(), 1, "the chunk failure left the pair's counts dirty");
         assert_eq!(found[0].quote_uri, quote_uri);
     }
 

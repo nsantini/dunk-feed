@@ -11,8 +11,10 @@
 //! No raw SQL lives outside `src/store/` (AGENTS.md); every other module
 //! calls through the functions this module re-exports.
 
-#![allow(dead_code)] // ingest (story 06) now calls this module; the promote/demote/expire/feed/author path still awaits its first caller: story 07's scorer.
-
+// Round 2 finding 9: narrowed from a module-wide `#![allow(dead_code)]`. The
+// scorer (this story) now calls every promote/demote/expire/feed path;
+// `authors` alone still awaits its first caller, story 10's guards.
+#[allow(dead_code)]
 pub mod authors;
 pub mod counts;
 pub mod feed;
@@ -87,6 +89,9 @@ impl PairState {
 }
 
 /// A `pairs.drop_reason` value, TECH-DESIGN section 8.3's ten reasons.
+/// Round 2 finding 9 (BC52): no `Demoted` variant. A demote (BC20) returns a
+/// pair to `candidate` with `drop_reason = NULL`; nothing ever constructs a
+/// `drop_reason` of `"demoted"`, so `FromStr` no longer parses it either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
     SelfQuote,
@@ -98,7 +103,6 @@ pub enum DropReason {
     Labelled,
     AuthorInactive,
     FollowerFloor,
-    Demoted,
 }
 
 impl DropReason {
@@ -113,7 +117,6 @@ impl DropReason {
             DropReason::Labelled => "labelled",
             DropReason::AuthorInactive => "author_inactive",
             DropReason::FollowerFloor => "follower_floor",
-            DropReason::Demoted => "demoted",
         }
     }
 }
@@ -132,7 +135,6 @@ impl std::str::FromStr for DropReason {
             "labelled" => Ok(DropReason::Labelled),
             "author_inactive" => Ok(DropReason::AuthorInactive),
             "follower_floor" => Ok(DropReason::FollowerFloor),
-            "demoted" => Ok(DropReason::Demoted),
             _ => Err(StoreError::MalformedRow { table: "pairs", column: "drop_reason" }),
         }
     }
@@ -145,11 +147,12 @@ pub fn unix_now() -> i64 {
 }
 
 /// SQLite's limit on the number of bound parameters in one statement
-/// (`SQLITE_MAX_VARIABLE_NUMBER`'s default). `counts::clear_dirty`,
-/// `counts::mark_dirty` and both of `pairs::expire`'s `IN (...)` deletes
-/// split a URI list longer than this into chunks of at most this many, one
-/// statement per chunk (BC39), so a scorer pass over a large snapshot never
-/// exceeds it.
+/// (`SQLITE_MAX_VARIABLE_NUMBER`'s default). Both of `pairs::expire`'s
+/// `IN (...)` deletes split a URI list longer than this into chunks of at
+/// most this many, one statement per chunk (BC39), so a scorer pass over a
+/// large snapshot never exceeds it. `counts::clear_dirty_if_unchanged` (round
+/// 2 finding 2) runs one `UPDATE` per row instead, so it never builds an
+/// `IN (...)` list at all.
 pub const MAX_BOUND_PARAMS: usize = 32_766;
 
 /// Applies the pragmas TECH-DESIGN section 6 asks for, on every open
@@ -236,7 +239,9 @@ impl Store {
     }
 
     /// Opens an in-memory database. Tests use this so the writer thread and
-    /// every read share the same connection (BC75).
+    /// every read share the same connection (BC75). No production caller:
+    /// `dunk run` always opens a file through `open`/`open_path`.
+    #[allow(dead_code)]
     pub fn open_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         open_and_migrate(&conn)?;
@@ -298,20 +303,30 @@ impl Store {
         pairs::promoted_within(&conn, now, h)
     }
 
-    /// Upserts a `feed` row and promotes its pair (BC52, BC53, BC54).
+    /// Upserts a `feed` row and promotes its pair (BC52, BC53, BC54). Round
+    /// 2 finding 5: the scorer itself now goes through `apply_verdicts`
+    /// instead, so a single promote runs inside the same transaction as any
+    /// drop or demote from the same verify phase. This wrapper stays for
+    /// tests that promote one row directly.
+    #[allow(dead_code)]
     pub fn promote(&self, row: &feed::FeedRow) -> Result<(), StoreError> {
         let conn = self.lock()?;
         feed::promote(&conn, row)
     }
 
     /// Returns a pair to `candidate` and deletes its `feed` row (BC55).
+    /// Round 2 finding 5: the scorer itself now goes through
+    /// `apply_verdicts` instead; this wrapper stays for tests.
+    #[allow(dead_code)]
     pub fn demote(&self, quote_uri: &str) -> Result<(), StoreError> {
         let conn = self.lock()?;
         pairs::demote(&conn, quote_uri)
     }
 
     /// Marks a pair `dropped` with `reason` and deletes its `feed` row
-    /// (BC56).
+    /// (BC56). Round 2 finding 5: the scorer itself now goes through
+    /// `apply_verdicts` instead; this wrapper stays for tests.
+    #[allow(dead_code)]
     pub fn drop_pair(&self, quote_uri: &str, reason: DropReason) -> Result<(), StoreError> {
         let conn = self.lock()?;
         pairs::drop_pair(&conn, quote_uri, reason)
@@ -334,36 +349,44 @@ impl Store {
         feed::feed_rows(&conn)
     }
 
-    /// Reads one `authors` row (BC64, BC66).
+    /// Reads one `authors` row (BC64, BC66). No caller yet; story 10's
+    /// guards are the first.
+    #[allow(dead_code)]
     pub fn author_get(&self, did: &str) -> Result<Option<authors::AuthorRow>, StoreError> {
         let conn = self.read_lock()?;
         authors::author_get(&conn, did)
     }
 
-    /// Inserts or replaces one `authors` row (BC65).
+    /// Inserts or replaces one `authors` row (BC65). No caller yet; story
+    /// 10's guards are the first.
+    #[allow(dead_code)]
     pub fn author_put(&self, row: &authors::AuthorRow) -> Result<(), StoreError> {
         let conn = self.lock()?;
         authors::author_put(&conn, row)
     }
 
-    /// Clears the dirty flag on each `post_uri`'s `counts` row. A URI with
-    /// no counts row is skipped, not an error (BC50).
-    pub fn clear_dirty(&self, post_uris: &[&str]) -> Result<(), StoreError> {
+    /// Clears the dirty flag on each row in `rows` only when its counts
+    /// still match what the caller read at select time (round 2 finding 2,
+    /// BC43, BC44, BC45). A URI with no `counts` row is skipped, not an
+    /// error.
+    pub fn clear_dirty_if_unchanged(
+        &self,
+        rows: &[(String, crate::score::Counts)],
+    ) -> Result<(), StoreError> {
         let conn = self.lock()?;
-        counts::clear_dirty(&conn, post_uris)
+        counts::clear_dirty_if_unchanged(&conn, rows)
     }
 
-    /// Sets the dirty flag on each `post_uri`'s `counts` row again. Used by
-    /// the scorer (BC36) to restore `dirty` for the URIs of a `getPosts`
-    /// chunk that failed after `select` already cleared it, so a later pass
-    /// picks the pair back up. A URI with no `counts` row is skipped, not an
-    /// error, the same as `clear_dirty`.
-    pub fn mark_dirty(&self, post_uris: &[&str]) -> Result<(), StoreError> {
+    /// Applies every `PairOutcome` inside one transaction (round 2 finding
+    /// 5, BC48): a failure applies none of them.
+    pub fn apply_verdicts(&self, outcomes: &[pairs::PairOutcome]) -> Result<(), StoreError> {
         let conn = self.lock()?;
-        counts::mark_dirty(&conn, post_uris)
+        pairs::apply_verdicts(&conn, outcomes)
     }
 
-    /// Reads one `meta` key. `Ok(None)` when the key has no row (BC67).
+    /// Reads one `meta` key. `Ok(None)` when the key has no row (BC67). No
+    /// production caller yet: `last_scorer_pass` is write-only so far.
+    #[allow(dead_code)]
     pub fn meta_get(&self, key: &str) -> Result<Option<String>, StoreError> {
         let conn = self.read_lock()?;
         meta::meta_get(&conn, key)
@@ -376,7 +399,9 @@ impl Store {
     }
 
     /// Starts the one writer thread with `WriterConfig::default()`
-    /// (BC42).
+    /// (BC42). No production caller: `dunk run` always uses
+    /// `writer_evicting` instead, so eviction is wired in from the start.
+    #[allow(dead_code)]
     pub fn writer(&self) -> Result<writer::WriterHandle, StoreError> {
         self.writer_with(writer::WriterConfig::default())
     }
@@ -387,7 +412,9 @@ impl Store {
     /// `:memory:` test sees the writer's rows through the same `Store`. A
     /// second call on this `Store` (or a clone of it) is
     /// `StoreError::WriterAlreadyStarted`: one store has one writer thread
-    /// (BC73).
+    /// (BC73). No production caller: `dunk run` always uses
+    /// `writer_evicting`.
+    #[allow(dead_code)]
     pub fn writer_with(
         &self,
         cfg: writer::WriterConfig,
@@ -490,7 +517,6 @@ mod tests {
             DropReason::Labelled,
             DropReason::AuthorInactive,
             DropReason::FollowerFloor,
-            DropReason::Demoted,
         ] {
             assert_eq!(DropReason::from_str(reason.as_str()).unwrap(), reason);
         }
@@ -511,15 +537,22 @@ mod tests {
     }
 
     #[test]
-    fn clear_dirty_clears_the_flag_and_skips_an_unknown_uri() {
+    fn clear_dirty_if_unchanged_clears_the_flag_and_skips_an_unknown_uri() {
         let store = Store::open_memory().unwrap();
         {
             let conn = store.lock().unwrap();
             counts::incr(&conn, "at://post/1", writer::CountField::Likes, 1).unwrap();
         }
 
-        // An unknown URI alongside a known one is skipped, not an error.
-        store.clear_dirty(&["at://post/1", "at://post/unknown"]).unwrap();
+        // An unknown URI alongside a known, unchanged one is skipped, not an
+        // error.
+        let read = crate::score::Counts { likes: 1, reposts: 0, replies: 0 };
+        store
+            .clear_dirty_if_unchanged(&[
+                ("at://post/1".to_string(), read),
+                ("at://post/unknown".to_string(), crate::score::Counts::default()),
+            ])
+            .unwrap();
 
         let conn = store.lock().unwrap();
         let dirty: i64 = conn

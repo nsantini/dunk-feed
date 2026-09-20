@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use crate::appview::types::{EmbedView, PostView, RecordViewInner};
+use crate::appview::types::{classify_quote_embed, PostView, QuoteEmbed};
 use crate::appview::{AppViewClient, AppViewError};
 use crate::ingest::embed::{self, AtUri, Embed};
 use crate::score::{self, Counts, Thresholds, Weights};
@@ -125,33 +125,25 @@ pub fn candidates(posts: Vec<PostView>) -> Vec<Candidate> {
     out
 }
 
-/// The quote's own hydrated `postView.embed` inner record view, when its
-/// outer `$type` is `app.bsky.embed.record#view` or
-/// `app.bsky.embed.recordWithMedia#view`. `None` when the hydrated embed is
-/// absent entirely or decoded as `EmbedView::Other`: BC25 falls through to
-/// the `getPosts` map in either case, since neither tells us anything about
-/// the original.
-fn inner_view(quote: &PostView) -> Option<&RecordViewInner> {
-    match &quote.embed {
-        Some(EmbedView::Record { record }) => Some(record),
-        Some(EmbedView::RecordWithMedia { record }) => Some(&record.record),
-        _ => None,
-    }
-}
-
 /// The unscored row a `Scoreable` candidate's hydrated embed view assigns on
-/// its own, before any `getPosts` lookup happens (finding 1, BC21, BC24):
-/// `#viewDetached` is `detached`, `#viewBlocked` is `blocked`, and any other
-/// named `$type` `RecordViewInner::Other` decodes to is `not_a_post`.
-/// `#viewNotFound` and `#viewRecord` both return `None`: the former still
-/// needs the generic `original_gone` a missing map entry gives (BC5), and
-/// the latter must still be scored.
-fn reason_from_inner_view(inner: &RecordViewInner) -> Option<Reason> {
-    match inner {
-        RecordViewInner::ViewDetached { .. } => Some(Reason::Detached),
-        RecordViewInner::ViewBlocked { .. } => Some(Reason::Blocked),
-        RecordViewInner::Other => Some(Reason::NotAPost),
-        RecordViewInner::ViewNotFound { .. } | RecordViewInner::ViewRecord(_) => None,
+/// its own, before any `getPosts` lookup happens (finding 1, BC21, BC24;
+/// round 2 finding 8: shares `appview::types::classify_quote_embed` with
+/// `scorer::verify` instead of its own copy of section 8.2's table):
+/// `#viewDetached` is `detached`, `#viewBlocked` is `blocked`, and
+/// `QuoteEmbed::NotAPost` is `not_a_post`. `QuoteEmbed::NotFound`,
+/// `QuoteEmbed::Normal` and `QuoteEmbed::Absent` all return `None`: the first
+/// still needs the generic `original_gone` a missing map entry gives (BC5),
+/// the second must still be scored, and the third (no hydrated embed at all,
+/// or an outer `$type` naming neither `record#view` nor
+/// `recordWithMedia#view`) falls through to the same `getPosts` lookup
+/// (BC25), since none of the three tells us anything about the original on
+/// its own.
+fn reason_from_quote_embed(quote: &PostView) -> Option<Reason> {
+    match classify_quote_embed(quote) {
+        QuoteEmbed::Detached => Some(Reason::Detached),
+        QuoteEmbed::Blocked => Some(Reason::Blocked),
+        QuoteEmbed::NotAPost => Some(Reason::NotAPost),
+        QuoteEmbed::NotFound | QuoteEmbed::Normal { .. } | QuoteEmbed::Absent => None,
     }
 }
 
@@ -200,7 +192,7 @@ pub fn build_rows(
                 unscored_row(&quote, &original_uri, Reason::SelfQuote)
             }
             Candidate::Scoreable { quote, original_uri } => {
-                if let Some(reason) = inner_view(&quote).and_then(reason_from_inner_view) {
+                if let Some(reason) = reason_from_quote_embed(&quote) {
                     return unscored_row(&quote, &original_uri, reason);
                 }
                 match originals.get(original_uri.as_str()) {
@@ -565,7 +557,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::appview::types::{GetFeedResponse, PostRecord, PostViewAuthor};
+    use crate::appview::types::{EmbedView, GetFeedResponse, PostRecord, PostViewAuthor};
     use serde_json::json;
 
     const HOT_CLASSIC_PAGE: &str = include_str!("../tests/fixtures/hot_classic_page.json");

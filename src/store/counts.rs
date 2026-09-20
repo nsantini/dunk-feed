@@ -41,33 +41,40 @@ pub fn incr(
     Ok(())
 }
 
-/// Clears `dirty` on every URI in `post_uris` in one set-based `UPDATE`
-/// (BC50, round 1 finding 5), not one statement per URI. A URI with no
-/// `counts` row is skipped, not an error: the `UPDATE` simply touches zero
-/// rows for it. A `post_uris` longer than `MAX_BOUND_PARAMS` is split into
-/// chunks, one `UPDATE` per chunk (BC39), so SQLite's bound-parameter limit
-/// is never exceeded.
-pub fn clear_dirty(conn: &Connection, post_uris: &[&str]) -> Result<(), StoreError> {
-    set_dirty(conn, post_uris, 0)
-}
-
-/// Sets `dirty = 1` on every URI in `post_uris`, the reverse of
-/// `clear_dirty`. Used by the scorer (BC36) to restore `dirty` for the URIs
-/// of a `getPosts` chunk that failed, after `select` already cleared it on
-/// read. Chunked the same way `clear_dirty` is (BC39).
-pub fn mark_dirty(conn: &Connection, post_uris: &[&str]) -> Result<(), StoreError> {
-    set_dirty(conn, post_uris, 1)
-}
-
-/// Shared body of `clear_dirty` and `mark_dirty`: one set-based `UPDATE` per
-/// chunk of at most `MAX_BOUND_PARAMS` URIs (BC39). A URI with no `counts`
-/// row is skipped, not an error.
-fn set_dirty(conn: &Connection, post_uris: &[&str], dirty: i64) -> Result<(), StoreError> {
-    for chunk in post_uris.chunks(crate::store::MAX_BOUND_PARAMS) {
-        let placeholders = vec!["?"; chunk.len()].join(",");
-        let sql = format!("UPDATE counts SET dirty = {dirty} WHERE post_uri IN ({placeholders})");
-        conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+/// Clears `dirty` on each row in `rows` only when its stored `likes`,
+/// `reposts` and `replies` still match the `Counts` the caller read at
+/// select time (round 2 finding 2, BC43, BC44): a row whose counts moved
+/// between that read and this call keeps `dirty = 1`, so the next pass
+/// reselects the pair rather than losing an event that landed in between.
+/// Every row in `rows` runs inside one `unchecked_transaction`, through one
+/// `prepare_cached` `UPDATE` (BC44), so a batch of many rows is not one
+/// transaction per row. Replaces `clear_dirty`, `mark_dirty` and
+/// `set_dirty`: a pair whose verify chunk failed is simply left out of
+/// `rows` by the caller (BC45), so it stays dirty with no second write,
+/// instead of the old clear-then-restore round trip.
+pub fn clear_dirty_if_unchanged(
+    conn: &Connection,
+    rows: &[(String, Counts)],
+) -> Result<(), StoreError> {
+    if rows.is_empty() {
+        return Ok(());
     }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "UPDATE counts SET dirty = 0
+             WHERE post_uri = ?1 AND likes = ?2 AND reposts = ?3 AND replies = ?4",
+        )?;
+        for (post_uri, counts) in rows {
+            stmt.execute(rusqlite::params![
+                post_uri,
+                i64::from(counts.likes),
+                i64::from(counts.reposts),
+                i64::from(counts.replies)
+            ])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -167,21 +174,51 @@ mod tests {
         assert_eq!(dirty, 1);
     }
 
+    // BC43: a row whose counts moved since the caller's read keeps
+    // `dirty = 1`.
     #[test]
-    fn clear_dirty_skips_a_uri_with_no_row() {
-        let conn = migrated_conn();
-        // No row for this URI; must not error.
-        clear_dirty(&conn, &["at://did:plc:o/app.bsky.feed.post/missing"]).unwrap();
-    }
-
-    #[test]
-    fn mark_dirty_sets_the_flag_on_an_existing_row() {
+    fn clear_dirty_if_unchanged_leaves_a_moved_row_dirty() {
         let conn = migrated_conn();
         let uri = "at://did:plc:o/app.bsky.feed.post/o1";
         incr(&conn, uri, CountField::Likes, 1_700_000_000).unwrap();
-        clear_dirty(&conn, &[uri]).unwrap();
+        // The caller read `likes = 1`; the row has since moved to 2.
+        incr(&conn, uri, CountField::Likes, 1_700_000_001).unwrap();
 
-        mark_dirty(&conn, &[uri]).unwrap();
+        let stale = Counts { likes: 1, reposts: 0, replies: 0 };
+        clear_dirty_if_unchanged(&conn, &[(uri.to_string(), stale)]).unwrap();
+
+        let dirty: i64 = conn
+            .query_row("SELECT dirty FROM counts WHERE post_uri = ?1", [uri], |row| row.get(0))
+            .unwrap();
+        assert_eq!(dirty, 1, "the row moved since the read, so dirty must stay set");
+    }
+
+    // BC44: a row unchanged since the read clears.
+    #[test]
+    fn clear_dirty_if_unchanged_clears_an_unchanged_row() {
+        let conn = migrated_conn();
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        incr(&conn, uri, CountField::Likes, 1_700_000_000).unwrap();
+
+        let read = Counts { likes: 1, reposts: 0, replies: 0 };
+        clear_dirty_if_unchanged(&conn, &[(uri.to_string(), read)]).unwrap();
+
+        let dirty: i64 = conn
+            .query_row("SELECT dirty FROM counts WHERE post_uri = ?1", [uri], |row| row.get(0))
+            .unwrap();
+        assert_eq!(dirty, 0);
+    }
+
+    // BC45: a URI simply left out of `rows` (the caller's stand-in for a
+    // failed verify chunk) gets no write at all, so it stays dirty with no
+    // second write.
+    #[test]
+    fn clear_dirty_if_unchanged_skips_a_uri_left_out_of_rows() {
+        let conn = migrated_conn();
+        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        incr(&conn, uri, CountField::Likes, 1_700_000_000).unwrap();
+
+        clear_dirty_if_unchanged(&conn, &[]).unwrap();
 
         let dirty: i64 = conn
             .query_row("SELECT dirty FROM counts WHERE post_uri = ?1", [uri], |row| row.get(0))
@@ -190,45 +227,14 @@ mod tests {
     }
 
     #[test]
-    fn mark_dirty_skips_a_uri_with_no_row() {
+    fn clear_dirty_if_unchanged_skips_a_uri_with_no_row() {
         let conn = migrated_conn();
         // No row for this URI; must not error.
-        mark_dirty(&conn, &["at://did:plc:o/app.bsky.feed.post/missing"]).unwrap();
-    }
-
-    // BC39: a URI list past SQLite's bound-parameter limit must not error.
-    // An unchunked `IN (...)` over this many placeholders would fail with
-    // "too many SQL variables"; success here proves the chunking loop runs.
-    #[test]
-    fn clear_dirty_chunks_a_list_past_the_bound_parameter_limit() {
-        let conn = migrated_conn();
-        let uris: Vec<String> = (0..crate::store::MAX_BOUND_PARAMS + 10)
-            .map(|i| format!("at://did:plc:o/app.bsky.feed.post/o{i}"))
-            .collect();
-        let refs: Vec<&str> = uris.iter().map(String::as_str).collect();
-        clear_dirty(&conn, &refs).unwrap();
-    }
-
-    #[test]
-    fn mark_dirty_chunks_a_list_past_the_bound_parameter_limit() {
-        let conn = migrated_conn();
-        let uris: Vec<String> = (0..crate::store::MAX_BOUND_PARAMS + 10)
-            .map(|i| format!("at://did:plc:o/app.bsky.feed.post/o{i}"))
-            .collect();
-        let refs: Vec<&str> = uris.iter().map(String::as_str).collect();
-        mark_dirty(&conn, &refs).unwrap();
-    }
-
-    #[test]
-    fn clear_dirty_clears_existing_rows() {
-        let conn = migrated_conn();
-        let uri = "at://did:plc:o/app.bsky.feed.post/o1";
-        incr(&conn, uri, CountField::Likes, 1_700_000_000).unwrap();
-        clear_dirty(&conn, &[uri]).unwrap();
-        let dirty: i64 = conn
-            .query_row("SELECT dirty FROM counts WHERE post_uri = ?1", [uri], |row| row.get(0))
-            .unwrap();
-        assert_eq!(dirty, 0);
+        clear_dirty_if_unchanged(
+            &conn,
+            &[("at://did:plc:o/app.bsky.feed.post/missing".to_string(), Counts::default())],
+        )
+        .unwrap();
     }
 
     #[test]

@@ -9,7 +9,7 @@
 
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -69,6 +69,47 @@ pub fn retry_decision(status: Option<u16>, attempt: u32) -> RetryDecision {
         1 => RetryDecision::RetryAfter(Duration::from_secs(2)),
         2 => RetryDecision::RetryAfter(Duration::from_secs(4)),
         _ => RetryDecision::Fail,
+    }
+}
+
+/// The result of one lenient, chunked `getPosts` call (round 2 finding 4,
+/// BC47): every chunk of at most [`AppViewClient::POSTS_BATCH`] URIs is
+/// attempted, a chunk that fails after the client's own retries is logged at
+/// `warn` and its URIs collected into `failed_uris`, but every other chunk's
+/// posts still land in `posts`. The call itself never returns `Err`; `calls`
+/// counts every chunk attempted, failed or not, so a caller does not have to
+/// count its own chunks. `AppViewClient::get_posts` is unchanged and still
+/// used by `validate`, which wants one `Err` on any chunk failure instead of
+/// a partial result.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PostsOutcome {
+    pub posts: HashMap<String, PostView>,
+    pub failed_uris: HashSet<String>,
+    pub calls: usize,
+}
+
+/// Folds one chunk's `getPosts` result into `outcome` (BC47): the chunk's
+/// posts on success, or every one of `chunk`'s own URIs into `failed_uris`
+/// on failure, after logging at `warn`. Kept separate from
+/// `AppViewClient::get_posts_lenient` so the merge and failed-URI bookkeeping
+/// can be tested with synthetic chunk results, with no live chunk boundary
+/// of exactly `POSTS_BATCH` and no network required.
+fn merge_chunk_outcome(
+    outcome: &mut PostsOutcome,
+    chunk: &[String],
+    result: Result<HashMap<String, PostView>, AppViewError>,
+) {
+    outcome.calls += 1;
+    match result {
+        Ok(map) => outcome.posts.extend(map),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                chunk_len = chunk.len(),
+                "appview: getPosts chunk failed after retries"
+            );
+            outcome.failed_uris.extend(chunk.iter().cloned());
+        }
     }
 }
 
@@ -201,6 +242,20 @@ impl AppViewClient {
             result.extend(response.posts.into_iter().map(|post| (post.uri.clone(), post)));
         }
         Ok(result)
+    }
+
+    /// `getPosts`, chunked at [`Self::POSTS_BATCH`], tolerant of a chunk
+    /// that fails after its retries (BC47, round 2 finding 4): moved onto
+    /// the `PostSource` trait (`src/scorer/mod.rs`), which the scorer calls
+    /// instead of chunking `uris` itself and calling `get_posts` once per
+    /// chunk.
+    pub async fn get_posts_lenient(&self, uris: &[String]) -> PostsOutcome {
+        let mut outcome = PostsOutcome::default();
+        for chunk in uris.chunks(Self::POSTS_BATCH) {
+            let result = self.get_posts(chunk).await;
+            merge_chunk_outcome(&mut outcome, chunk, result);
+        }
+        outcome
     }
 
     /// `app.bsky.actor.getProfiles`. Splits `dids` into groups of
@@ -358,6 +413,43 @@ mod tests {
         let err =
             AppViewClient::with_base_url("http://example.com".to_string(), f64::NAN).unwrap_err();
         assert_eq!(err, AppViewError::InvalidRate);
+    }
+
+    // BC47: a chunk that fails keeps its own URIs out of `posts` and names
+    // them in `failed_uris`, while a good chunk's posts still land in
+    // `posts` and every chunk attempted, failed or not, is counted.
+    #[test]
+    fn merge_chunk_outcome_keeps_good_chunk_and_names_failed_chunk() {
+        let decoded: GetPostsResponse = serde_json::from_str(GETPOSTS_OK).expect("fixture decodes");
+        let good_post = decoded.posts[0].clone();
+        let good_chunk = vec![good_post.uri.clone()];
+        let bad_chunk = vec!["uri-b".to_string(), "uri-c".to_string()];
+
+        let mut outcome = PostsOutcome::default();
+        merge_chunk_outcome(
+            &mut outcome,
+            &good_chunk,
+            Ok(HashMap::from([(good_post.uri.clone(), good_post.clone())])),
+        );
+        merge_chunk_outcome(
+            &mut outcome,
+            &bad_chunk,
+            Err(AppViewError::Failed { method: "getPosts", status: None, attempts: 3 }),
+        );
+
+        assert_eq!(outcome.calls, 2);
+        assert_eq!(outcome.posts.len(), 1);
+        assert_eq!(outcome.posts.get(&good_post.uri), Some(&good_post));
+        assert_eq!(outcome.failed_uris, bad_chunk.into_iter().collect::<HashSet<_>>());
+    }
+
+    #[tokio::test]
+    async fn get_posts_lenient_makes_no_request_on_empty_input() {
+        let client =
+            AppViewClient::with_base_url("http://appview.invalid.example".to_string(), 1.0)
+                .expect("positive rate builds a client");
+        let outcome = client.get_posts_lenient(&[]).await;
+        assert_eq!(outcome, PostsOutcome::default());
     }
 
     #[test]

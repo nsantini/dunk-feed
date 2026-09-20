@@ -119,6 +119,127 @@ pub struct GetPostsResponse {
     pub posts: Vec<PostView>,
 }
 
+/// The shape of a quote post's own hydrated `postView.embed`, TECH-DESIGN
+/// section 8.2's table, read once here instead of twice (round 2 finding 8):
+/// `verify.rs` maps this to a `DropReason` and `validate.rs` maps it to its
+/// own `Reason`. `Normal` carries the embedded post's URI, on a plain
+/// `record#view` or a `recordWithMedia#view` whose inner `$type` is
+/// `#viewRecord`. `Absent` (no embed at all, or an outer `$type` that is
+/// neither `record#view` nor `recordWithMedia#view`) is kept distinct from
+/// `NotAPost` (an inner `$type` present but none of the four named ones):
+/// `validate.rs` falls through to its `getPosts`-map lookup on the first and
+/// reports `not_a_post` directly on the second, so the two must stay
+/// separate variants even though `verify.rs` maps both to the same
+/// `DropReason::NotAPost`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuoteEmbed {
+    Normal { uri: String },
+    Detached,
+    Blocked,
+    NotFound,
+    NotAPost,
+    Absent,
+}
+
+/// Classifies `q`'s own hydrated `postView.embed`, TECH-DESIGN section 8.2's
+/// table (BC51). Pure: reads nothing but `q.embed`.
+pub fn classify_quote_embed(q: &PostView) -> QuoteEmbed {
+    let inner = match &q.embed {
+        Some(EmbedView::Record { record }) => record,
+        Some(EmbedView::RecordWithMedia { record }) => &record.record,
+        Some(EmbedView::Other) | None => return QuoteEmbed::Absent,
+    };
+    match inner {
+        RecordViewInner::ViewRecord(view) => QuoteEmbed::Normal { uri: view.uri.clone() },
+        RecordViewInner::ViewDetached { .. } => QuoteEmbed::Detached,
+        RecordViewInner::ViewBlocked { .. } => QuoteEmbed::Blocked,
+        RecordViewInner::ViewNotFound { .. } => QuoteEmbed::NotFound,
+        RecordViewInner::Other => QuoteEmbed::NotAPost,
+    }
+}
+
+#[cfg(test)]
+mod classify_quote_embed_tests {
+    use super::*;
+
+    fn post(embed: Option<EmbedView>) -> PostView {
+        PostView {
+            uri: "at://did:plc:q/app.bsky.feed.post/q".to_string(),
+            cid: "cid-q".to_string(),
+            author: PostViewAuthor { did: "did:plc:q".to_string() },
+            labels: vec![],
+            record: PostRecord {
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                rest: serde_json::json!({}),
+            },
+            like_count: 0,
+            repost_count: 0,
+            reply_count: 0,
+            embed,
+        }
+    }
+
+    #[test]
+    fn absent_embed_is_absent() {
+        assert_eq!(classify_quote_embed(&post(None)), QuoteEmbed::Absent);
+    }
+
+    #[test]
+    fn other_outer_type_is_absent() {
+        assert_eq!(classify_quote_embed(&post(Some(EmbedView::Other))), QuoteEmbed::Absent);
+    }
+
+    #[test]
+    fn other_inner_type_is_not_a_post() {
+        let embed = EmbedView::Record { record: RecordViewInner::Other };
+        assert_eq!(classify_quote_embed(&post(Some(embed))), QuoteEmbed::NotAPost);
+    }
+
+    #[test]
+    fn view_record_is_normal() {
+        let uri = "at://did:plc:o/app.bsky.feed.post/o".to_string();
+        let embed = EmbedView::Record {
+            record: RecordViewInner::ViewRecord(EmbedRecordViewRecord { uri: uri.clone() }),
+        };
+        assert_eq!(classify_quote_embed(&post(Some(embed))), QuoteEmbed::Normal { uri });
+    }
+
+    #[test]
+    fn record_with_media_view_record_is_normal() {
+        let uri = "at://did:plc:o/app.bsky.feed.post/o".to_string();
+        let embed = EmbedView::RecordWithMedia {
+            record: RecordWithMediaInner {
+                record: RecordViewInner::ViewRecord(EmbedRecordViewRecord { uri: uri.clone() }),
+            },
+        };
+        assert_eq!(classify_quote_embed(&post(Some(embed))), QuoteEmbed::Normal { uri });
+    }
+
+    #[test]
+    fn view_detached_is_detached() {
+        let embed = EmbedView::Record {
+            record: RecordViewInner::ViewDetached { uri: "at://x".to_string() },
+        };
+        assert_eq!(classify_quote_embed(&post(Some(embed))), QuoteEmbed::Detached);
+    }
+
+    #[test]
+    fn view_blocked_is_blocked() {
+        let embed = EmbedView::Record {
+            record: RecordViewInner::ViewBlocked { uri: "at://x".to_string() },
+        };
+        assert_eq!(classify_quote_embed(&post(Some(embed))), QuoteEmbed::Blocked);
+    }
+
+    #[test]
+    fn view_not_found_is_not_found() {
+        let embed = EmbedView::Record {
+            record: RecordViewInner::ViewNotFound { uri: "at://x".to_string() },
+        };
+        assert_eq!(classify_quote_embed(&post(Some(embed))), QuoteEmbed::NotFound);
+    }
+}
+
 /// `app.bsky.actor.defs#profileView`. Only the fields the follower floor and
 /// author-state guards read (story 10): the DID to key the map, the follower
 /// count, and the account's own labels.

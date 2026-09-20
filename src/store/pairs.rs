@@ -38,6 +38,36 @@ pub struct ExpireReport {
     pub feed_expired: usize,
 }
 
+/// One verdict from a scorer verify phase, ready to apply in one transaction
+/// (round 2 finding 5, BC48). `Promote` carries the full `feed::FeedRow` to
+/// upsert; `Drop` and `Demote` carry just what `drop_pair`/`demote` need.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PairOutcome {
+    Promote(feed::FeedRow),
+    Drop { quote_uri: String, reason: DropReason },
+    Demote { quote_uri: String },
+}
+
+/// Applies every `PairOutcome` in `outcomes` inside one transaction (BC48):
+/// a failure partway through applies none of them. Round 2 finding 10: the
+/// scorer calls this once per verify phase (first verify, re-verify) instead
+/// of one blocking call per pair.
+pub fn apply_verdicts(conn: &Connection, outcomes: &[PairOutcome]) -> Result<(), StoreError> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for outcome in outcomes {
+        match outcome {
+            PairOutcome::Promote(row) => feed::promote(&tx, row)?,
+            PairOutcome::Drop { quote_uri, reason } => drop_pair(&tx, quote_uri, *reason)?,
+            PairOutcome::Demote { quote_uri } => demote(&tx, quote_uri)?,
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// `INSERT ... ON CONFLICT(quote_uri) DO NOTHING`, so a repeat `InsertPair`
 /// for a `quote_uri` already on file is a no-op, not an error (BC10).
 /// `first_seen_at` is whatever the caller passes; this function never reads
@@ -268,13 +298,19 @@ pub fn drop_pair(conn: &Connection, quote_uri: &str, reason: DropReason) -> Resu
 /// no non-dropped pair still names it on either side (BC61) — so a URI a
 /// live pair still needs (a shared original whose other quote survives) is
 /// never evicted. Round 1 finding 5 (BC79): every delete here is one
-/// statement over the whole matching set, not one statement per row.
+/// statement over the whole matching set, not one statement per row. Round 2
+/// finding 3 (BC46): the whole body runs inside one
+/// `conn.unchecked_transaction()`, committed at the end, so a failure
+/// part-way through never leaves a pair promoted without its `feed` row, or
+/// a `counts` row deleted while its `pairs` row survives.
 pub fn expire(
     conn: &Connection,
     now: i64,
     candidate_ttl_h: i64,
     feed_ttl_d: i64,
 ) -> Result<ExpireReport, StoreError> {
+    let tx = conn.unchecked_transaction()?;
+    let conn = &tx;
     let mut report = ExpireReport::default();
     let mut touched_uris: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -363,6 +399,7 @@ pub fn expire(
     }
     report.evicted_uris = orphaned;
 
+    tx.commit()?;
     Ok(report)
 }
 
@@ -803,6 +840,84 @@ mod tests {
         assert_eq!(state, "dropped");
         assert_eq!(drop_reason, Some("follower_floor".to_string()));
         assert_eq!(pair_count(&conn), 1, "the pair row stays");
+    }
+
+    // BC48: a mixed batch of `PairOutcome`s applies all three kinds
+    // atomically.
+    #[test]
+    fn apply_verdicts_applies_promote_drop_and_demote_in_one_transaction() {
+        let conn = migrated_conn();
+        let promote_uri = "at://did:plc:q/app.bsky.feed.post/promote";
+        let drop_uri = "at://did:plc:q/app.bsky.feed.post/drop";
+        let demote_uri = "at://did:plc:q/app.bsky.feed.post/demote";
+        insert_test_pair(&conn, promote_uri, "at://did:plc:o/app.bsky.feed.post/o1");
+        insert_test_pair(&conn, drop_uri, "at://did:plc:o/app.bsky.feed.post/o2");
+        insert_test_pair(&conn, demote_uri, "at://did:plc:o/app.bsky.feed.post/o3");
+        conn.execute("UPDATE pairs SET state = 'promoted' WHERE quote_uri = ?1", [demote_uri])
+            .unwrap();
+        insert_feed_row(&conn, demote_uri);
+
+        let mut row = feed_row_template(promote_uri);
+        row.quote_uri = promote_uri.to_string();
+        let outcomes = vec![
+            PairOutcome::Promote(row),
+            PairOutcome::Drop {
+                quote_uri: drop_uri.to_string(),
+                reason: crate::store::DropReason::FollowerFloor,
+            },
+            PairOutcome::Demote { quote_uri: demote_uri.to_string() },
+        ];
+
+        apply_verdicts(&conn, &outcomes).unwrap();
+
+        let promote_state: String = conn
+            .query_row("SELECT state FROM pairs WHERE quote_uri = ?1", [promote_uri], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(promote_state, "promoted");
+        let (drop_state, drop_reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, drop_reason FROM pairs WHERE quote_uri = ?1",
+                [drop_uri],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(drop_state, "dropped");
+        assert_eq!(drop_reason, Some("follower_floor".to_string()));
+        let demote_state: String = conn
+            .query_row("SELECT state FROM pairs WHERE quote_uri = ?1", [demote_uri], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(demote_state, "candidate");
+        assert_eq!(feed_count(&conn), 1, "only promote_uri's feed row remains");
+    }
+
+    #[test]
+    fn apply_verdicts_of_an_empty_slice_is_a_noop() {
+        let conn = migrated_conn();
+        apply_verdicts(&conn, &[]).unwrap();
+    }
+
+    fn feed_row_template(quote_uri: &str) -> feed::FeedRow {
+        feed::FeedRow {
+            quote_uri: quote_uri.to_string(),
+            quote_cid: format!("cid-{quote_uri}"),
+            quote_did: "did:plc:q".to_string(),
+            original_did: "did:plc:o".to_string(),
+            quoted_at: 1_700_000_000,
+            v_likes_q: 1,
+            v_reposts_q: 0,
+            v_replies_q: 0,
+            v_likes_o: 0,
+            v_reposts_o: 0,
+            v_replies_o: 0,
+            ratio: 1.5,
+            rank: 1.0,
+            promoted_at: 1_700_000_000,
+            verified_at: 1_700_000_000,
+        }
     }
 
     #[test]

@@ -54,6 +54,11 @@ pub enum Op {
     Checkpoint {
         seq: u64,
     },
+    // Story 08's `sendInteractions` endpoint is the first production
+    // constructor; no caller yet, so this narrowed allow replaces the
+    // `store` module's old blanket `#![allow(dead_code)]` (round 2
+    // finding 9) for this one variant.
+    #[allow(dead_code)]
     Interaction {
         item: Option<String>,
         event: Option<String>,
@@ -738,7 +743,12 @@ mod tests {
         handle.send(incr_op(uri_a, 1)).await.unwrap();
         handle.send(incr_op(uri_b, 2)).await.unwrap();
         handle.flush().await.unwrap();
-        counts::clear_dirty(&conn.lock().unwrap(), &[uri_a, uri_b]).unwrap();
+        let read = crate::score::Counts { likes: 1, reposts: 0, replies: 0 };
+        counts::clear_dirty_if_unchanged(
+            &conn.lock().unwrap(),
+            &[(uri_a.to_string(), read), (uri_b.to_string(), read)],
+        )
+        .unwrap();
 
         handle.send(Op::MarkAllDirty { seq: 3 }).await.unwrap();
         handle.flush().await.unwrap();

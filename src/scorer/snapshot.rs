@@ -39,7 +39,10 @@ impl SnapshotHandle {
     }
 
     /// The current snapshot. Cloning the returned `Arc` is cheap and never
-    /// blocks a concurrent `swap`.
+    /// blocks a concurrent `swap`. Round 2 finding 9: narrowed from a
+    /// module-wide `#![allow(dead_code)]` in `src/scorer/mod.rs`. No
+    /// non-test caller yet; story 08's HTTP server is the first.
+    #[allow(dead_code)]
     pub fn current(&self) -> Arc<Vec<FeedItem>> {
         self.inner.read().expect("snapshot lock poisoned").clone()
     }
@@ -61,20 +64,32 @@ impl Default for SnapshotHandle {
     }
 }
 
-/// Recomputes `rank` for every row from its stored `ratio` (`D`, unchanged
-/// since the row's last verify) and its verified `Q` engagement, at the
-/// current age. A `quoted_at` in the future clamps `age_hours` at `0.0`
-/// rather than handing `score::rank` a negative age (BC27).
-fn recompute_ranks(rows: &mut [FeedRow], weights: &Weights, now: i64) {
+/// Recomputes `rank` for every row from both sides' stored `v_*` counts,
+/// re-derived with the current `Weights` and `k` (round 2 finding 7, BC50),
+/// rather than trusting the stored `ratio` at face value: `k` can change
+/// between builds, even though the verified counts themselves are frozen
+/// until the next verify. `feed.ratio` itself is left untouched as the
+/// promotion-time record — only the freshly recomputed `D` local to this
+/// function feeds `score::rank`. `age_hours` uses the current age. A
+/// `quoted_at` in the future clamps `age_hours` at `0.0` rather than handing
+/// `score::rank` a negative age (BC27).
+fn recompute_ranks(rows: &mut [FeedRow], weights: &Weights, now: i64, k: f64) {
     for row in rows.iter_mut() {
         let counts_q = Counts {
             likes: row.v_likes_q.max(0) as u32,
             reposts: row.v_reposts_q.max(0) as u32,
             replies: row.v_replies_q.max(0) as u32,
         };
+        let counts_o = Counts {
+            likes: row.v_likes_o.max(0) as u32,
+            reposts: row.v_reposts_o.max(0) as u32,
+            replies: row.v_replies_o.max(0) as u32,
+        };
         let eq = score::engagement(&counts_q, weights);
+        let eo = score::engagement(&counts_o, weights);
+        let d = score::ratio(eq, eo, k);
         let age_hours = ((now - row.quoted_at) as f64 / 3600.0).max(0.0);
-        row.rank = score::rank(row.ratio, eq, age_hours);
+        row.rank = score::rank(d, eq, age_hours);
     }
 }
 
@@ -142,11 +157,20 @@ fn push_kept(
 /// list is exhausted, every item still stuck in the deferred queue is
 /// illegal for good — the window cannot shrink without a new output — so
 /// the whole remainder is dropped from this snapshot (BC31).
+///
+/// Round 2 finding 6 (BC49): deferred rows are stored bucketed by
+/// `quote_did` in `deferred: HashMap<String, VecDeque<FeedRow>>`, popped
+/// front-first from the bucket that becomes legal, rather than in one flat
+/// `VecDeque<FeedRow>`. `defer_order` carries the release order — one `did`
+/// entry per deferred row, in the order it was deferred — so the row
+/// actually released at each step, and the whole output order, are
+/// identical to the previous scan-based version.
 fn apply_cap_one_per_quoter_per_50(rows: Vec<FeedRow>) -> Vec<FeedItem> {
     const WINDOW: usize = 49;
     let mut window_queue: VecDeque<String> = VecDeque::with_capacity(WINDOW);
     let mut window_counts: HashMap<String, usize> = HashMap::new();
-    let mut deferred: VecDeque<FeedRow> = VecDeque::new();
+    let mut deferred: HashMap<String, VecDeque<FeedRow>> = HashMap::new();
+    let mut defer_order: VecDeque<String> = VecDeque::new();
     let mut output: Vec<FeedItem> = Vec::with_capacity(rows.len());
     let mut main_idx = 0usize;
 
@@ -154,9 +178,14 @@ fn apply_cap_one_per_quoter_per_50(rows: Vec<FeedRow>) -> Vec<FeedItem> {
         |did: &str, counts: &HashMap<String, usize>| counts.get(did).copied().unwrap_or(0) == 0;
 
     loop {
-        if let Some(pos) = deferred.iter().position(|row| is_legal(&row.quote_did, &window_counts))
+        if let Some(release_pos) = defer_order.iter().position(|did| is_legal(did, &window_counts))
         {
-            let row = deferred.remove(pos).expect("position just found in this deque");
+            let did = defer_order.remove(release_pos).expect("position just found in this deque");
+            let bucket = deferred.get_mut(&did).expect("a did in defer_order has a bucket");
+            let row = bucket.pop_front().expect("a did in defer_order has at least one row");
+            if bucket.is_empty() {
+                deferred.remove(&did);
+            }
             push_kept(row, &mut output, &mut window_queue, &mut window_counts, WINDOW);
             continue;
         }
@@ -167,7 +196,9 @@ fn apply_cap_one_per_quoter_per_50(rows: Vec<FeedRow>) -> Vec<FeedItem> {
             if is_legal(&row.quote_did, &window_counts) {
                 push_kept(row, &mut output, &mut window_queue, &mut window_counts, WINDOW);
             } else {
-                deferred.push_back(row);
+                let did = row.quote_did.clone();
+                deferred.entry(did.clone()).or_default().push_back(row);
+                defer_order.push_back(did);
             }
             continue;
         }
@@ -181,9 +212,10 @@ fn apply_cap_one_per_quoter_per_50(rows: Vec<FeedRow>) -> Vec<FeedItem> {
 
 /// The full snapshot step, TECH-DESIGN section 7.3: recompute rank, sort,
 /// cap 1, cap 2. Pure and synchronous, so the caller can build it outside
-/// the `SnapshotHandle`'s lock (BC33).
-pub fn build(mut rows: Vec<FeedRow>, weights: &Weights, now: i64) -> Vec<FeedItem> {
-    recompute_ranks(&mut rows, weights, now);
+/// the `SnapshotHandle`'s lock (BC33). `k` reaches here from `Config`
+/// (round 2 finding 7, BC50), never a literal.
+pub fn build(mut rows: Vec<FeedRow>, weights: &Weights, now: i64, k: f64) -> Vec<FeedItem> {
+    recompute_ranks(&mut rows, weights, now, k);
     sort_by_rank(&mut rows);
     let capped_by_author = apply_cap_one_per_author_per_day(rows);
     apply_cap_one_per_quoter_per_50(capped_by_author)
@@ -256,9 +288,29 @@ mod tests {
             now + 3600,
             0.0,
         )];
-        recompute_ranks(&mut rows, &weights(), now);
+        recompute_ranks(&mut rows, &weights(), now, 5.0);
         assert!(rows[0].rank.is_finite());
         assert!(rows[0].rank > 0.0);
+    }
+
+    // BC50: `rank` is recomputed from both sides' stored `v_*` counts with
+    // the current weights and `k`, not from the stored `ratio`; `ratio`
+    // itself is left untouched as the promotion-time record.
+    #[test]
+    fn recompute_ranks_uses_current_weights_and_k_not_stored_ratio() {
+        let now = 1_700_000_000;
+        let mut r = row("at://did:plc:q/app.bsky.feed.post/q", "did:plc:q", "did:plc:o", now, 0.0);
+        r.ratio = 999.0; // A stale value `recompute_ranks` must not trust.
+        r.v_likes_q = 100;
+        r.v_likes_o = 20;
+        let mut rows = vec![r];
+
+        recompute_ranks(&mut rows, &weights(), now, 5.0);
+
+        // D = eq / (eo + k) = 100 / (20 + 5) = 4.0, not the stale 999.0.
+        let expected_rank = score::rank(4.0, 100.0, 0.0);
+        assert_eq!(rows[0].rank, expected_rank);
+        assert_eq!(rows[0].ratio, 999.0, "ratio itself is left untouched");
     }
 
     // AC6, BC28: two items sharing (original_did, UTC day) keep only the
@@ -474,6 +526,53 @@ mod tests {
         assert_eq!(kept.last().unwrap().quote_uri, "at://did:plc:q/app.bsky.feed.post/50th");
     }
 
+    // BC49: two rows deferred for one DID release in the same order they
+    // were deferred (rank order), proving the per-DID bucket's `VecDeque`
+    // pops front-first rather than, say, last-in-first-out. Releasing
+    // `first` re-adds `quoter` to the window (`push_kept` always does), so
+    // `second` needs the window to clear a second time before it can
+    // release: 49 filler pushes evict `head`'s window entry, freeing
+    // `first`; then 49 more evict the window entry `first`'s own release
+    // just added, freeing `second`.
+    #[test]
+    fn cap_one_per_quoter_per_50_releases_many_deferred_rows_for_one_did_in_order() {
+        let quoter = "did:plc:same";
+        let mut rows = vec![row(
+            "at://did:plc:q/app.bsky.feed.post/head",
+            quoter,
+            "did:plc:o0",
+            1_700_000_000,
+            200.0,
+        )];
+        for (name, rank) in [("first", 100.0), ("second", 99.0)] {
+            rows.push(row(
+                &format!("at://did:plc:q/app.bsky.feed.post/{name}"),
+                quoter,
+                "did:plc:o1",
+                1_700_000_000,
+                rank,
+            ));
+        }
+        for i in 0..98 {
+            rows.push(row(
+                &format!("at://did:plc:q/app.bsky.feed.post/filler{i}"),
+                &format!("did:plc:filler{i}"),
+                "did:plc:o2",
+                1_700_000_000,
+                6.0 - i as f64 * 0.01,
+            ));
+        }
+
+        let kept = apply_cap_one_per_quoter_per_50(rows);
+
+        let uris: Vec<&str> = kept.iter().map(|item| item.quote_uri.as_str()).collect();
+        let first_idx =
+            uris.iter().position(|u| *u == "at://did:plc:q/app.bsky.feed.post/first").unwrap();
+        let second_idx =
+            uris.iter().position(|u| *u == "at://did:plc:q/app.bsky.feed.post/second").unwrap();
+        assert!(first_idx < second_idx, "released in the order they were deferred");
+    }
+
     // AC6 + AC7 together, and BC26: `build` recomputes rank, re-sorts, then
     // applies both caps in order.
     #[test]
@@ -497,7 +596,7 @@ mod tests {
             ),
         ];
 
-        let items = build(rows, &weights(), now);
+        let items = build(rows, &weights(), now, 5.0);
 
         assert_eq!(items.len(), 1, "cap 1 drops the second same-author-same-day row");
     }

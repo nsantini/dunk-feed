@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::appview::types::{EmbedView, PostView, RecordViewInner};
+use crate::appview::types::{classify_quote_embed, PostView, QuoteEmbed};
 use crate::score::Counts;
 use crate::store::DropReason;
 
@@ -61,9 +61,12 @@ pub fn verify_pair(
         return Verdict::Drop(DropReason::OriginalGone);
     };
 
-    let embedded_uri = match embedded_record(q) {
-        Ok(uri) => uri,
-        Err(reason) => return Verdict::Drop(reason),
+    let embedded_uri = match classify_quote_embed(q) {
+        QuoteEmbed::Normal { uri } => uri,
+        QuoteEmbed::Detached => return Verdict::Drop(DropReason::Detached),
+        QuoteEmbed::Blocked => return Verdict::Drop(DropReason::Blocked),
+        QuoteEmbed::NotFound => return Verdict::Drop(DropReason::OriginalGone),
+        QuoteEmbed::NotAPost | QuoteEmbed::Absent => return Verdict::Drop(DropReason::NotAPost),
     };
 
     if embedded_uri != original_uri {
@@ -86,29 +89,12 @@ pub fn verify_pair(
     })
 }
 
-/// TECH-DESIGN section 8.2's table, applied to `q.embed`. Returns the
-/// embedded post's URI on a normal quote or a normal quote with media
-/// (BC6, BC7); a `DropReason` for every other shape (BC8 to BC11).
-fn embedded_record(q: &PostView) -> Result<&str, DropReason> {
-    let inner = match &q.embed {
-        Some(EmbedView::Record { record }) => record,
-        Some(EmbedView::RecordWithMedia { record }) => &record.record,
-        Some(EmbedView::Other) | None => return Err(DropReason::NotAPost),
-    };
-    match inner {
-        RecordViewInner::ViewRecord(view) => Ok(view.uri.as_str()),
-        RecordViewInner::ViewDetached { .. } => Err(DropReason::Detached),
-        RecordViewInner::ViewBlocked { .. } => Err(DropReason::Blocked),
-        RecordViewInner::ViewNotFound { .. } => Err(DropReason::OriginalGone),
-        RecordViewInner::Other => Err(DropReason::NotAPost),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::appview::types::{
-        EmbedRecordViewRecord, GetPostsResponse, PostRecord, PostViewAuthor, RecordWithMediaInner,
+        EmbedRecordViewRecord, EmbedView, GetPostsResponse, PostRecord, PostViewAuthor,
+        RecordViewInner, RecordWithMediaInner,
     };
 
     const GETPOSTS_NORMAL_QUOTE: &str =
