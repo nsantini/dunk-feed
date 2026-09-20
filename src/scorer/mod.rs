@@ -511,6 +511,8 @@ pub async fn one_pass<S: PostSource + ProfileSource>(
     tracing::info!(
         selected = counters.selected,
         appview_calls = counters.appview_calls,
+        profile_calls = counters.profile_calls,
+        deferred = counters.deferred,
         promoted = counters.promoted,
         demoted = counters.demoted,
         dropped = dropped_total,
@@ -863,6 +865,7 @@ mod tests {
             one_pass(&store, &source, &cfg, &evict_tx, now, false, &snapshot).await.unwrap();
 
         assert_eq!(counters.promoted, 1);
+        assert_eq!(counters.profile_calls, 1, "the pass line's profile_calls reflects the fetch");
         let feed_rows = store.feed_rows().unwrap();
         assert_eq!(feed_rows.len(), 1);
         assert_eq!(feed_rows[0].quote_uri, quote_uri);
@@ -1185,6 +1188,7 @@ mod tests {
 
         assert_eq!(counters.promoted, 0);
         assert_eq!(counters.deferred, 1);
+        assert_eq!(counters.profile_calls, 1, "the pass line's profile_calls counts the attempt");
         assert!(counters.dropped.is_empty());
         assert!(store.feed_rows().unwrap().is_empty());
 
