@@ -11,13 +11,12 @@
 //! Round 2 finding 10 folds the first-verify and re-verify branches of
 //! `one_pass` into one `verify_and_apply`, shared by both phases.
 
-// Round 2 finding 9: narrowed to story 10's guard stub only.
-// `GuardResult::Drop` (`guards.rs`) has no caller yet; this module-level
-// attribute is what suppresses it, since the variant is defined in a child
-// module of this one. `SnapshotHandle::current` (story 08) and every other
-// item that still needs it now carries its own local `#[allow(dead_code)]`
-// instead of relying on this one.
-#![allow(dead_code)]
+// Round 2 finding 9, finished in slice 6.0: the module-level
+// `#![allow(dead_code)]` is gone. `GuardResult::Drop` (`guards.rs`) has no
+// caller yet, since story 10 is its first constructor; it now carries its
+// own local `#[allow(dead_code)]` there instead of relying on a blanket
+// attribute here. `SnapshotHandle::current` (story 08) and every other item
+// that still needs one carries its own local `#[allow(dead_code)]` too.
 
 pub mod guards;
 pub mod snapshot;

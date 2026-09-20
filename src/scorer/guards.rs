@@ -14,6 +14,11 @@ use crate::store::DropReason;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardResult {
     Pass,
+    // Story 10 is this variant's first constructor: the follower floor,
+    // author-state and label checks it adds will build `Drop`. Until then
+    // nothing constructs it, so it needs its own attribute now that
+    // `src/scorer/mod.rs`'s blanket `#![allow(dead_code)]` is gone.
+    #[allow(dead_code)]
     Drop(DropReason),
 }
 
