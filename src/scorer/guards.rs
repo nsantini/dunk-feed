@@ -971,4 +971,48 @@ mod tests {
     // satisfied by substring match against the `log_only_window_meta_clock_*`
     // tests above and `check_batch_log_only_window_suppresses_and_counts`,
     // for the same reason noted above `cache_thirty_dids_causes_two_calls`.
+
+    // AC7: a live `getProfiles` call for the reference pair's two DIDs
+    // (`scorer::tests::scorer_live_pass`'s `did:plc:o7xt7svg2xtjbb4e2xqahqqc`
+    // and `did:plc:ofzkhjyyh4kl4a35wxgmobmm`) plus two well-known accounts,
+    // printing each DID's real follower count and the resulting histogram
+    // bucket so an operator can eyeball a real distribution before setting
+    // `DUNK_FOLLOWER_FLOOR`. `#[ignore]`d, per `AGENTS.md`: run by hand with
+    // `cargo test --all-features -- --ignored
+    // guards_live_follower_distribution`.
+    #[tokio::test]
+    #[ignore]
+    async fn guards_live_follower_distribution() {
+        let config = crate::config::load(|name| match name {
+            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
+            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        let client =
+            AppViewClient::new(&config).expect("cfg.appview_rps is validated by config::load");
+
+        let dids: Vec<String> = vec![
+            "did:plc:o7xt7svg2xtjbb4e2xqahqqc".to_string(), // reference pair's Q author
+            "did:plc:ofzkhjyyh4kl4a35wxgmobmm".to_string(), // reference pair's O author
+            "did:plc:z72i7hdynmk6r22z27h6tvur".to_string(), // bsky.app
+            "did:plc:plcl43vt7d2ig7hif4zmyg6h".to_string(), // well-known account
+        ];
+
+        let outcome = client.get_profiles_lenient(&dids).await;
+        assert!(
+            outcome.failed_dids.is_empty(),
+            "every DID should resolve against the real App View"
+        );
+
+        let mut histogram = FollowerHistogram::default();
+        for did in &dids {
+            let followers = outcome.profiles.get(did).map(|p| i64::from(p.followers_count));
+            println!("did={did} followers={followers:?}");
+            if let Some(count) = followers {
+                histogram.record(count);
+            }
+        }
+        println!("{histogram:?}");
+    }
 }
