@@ -9,6 +9,7 @@ mod health;
 mod http;
 mod ingest;
 mod jetstream;
+mod publish;
 mod score;
 mod scorer;
 mod store;

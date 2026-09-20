@@ -25,7 +25,6 @@ pub struct Secret(String);
 
 impl Secret {
     /// Returns the plain value. Use only when building the request that needs it.
-    #[allow(dead_code)] // First caller is `dunk publish`, story 09.
     pub fn expose(&self) -> &str {
         &self.0
     }

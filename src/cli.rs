@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::appview::AppViewClient;
 use crate::config::Config;
 use crate::ingest::{self, IngestError};
+use crate::publish::{self, PublishError};
 use crate::score::{Thresholds, Weights};
 use crate::validate::{self, ValidateError};
 
@@ -25,10 +26,13 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The four subcommands. `Run`, `Publish` and `Dump` are stubs that print
-/// their own name and return success; later stories add their real
-/// behaviour. `Validate` runs `dunk validate`, TECH-DESIGN section 10's
-/// phase 0 tool.
+/// The four subcommands. `Dump` is still a stub that prints its own name and
+/// returns success; a later story adds its real behaviour. `Run` and
+/// `Validate` are real: `Run` is `dunk run`, story 06's ingest task
+/// (TECH-DESIGN section 5.1), and `Validate` is `dunk validate`, TECH-DESIGN
+/// section 10's phase 0 tool. `Publish` is `dunk publish`, story 09,
+/// TECH-DESIGN section 11.2: it writes the `app.bsky.feed.generator` record.
+/// All three real subcommands run through [`dispatch`].
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
     /// Run the ingest, scorer and HTTP server.
@@ -49,17 +53,23 @@ pub enum Command {
         csv_path: PathBuf,
     },
     /// Publish the feed generator record.
-    Publish,
+    Publish {
+        /// A local image file uploaded as the feed's avatar before the
+        /// record is written. `png`, `jpg` or `jpeg`, compared lowercased
+        /// (BC4, BC5). Omit to publish with no avatar (BC3).
+        #[arg(long)]
+        avatar: Option<PathBuf>,
+    },
     /// Dump the current feed to stdout.
     Dump,
 }
 
 impl Command {
-    /// Prints this command's own name to stdout (BC12). `Publish` and
-    /// `Dump` have no other behaviour yet; `Run` and `Validate`'s real
-    /// behaviour runs through [`dispatch`] instead, since both need
-    /// `Config`, and `Run` no longer prints its own name (`dispatch` calls
-    /// `ingest::run` for it directly).
+    /// Prints this command's own name to stdout (BC12). `Dump` has no other
+    /// behaviour yet; `Run`, `Validate` and `Publish`'s real behaviour runs
+    /// through [`dispatch`] instead, since each needs `Config` (`Run` no
+    /// longer prints its own name; `dispatch` calls `ingest::run` for it
+    /// directly).
     pub fn run(&self) {
         println!("{}", self.name());
     }
@@ -70,33 +80,35 @@ impl Command {
         match self {
             Command::Run => "run",
             Command::Validate { .. } => "validate",
-            Command::Publish => "publish",
+            Command::Publish { .. } => "publish",
             Command::Dump => "dump",
         }
     }
 }
 
 /// Every error a subcommand can raise, so `main.rs` has one type to catch
-/// (BC34). `Publish` and `Dump` are infallible stubs and never construct
-/// either variant.
+/// (BC34). `Dump` is an infallible stub and never constructs any variant.
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error(transparent)]
     Validate(#[from] ValidateError),
     #[error(transparent)]
     Ingest(#[from] IngestError),
+    #[error(transparent)]
+    Publish(#[from] PublishError),
 }
 
 /// Dispatches `command`, built from `config`. `Run` calls `ingest::run`
 /// (BC33 to BC35); `Validate` builds the `AppViewClient`, `Weights` and
 /// `Thresholds` `config` describes and calls `validate::run` with its own
-/// flags; `Publish` and `Dump` only print their own name (`Command::run`).
-/// This is the only path that can fail: `main.rs` prints the error and
-/// exits 1 (BC10, BC11, BC12, BC34). Round 1 finding 6: `Validate`'s body
-/// used to live in a separate `dispatch_validate`, whose only reason to
-/// exist was mapping `ValidateError` to `CliError::Validate` at its call
-/// site; `CliError::Validate`'s own `#[from]` does that through `?` just as
-/// well, so the indirection is gone.
+/// flags; `Publish` calls `publish::run` and prints the at-URI it returns
+/// (BC13); `Dump` only prints its own name (`Command::run`). This is the
+/// only path that can fail: `main.rs` prints the error and exits 1 (BC10,
+/// BC11, BC12, BC34). Round 1 finding 6: `Validate`'s body used to live in a
+/// separate `dispatch_validate`, whose only reason to exist was mapping
+/// `ValidateError` to `CliError::Validate` at its call site;
+/// `CliError::Validate`'s own `#[from]` does that through `?` just as well,
+/// so the indirection is gone.
 pub async fn dispatch(command: &Command, config: &Config) -> Result<(), CliError> {
     match command {
         Command::Run => ingest::run(config).await?,
@@ -106,6 +118,10 @@ pub async fn dispatch(command: &Command, config: &Config) -> Result<(), CliError
             let thresholds = Thresholds::from(config);
             validate::run(&client, &weights, &thresholds, *pages, seed_file.as_deref(), csv_path)
                 .await?;
+        }
+        Command::Publish { avatar } => {
+            let uri = publish::run(config, avatar.as_deref()).await?;
+            println!("{uri}");
         }
         other => other.run(),
     }
@@ -126,11 +142,13 @@ mod tests {
 
     #[test]
     fn stub_subcommands_exit_zero() {
-        for command in [Command::Run, validate_command(), Command::Publish, Command::Dump] {
+        for command in
+            [Command::Run, validate_command(), Command::Publish { avatar: None }, Command::Dump]
+        {
             // `run` only prints; reaching this line without panicking is the
             // stub's whole contract, matching "exits 0" for a library call.
-            // `Validate`'s real behaviour is `dispatch`, not `run`, so this
-            // never touches the network.
+            // `Validate` and `Publish`'s real behaviour is `dispatch`, not
+            // `run`, so this never touches the network.
             command.run();
         }
     }
@@ -139,7 +157,7 @@ mod tests {
     fn each_command_prints_its_own_name() {
         assert_eq!(Command::Run.name(), "run");
         assert_eq!(validate_command().name(), "validate");
-        assert_eq!(Command::Publish.name(), "publish");
+        assert_eq!(Command::Publish { avatar: None }.name(), "publish");
         assert_eq!(Command::Dump.name(), "dump");
     }
 
@@ -183,6 +201,46 @@ mod tests {
     fn missing_subcommand_prints_usage_and_exits_non_zero() {
         let err = Cli::try_parse_from(["dunk"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
+    }
+
+    #[test]
+    fn publish_flags_default_to_no_avatar() {
+        let cli = Cli::try_parse_from(["dunk", "publish"]).expect("publish parses with no flags");
+        match cli.command {
+            Command::Publish { avatar } => assert_eq!(avatar, None),
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_avatar_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["dunk", "publish", "--avatar", "avatar.png"])
+            .expect("publish parses with --avatar");
+        match cli.command {
+            Command::Publish { avatar } => assert_eq!(avatar, Some(PathBuf::from("avatar.png"))),
+            other => panic!("expected Publish, got {other:?}"),
+        }
+    }
+
+    // BC1: dispatch surfaces preflight's error through CliError::Publish
+    // before any network call, since no BSKY_HANDLE is set here.
+    #[tokio::test]
+    async fn publish_with_missing_credentials_is_a_cli_publish_error() {
+        let lookup = |name: &str| match name {
+            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
+            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            _ => None,
+        };
+        let config = crate::config::load(lookup).expect("minimal config loads");
+
+        let result = dispatch(&Command::Publish { avatar: None }, &config).await;
+
+        match result {
+            Err(CliError::Publish(PublishError::MissingCredentials { var })) => {
+                assert_eq!(var, "BSKY_HANDLE");
+            }
+            other => panic!("expected CliError::Publish(MissingCredentials), got {other:?}"),
+        }
     }
 
     #[tokio::test]
