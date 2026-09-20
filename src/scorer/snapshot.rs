@@ -112,15 +112,20 @@ fn recompute_ranks(
     ratios
 }
 
+/// `rank DESC, cid ASC`, the one comparator both `sort_by_rank` and
+/// `src/http/skeleton.rs`'s page scan use (BC46, round 2 finding 6): a
+/// duplicate copy of this same rule, `cursor::cmp_by_rank_then_cid`, used to
+/// live in `src/http/cursor.rs` and has been deleted in its favour.
+pub fn cmp_rank_then_cid(a: (f64, &str), b: (f64, &str)) -> std::cmp::Ordering {
+    let (rank_a, cid_a) = a;
+    let (rank_b, cid_b) = b;
+    rank_b.partial_cmp(&rank_a).unwrap_or(std::cmp::Ordering::Equal).then_with(|| cid_a.cmp(cid_b))
+}
+
 /// `rank DESC, quote_cid ASC` (BC26), the same tie rule `Store::feed_rows`
 /// starts from, re-applied after `recompute_ranks` changes `rank`.
 fn sort_by_rank(rows: &mut [FeedRow]) {
-    rows.sort_by(|a, b| {
-        b.rank
-            .partial_cmp(&a.rank)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.quote_cid.cmp(&b.quote_cid))
-    });
+    rows.sort_by(|a, b| cmp_rank_then_cid((a.rank, &a.quote_cid), (b.rank, &b.quote_cid)));
 }
 
 /// Cap 1: one item per `(original_did, UTC day of quoted_at)`, keeping the
@@ -285,6 +290,16 @@ mod tests {
             promoted_at: quoted_at,
             verified_at: quoted_at,
         }
+    }
+
+    // BC46: the one comparator, moved here from the now-deleted
+    // `cursor::cmp_by_rank_then_cid`.
+    #[test]
+    fn cmp_rank_then_cid_orders_rank_desc_then_cid_asc() {
+        assert_eq!(cmp_rank_then_cid((2.0, "a"), (1.0, "b")), std::cmp::Ordering::Less);
+        assert_eq!(cmp_rank_then_cid((1.0, "b"), (2.0, "a")), std::cmp::Ordering::Greater);
+        assert_eq!(cmp_rank_then_cid((1.0, "a"), (1.0, "b")), std::cmp::Ordering::Less);
+        assert_eq!(cmp_rank_then_cid((1.0, "a"), (1.0, "a")), std::cmp::Ordering::Equal);
     }
 
     // BC41: a fresh handle reads an empty list, never a panic and never

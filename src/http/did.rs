@@ -26,21 +26,18 @@ pub struct Service {
     pub service_endpoint: String,
 }
 
-/// Builds the document from `cfg.hostname`: `did:web:<host>` as the DID and
+/// Builds the document from `state.cfg`: `did:web:<host>` (BC44's
+/// precomputed `did_web`, never reformatted here) as the DID and
 /// `https://<host>` as the service endpoint, per BC1.
-///
-/// No non-test caller yet: registered on `router` (`src/http/mod.rs`),
-/// itself uncalled until `run` (slice 3.0) starts the HTTP task.
-#[allow(dead_code)]
 pub async fn handler(State(state): State<Arc<AppState>>) -> Json<DidDocument> {
-    let host = &state.cfg.hostname;
+    let cfg = &state.cfg;
     Json(DidDocument {
         context: vec!["https://www.w3.org/ns/did/v1".to_string()],
-        id: format!("did:web:{host}"),
+        id: cfg.did_web.clone(),
         service: vec![Service {
             id: "#bsky_fg".to_string(),
             kind: "BskyFeedGenerator".to_string(),
-            service_endpoint: format!("https://{host}"),
+            service_endpoint: format!("https://{}", cfg.hostname),
         }],
     })
 }

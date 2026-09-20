@@ -21,18 +21,13 @@ pub struct Feed {
 }
 
 /// `did:web:<host>` and one feed, `at://<publisher_did>/app.bsky.feed.generator/<rkey>`,
-/// per BC2.
-///
-/// No non-test caller yet: registered on `router` (`src/http/mod.rs`),
-/// itself uncalled until `run` (slice 3.0) starts the HTTP task.
-#[allow(dead_code)]
+/// per BC2. Both strings come straight off `state.cfg` (BC44): neither is
+/// reformatted here.
 pub async fn handler(State(state): State<Arc<AppState>>) -> Json<DescribeFeedGenerator> {
     let cfg = &state.cfg;
     Json(DescribeFeedGenerator {
-        did: format!("did:web:{}", cfg.hostname),
-        feeds: vec![Feed {
-            uri: format!("at://{}/app.bsky.feed.generator/{}", cfg.publisher_did, cfg.feed_rkey),
-        }],
+        did: cfg.did_web.clone(),
+        feeds: vec![Feed { uri: cfg.feed_uri.clone() }],
     })
 }
 

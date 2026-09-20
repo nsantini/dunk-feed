@@ -45,9 +45,6 @@ pub struct SendInteractionsResponse {}
 /// failing the request (BC28); the response is always 200 `{}` once the
 /// body itself parsed. `interactions` present and empty (BC34) touches this
 /// loop zero times and still returns 200 `{}`.
-///
-/// No non-test caller yet: registered on `router` (`src/http/mod.rs`),
-/// itself uncalled until `run` (`src/ingest/mod.rs`) starts the HTTP task.
 pub async fn handler(State(state): State<Arc<AppState>>, bytes: Bytes) -> Response {
     let body: SendInteractionsRequest = match serde_json::from_slice(&bytes) {
         Ok(body) => body,
@@ -193,10 +190,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    // Slice 4.0: `reqId` reaches `Op::Interaction` and lands in the written
-    // row's `req_id` column. A file-backed store, not `test_state`'s
-    // in-memory one, so the row can be read back after `flush` through a
-    // second connection on the same path.
+    // Slice 4.0 / round 2 finding 9 (BC47): `reqId` reaches `Op::Interaction`
+    // and lands in the written row's `req_id` column. A file-backed store,
+    // not `test_state`'s in-memory one, so the row can be read back after
+    // `flush` — through `Store::interactions` (BC47: no raw SQL outside
+    // `src/store/`), not a second hand-rolled connection.
     #[tokio::test]
     async fn req_id_reaches_the_written_row() {
         let nanos =
@@ -211,7 +209,7 @@ mod tests {
             snapshot: crate::scorer::snapshot::SnapshotHandle::new(),
             writer: writer.clone(),
             health: crate::health::HealthState::new(),
-            cfg,
+            cfg: crate::http::HttpConfig::from(&cfg),
         });
         let app = router(state);
 
@@ -230,13 +228,10 @@ mod tests {
 
         writer.flush().await.unwrap();
 
-        let conn = rusqlite::Connection::open(&path_str).expect("reopen must succeed");
-        let req_id: Option<String> = conn
-            .query_row("SELECT req_id FROM interactions", [], |row| row.get(0))
-            .expect("one row must exist");
-        assert_eq!(req_id, Some("req-42".to_string()));
+        let rows = store.interactions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].req_id, Some("req-42".to_string()));
 
-        drop(conn);
         let _ = std::fs::remove_file(&path_str);
         let _ = std::fs::remove_file(format!("{path_str}-wal"));
         let _ = std::fs::remove_file(format!("{path_str}-shm"));
@@ -247,7 +242,8 @@ mod tests {
     // are proven at the store layer by
     // `src/store/interactions.rs::insert_interaction_allows_null_payload_columns`;
     // this test covers the HTTP contract that a `reqId`-carrying
-    // `InteractionBody` did not narrow that acceptance).
+    // `InteractionBody` did not narrow that acceptance), read back through
+    // `Store::interactions` (BC47).
     #[tokio::test]
     async fn all_fields_absent_including_req_id_still_writes_one_row() {
         let nanos =
@@ -263,7 +259,7 @@ mod tests {
             snapshot: crate::scorer::snapshot::SnapshotHandle::new(),
             writer: writer.clone(),
             health: crate::health::HealthState::new(),
-            cfg,
+            cfg: crate::http::HttpConfig::from(&cfg),
         });
         let app = router(state);
 
@@ -273,27 +269,13 @@ mod tests {
 
         writer.flush().await.unwrap();
 
-        let conn = rusqlite::Connection::open(&path_str).expect("reopen must succeed");
-        let (count, item, event, feed_context, req_id): (
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = conn
-            .query_row(
-                "SELECT count(*), max(item), max(event), max(feed_context), max(req_id) FROM interactions",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(item, None);
-        assert_eq!(event, None);
-        assert_eq!(feed_context, None);
-        assert_eq!(req_id, None);
+        let rows = store.interactions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item, None);
+        assert_eq!(rows[0].event, None);
+        assert_eq!(rows[0].feed_context, None);
+        assert_eq!(rows[0].req_id, None);
 
-        drop(conn);
         let _ = std::fs::remove_file(&path_str);
         let _ = std::fs::remove_file(format!("{path_str}-wal"));
         let _ = std::fs::remove_file(format!("{path_str}-shm"));

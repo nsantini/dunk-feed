@@ -3,9 +3,11 @@
 //! returned so the next request can resume from it. The snapshot is not
 //! totally ordered by `(rank DESC, cid ASC)` once
 //! `snapshot::apply_cap_one_per_quoter_per_50` has deferred items past
-//! lower-ranked ones (TECH-DESIGN section 11.1), so slice 3.0's page scan
-//! finds the resume point with one linear scan, not a binary search; this
-//! module supplies the comparator that scan uses (BC16, BC30, BC31).
+//! lower-ranked ones (TECH-DESIGN section 11.1), so `src/http/skeleton.rs`'s
+//! page scan finds the resume point with one linear scan, not a binary
+//! search (BC16, BC30, BC31). Round 2 finding 6 (BC46): the comparator that
+//! scan uses is `scorer::snapshot::cmp_rank_then_cid`, the same one
+//! `sort_by_rank` uses; this module no longer keeps its own copy.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -30,22 +32,25 @@ pub enum CursorError {
 /// Encodes `rank` and `cid` as a base64url (no padding) cursor: the rank's
 /// raw bits as 16 lowercase hex digits, a `:`, then the CID verbatim. Hex on
 /// the bit pattern, not the float itself, keeps `0.0` and `-0.0` distinct
-/// (BC31) and the round trip exact (BC16).
-///
-/// No caller yet in this slice; slice 3.0's page scan is the first (BC12 in
-/// `tasks.md` 1.7).
-#[allow(dead_code)]
+/// (BC31) and the round trip exact (BC16). `src/http/skeleton.rs`'s page
+/// scan is the caller.
 pub fn encode(rank: f64, cid: &str) -> String {
     let raw = format!("{:016x}:{cid}", rank.to_bits());
     URL_SAFE_NO_PAD.encode(raw.as_bytes())
 }
 
 /// Decodes a cursor produced by `encode`, or fails with the specific
-/// `CursorError` slice 3.0's `getFeedSkeleton` handler maps to
+/// `CursorError` `src/http/skeleton.rs`'s `getFeedSkeleton` handler maps to
 /// `InvalidRequest` (BC6, BC30).
 ///
-/// No caller yet in this slice; slice 3.0's page scan is the first.
-#[allow(dead_code)]
+/// Round 2 finding 10: returns an owned `String` for the CID rather than a
+/// `&str` borrowed from `cursor`. A borrow would tie the result to whatever
+/// buffer the caller decoded `cursor` into — here, the intermediate `text`
+/// this function itself builds from the base64 bytes — so the caller would
+/// have to keep that buffer alive alongside the returned tuple instead of
+/// getting one self-contained value back. The cost is one short string
+/// clone per request, well inside the 5 ms budget TECH-DESIGN section 11.1
+/// sets for the whole request.
 pub fn decode(cursor: &str) -> Result<(f64, String), CursorError> {
     let raw = URL_SAFE_NO_PAD.decode(cursor.as_bytes()).map_err(|_| CursorError::Base64)?;
     let text = String::from_utf8(raw).map_err(|_| CursorError::Utf8)?;
@@ -68,18 +73,6 @@ pub fn decode(cursor: &str) -> Result<(f64, String), CursorError> {
     }
 
     Ok((rank, cid.to_string()))
-}
-
-/// The same order `snapshot::sort_by_rank` uses: `rank DESC, cid ASC`. Slice
-/// 3.0's page scan compares each snapshot item against the decoded cursor
-/// with this function to find the resume point (BC7, BC32).
-///
-/// No caller yet in this slice; slice 3.0's page scan is the first.
-#[allow(dead_code)]
-pub fn cmp_by_rank_then_cid(a: (f64, &str), b: (f64, &str)) -> std::cmp::Ordering {
-    let (rank_a, cid_a) = a;
-    let (rank_b, cid_b) = b;
-    rank_b.partial_cmp(&rank_a).unwrap_or(std::cmp::Ordering::Equal).then_with(|| cid_a.cmp(cid_b))
 }
 
 #[cfg(test)]
@@ -174,13 +167,5 @@ mod tests {
         let raw = format!("{}:", "0".repeat(16));
         let encoded = URL_SAFE_NO_PAD.encode(raw.as_bytes());
         assert_eq!(decode(&encoded), Err(CursorError::EmptyCid));
-    }
-
-    #[test]
-    fn cmp_orders_rank_desc_then_cid_asc() {
-        assert_eq!(cmp_by_rank_then_cid((2.0, "a"), (1.0, "b")), std::cmp::Ordering::Less);
-        assert_eq!(cmp_by_rank_then_cid((1.0, "b"), (2.0, "a")), std::cmp::Ordering::Greater);
-        assert_eq!(cmp_by_rank_then_cid((1.0, "a"), (1.0, "b")), std::cmp::Ordering::Less);
-        assert_eq!(cmp_by_rank_then_cid((1.0, "a"), (1.0, "a")), std::cmp::Ordering::Equal);
     }
 }

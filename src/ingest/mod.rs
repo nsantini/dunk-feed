@@ -533,6 +533,13 @@ pub enum IngestError {
     /// `Scorer` wraps `ScorerError`.
     #[error("http error: {0}")]
     Http(#[from] crate::http::HttpError),
+    /// A supervised task's `JoinHandle` came back `Err` (BC40): the task
+    /// panicked rather than returning its `Result<(), IngestError>`
+    /// normally. `supervise` (round 2 finding 2) catches every panic here
+    /// and never re-panics itself; the writer still flushes and shuts down
+    /// either way.
+    #[error("the {task} task panicked")]
+    TaskPanicked { task: &'static str },
 }
 
 /// Sends one `Op` to the writer, mapping the only error `WriterHandle::send`
@@ -915,7 +922,7 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
         snapshot,
         writer: writer.clone(),
         health: liveness,
-        cfg: cfg.clone(),
+        cfg: crate::http::HttpConfig::from(cfg),
     });
     let http_handle: tokio::task::JoinHandle<Result<(), IngestError>> = tokio::spawn(async move {
         crate::http::serve(&http_cfg, http_state, http_shutdown_rx).await.map_err(IngestError::Http)
@@ -929,60 +936,64 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
     .await
 }
 
-/// Races every task in `tasks` with `futures_util::future::select_all`
-/// (round 2's generalisation of round 1 finding 1's two-task
-/// `tokio::select!`, BC29): whichever finishes first — with an error or not
-/// — flips `shutdown_tx` so the others stop on their own next check, then
-/// this awaits every other task in turn to let it wind down cleanly,
-/// logging its error at `warn` if it has one (never dropped, never
-/// returned: the first task's own result is always what `supervise`
-/// returns). Once every task has finished, `writer.flush()` then
-/// `writer.shutdown()` run here, so every committed op reaches the database
-/// before `run` returns either way.
 /// One supervised task's `JoinHandle`, its `Ok` always `IngestError` so
 /// `supervise` can race the ingest, scorer and HTTP tasks together despite
 /// their three different underlying error types.
 type SupervisedHandle = tokio::task::JoinHandle<Result<(), IngestError>>;
 
-/// A single task's name carried alongside its own `JoinHandle`'s result,
-/// boxed so `supervise` can race tasks whose names must survive
-/// `select_all`'s own reordering of the remaining futures (see `supervise`).
-type NamedTaskResult = (&'static str, Result<Result<(), IngestError>, tokio::task::JoinError>);
-type NamedHandleFuture = std::pin::Pin<Box<dyn Future<Output = NamedTaskResult> + Send>>;
-
+/// Runs every task in `tasks` on a `tokio::task::JoinSet` (round 2 finding
+/// 2, replacing round 1's two-task `tokio::select!` and round 2's own
+/// `futures_util::future::select_all`, BC29, BC40): each task is wrapped in
+/// a small async block that awaits its `JoinHandle` and turns a panic
+/// (`JoinError`) into `IngestError::TaskPanicked { task: name }` before
+/// pairing the result with the task's own name, so the wrapper future
+/// itself never panics and the name and the result can never be separated
+/// by however `JoinSet` orders its own completions — the swap-remove
+/// reordering bug `select_all` had (round 2's earlier finding) has no
+/// equivalent here, since nothing is zipped back together after the fact.
+///
+/// The first `join_next()` result is the winner: it flips `shutdown_tx` so
+/// the other two tasks stop on their own next check, then every remaining
+/// `join_next()` is drained to let each wind down cleanly, logging its
+/// error at `warn` if it has one (never dropped, never returned: the
+/// winner's own result is always what `supervise` returns). Once every task
+/// has finished, `writer.flush()` then `writer.shutdown()` run here, so
+/// every committed op reaches the database before `run` returns either way.
 async fn supervise(
     tasks: Vec<(&'static str, SupervisedHandle)>,
     shutdown_tx: watch::Sender<bool>,
     writer: WriterHandle,
 ) -> Result<(), IngestError> {
-    // Each task's name travels inside its own future rather than in a
-    // parallel `names` vec: `select_all` resolves the winner with
-    // `Vec::swap_remove`, which moves the *last* handle into the winner's
-    // slot, so a `names`/`remaining_handles` zip pairs the wrong name with a
-    // remaining handle whenever the winner is not the last task (round 2's
-    // finding, BC29). Carrying `(name, result)` out of the awaited future
-    // keeps the two together no matter how `select_all` reorders the list.
-    let named_handles: Vec<NamedHandleFuture> = tasks
-        .into_iter()
-        .map(|(name, handle)| Box::pin(async move { (name, handle.await) }) as NamedHandleFuture)
-        .collect();
+    let mut set: tokio::task::JoinSet<(&'static str, Result<(), IngestError>)> =
+        tokio::task::JoinSet::new();
+    for (name, handle) in tasks {
+        set.spawn(async move {
+            let result = match handle.await {
+                Ok(result) => result,
+                // BC40: the underlying task panicked; caught here as a
+                // value, never re-panicking this wrapper.
+                Err(_join_err) => Err(IngestError::TaskPanicked { task: name }),
+            };
+            (name, result)
+        });
+    }
 
-    let ((first_name, result), _index, remaining) =
-        futures_util::future::select_all(named_handles).await;
+    let (_first_name, first_result) = set
+        .join_next()
+        .await
+        .expect("supervise is always called with at least one task")
+        .expect("the wrapper future never panics: JoinHandle panics are caught above");
+
     let _ = shutdown_tx.send(true);
-    let first_result: Result<(), IngestError> =
-        result.unwrap_or_else(|err| panic!("the {first_name} task should not panic: {err}"));
 
-    for remaining_future in remaining {
-        let (name, handle_result) = remaining_future.await;
-        match handle_result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, task = name, "ingest: a task failed after another task finished")
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, task = name, "ingest: a task panicked after another task finished")
-            }
+    while let Some(joined) = set.join_next().await {
+        let (name, result) = joined.expect("the wrapper future never panics");
+        if let Err(err) = result {
+            tracing::warn!(
+                error = %err,
+                task = name,
+                "ingest: a task failed after another task finished"
+            );
         }
     }
 
@@ -1240,6 +1251,45 @@ mod tests {
         assert!(
             http_line.contains("http error"),
             "the \"http\" line must carry the http task's own error, not another task's: {http_line}"
+        );
+    }
+
+    // BC40: a panicking task maps to `IngestError::TaskPanicked` naming it,
+    // rather than `supervise` itself panicking, and the writer still
+    // flushes: a checkpoint sent before the panic is provably committed by
+    // reading `meta.jetstream_seq` back through the same `Store`.
+    #[tokio::test]
+    async fn supervise_maps_a_panicking_task_to_task_panicked_and_still_flushes_the_writer() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let writer = store.writer().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        writer.send(Op::Checkpoint { seq: 42 }).await.unwrap();
+
+        let ingest_handle: SupervisedHandle = tokio::spawn(async { panic!("boom") });
+        let scorer_handle = forever_task(shutdown_rx.clone());
+        let http_handle = forever_task(shutdown_rx);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise(
+                vec![("ingest", ingest_handle), ("scorer", scorer_handle), ("http", http_handle)],
+                shutdown_tx,
+                writer,
+            ),
+        )
+        .await
+        .expect("supervise must return promptly once ingest panics, not wait on the others");
+
+        match result {
+            Err(IngestError::TaskPanicked { task }) => assert_eq!(task, "ingest"),
+            other => panic!("expected TaskPanicked, got {other:?}"),
+        }
+
+        assert_eq!(
+            store.cursor().unwrap(),
+            Some(42),
+            "the writer must still flush the checkpoint sent before the panic"
         );
     }
 

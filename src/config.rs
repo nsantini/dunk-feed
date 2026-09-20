@@ -68,6 +68,22 @@ pub struct Config {
     pub health_max_lag_s: u32,
 }
 
+impl Config {
+    /// `at://<publisher_did>/app.bsky.feed.generator/<feed_rkey>` (BC45):
+    /// the single producer of this feed's own at-URI. `HttpConfig::from`
+    /// (`src/http/mod.rs`) calls this once at startup; `dunk publish`
+    /// (story 09) will too, so the format lives here and nowhere else.
+    pub fn feed_uri(&self) -> String {
+        format!("at://{}/app.bsky.feed.generator/{}", self.publisher_did, self.feed_rkey)
+    }
+
+    /// `did:web:<hostname>` (BC45): the single producer of this service's
+    /// `did:web` identity.
+    pub fn did_web(&self) -> String {
+        format!("did:web:{}", self.hostname)
+    }
+}
+
 /// Reads a required string variable. `Missing` if unset, and also `Missing`
 /// if set to an empty or whitespace-only value (BC17): a half-filled copy of
 /// `.env.example`, which ships both required variables as bare `NAME=`, must
@@ -692,6 +708,22 @@ mod tests {
         pairs.push(("DUNK_HEALTH_MAX_LAG_S", "120"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.health_max_lag_s, 120);
+    }
+
+    #[test]
+    fn feed_uri_is_the_at_uri_of_the_generator_record() {
+        // BC45.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_FEED_RKEY", "dunks"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.feed_uri(), "at://did:plc:abc/app.bsky.feed.generator/dunks");
+    }
+
+    #[test]
+    fn did_web_is_did_web_prefixed_hostname() {
+        // BC45.
+        let config = load(env(&required_pair())).unwrap();
+        assert_eq!(config.did_web(), "did:web:feed.example.com");
     }
 
     #[test]

@@ -1,10 +1,47 @@
-//! `interactions` table row operations, TECH-DESIGN section 6. Insert-only:
-//! the table has no primary key and no reader in this story. Story 08's
-//! `sendInteractions` handler is the caller.
+//! `interactions` table row operations, TECH-DESIGN section 6. Story 08's
+//! `sendInteractions` handler is the writer. Round 2 finding 9 (BC47) adds
+//! the reader: no raw SQL sits outside `src/store/` (AGENTS.md), so the
+//! `sendInteractions` HTTP tests read the row back through `interactions`
+//! (via `Store::interactions`) rather than opening a second `rusqlite`
+//! connection of their own.
 
 use rusqlite::Connection;
 
 use crate::store::StoreError;
+
+/// One `interactions` row, read back in insertion order (`rowid` order:
+/// the table has no other ordering column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractionRow {
+    pub received_at: i64,
+    pub item: Option<String>,
+    pub event: Option<String>,
+    pub feed_context: Option<String>,
+    pub req_id: Option<String>,
+}
+
+/// Every `interactions` row, oldest first (BC47). No caller yet in
+/// production: `Store::interactions` (`src/store/mod.rs`) is read only by
+/// `src/http/interactions.rs`'s own tests today.
+pub fn interactions(conn: &Connection) -> Result<Vec<InteractionRow>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT received_at, item, event, feed_context, req_id FROM interactions ORDER BY rowid",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(InteractionRow {
+            received_at: row.get(0)?,
+            item: row.get(1)?,
+            event: row.get(2)?,
+            feed_context: row.get(3)?,
+            req_id: row.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
 
 /// Appends one row. The four payload columns are nullable and stored
 /// verbatim; `received_at` is whatever `now` the caller passes (BC34).
@@ -82,5 +119,42 @@ mod tests {
         let count: i64 =
             conn.query_row("SELECT count(*) FROM interactions", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 2);
+    }
+
+    // BC47: `interactions` reads every row back, oldest first.
+    #[test]
+    fn interactions_returns_every_row_in_insertion_order() {
+        let conn = migrated_conn();
+        insert_interaction(
+            &conn,
+            Some("at://did:plc:q/app.bsky.feed.post/a"),
+            Some("app.bsky.feed.defs#requestLess"),
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        insert_interaction(
+            &conn,
+            Some("at://did:plc:q/app.bsky.feed.post/b"),
+            Some("app.bsky.feed.defs#interactionSeen"),
+            Some("r=4.5"),
+            Some("req-2"),
+            200,
+        )
+        .unwrap();
+
+        let rows = interactions(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].item, Some("at://did:plc:q/app.bsky.feed.post/a".to_string()));
+        assert_eq!(rows[0].received_at, 100);
+        assert_eq!(rows[1].feed_context, Some("r=4.5".to_string()));
+        assert_eq!(rows[1].req_id, Some("req-2".to_string()));
+    }
+
+    #[test]
+    fn interactions_of_an_empty_table_is_empty() {
+        let conn = migrated_conn();
+        assert_eq!(interactions(&conn).unwrap(), Vec::new());
     }
 }

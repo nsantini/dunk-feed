@@ -389,6 +389,16 @@ impl Store {
         pairs::apply_verdicts(&conn, outcomes)
     }
 
+    /// Every `interactions` row, oldest first (BC47). No production caller
+    /// yet: `src/http/interactions.rs`'s own tests are the first, reading
+    /// back what `sendInteractions` wrote through `Op::Interaction` rather
+    /// than opening a second raw SQL connection (AGENTS.md).
+    #[allow(dead_code)]
+    pub fn interactions(&self) -> Result<Vec<interactions::InteractionRow>, StoreError> {
+        let conn = self.read_lock()?;
+        interactions::interactions(&conn)
+    }
+
     /// Reads one `meta` key. `Ok(None)` when the key has no row (BC67). No
     /// production caller yet: `last_scorer_pass` is write-only so far.
     #[allow(dead_code)]
@@ -566,6 +576,28 @@ mod tests {
             })
             .unwrap();
         assert_eq!(dirty, 0);
+    }
+
+    // BC47: `Store::interactions` reads through to the same rows
+    // `interactions::insert_interaction` wrote.
+    #[test]
+    fn interactions_reads_through_the_store() {
+        let store = Store::open_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            interactions::insert_interaction(
+                &conn,
+                Some("at://did:plc:q/app.bsky.feed.post/1"),
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        }
+        let rows = store.interactions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item, Some("at://did:plc:q/app.bsky.feed.post/1".to_string()));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::http::cursor::{self, CursorError};
 use crate::http::AppState;
-use crate::scorer::snapshot::FeedItem;
+use crate::scorer::snapshot::{cmp_rank_then_cid, FeedItem};
 
 /// Every way `getFeedSkeleton` can fail. Mapped to the 400 bodies in BC3,
 /// BC4, BC6 by `SkeletonError`'s `IntoResponse` impl in `src/http/mod.rs`
@@ -37,23 +37,29 @@ impl From<CursorError> for SkeletonError {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SkeletonResponse {
-    pub feed: Vec<SkeletonItem>,
+pub struct SkeletonResponse<'a> {
+    pub feed: Vec<SkeletonItem<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
 }
 
+/// Round 2 finding 7: `post` borrows straight from the snapshot `Arc` the
+/// caller holds, rather than cloning every URI in a page for a response
+/// that only needs to read it once and serialise it. `feed_context` still
+/// owns its `String`: it is not a literal field of the snapshot, but a
+/// `format!` computed fresh per response (BC9).
 #[derive(Debug, Serialize)]
-pub struct SkeletonItem {
-    pub post: String,
+pub struct SkeletonItem<'a> {
+    pub post: &'a str,
     #[serde(rename = "feedContext")]
     pub feed_context: String,
 }
 
 /// `at://<publisher_did>/app.bsky.feed.generator/<rkey>`, the one URI BC3
-/// accepts, shared with `describe::handler`'s own feed URI.
-fn expected_feed_uri(state: &AppState) -> String {
-    format!("at://{}/app.bsky.feed.generator/{}", state.cfg.publisher_did, state.cfg.feed_rkey)
+/// accepts, read straight off `HttpConfig` (BC44, BC45): the same
+/// precomputed string `describe::handler` serves, never reformatted here.
+fn expected_feed_uri(state: &AppState) -> &str {
+    &state.cfg.feed_uri
 }
 
 /// A digit string, with an optional leading `-`, parsed leniently into
@@ -101,16 +107,42 @@ fn resolve_cursor(raw: Option<&str>) -> Result<Option<(f64, String)>, SkeletonEr
 /// The index the page starts at, found in one linear scan of `items`
 /// (TECH-DESIGN section 11.1's budget line; `snapshot::apply_cap_one_per_quoter_per_50`
 /// leaves `items` not totally ordered by `(rank DESC, cid ASC)`, so a binary
-/// search has no defined answer over it). An item whose `(rank, cid)`
-/// exactly matches `cursor_value` starts the page at that item's index plus
-/// one (BC32); otherwise the page starts at the first item, in list order,
-/// that sorts strictly after `cursor_value` (BC7). `cursor_value: None`
-/// (BC22) always starts at 0 without scanning.
+/// search has no defined answer over it). `cursor_value: None` (BC22)
+/// always starts at 0 without scanning.
+///
+/// Round 2 finding 1: an exact `(rank, cid)` match always wins, wherever it
+/// sits in the scan, over any earlier index that merely sorts after the
+/// cursor by `cmp_rank_then_cid` — the scan never returns early on that
+/// weaker signal; it only remembers the first one as a fallback and keeps
+/// going. That is the whole invariant: **never go backwards, so never
+/// repeat within a session.** `snapshot::apply_cap_one_per_quoter_per_50`
+/// can place an item earlier in `items` than its raw `(rank, cid)` would
+/// otherwise sort — a cap-2 deferral — so an earlier index can legitimately
+/// sort after the cursor (BC37) while the cursor's own item still sits
+/// later, not yet reached; returning that earlier index would replay
+/// whatever this pagination session already served up to it. Scanning to
+/// completion for the exact match instead means an index once returned is
+/// never returned again, no matter how the deferral reordered `items`
+/// (BC37: exact match at `k` always starts the next page at `k + 1`; BC38:
+/// with no exact match at all, the first-sorts-after fallback stands).
+///
+/// The accepted cost (BC39) is the one case with no exact match and no
+/// legitimate fallback either: the snapshot regenerates between two
+/// requests in a way that leaves nothing in the new list sorting at or
+/// after the stale cursor (for example, cap 2 had deferred the cursor's own
+/// item behind items that sort after it, and the next generation dropped or
+/// re-ordered around it). The scan then reaches the end having found
+/// neither, and the page truncates: an empty page with no `cursor` in the
+/// response, ending that pagination session early rather than repeating or
+/// looping. A plain refresh — a fresh request with no cursor — still serves
+/// every item in the new snapshot; this is a known limitation of a cursor
+/// that carries no list position, not a hole in the feed (`decisions.md`
+/// carries the proof).
 fn page_start(items: &[FeedItem], cursor_value: Option<(f64, String)>) -> usize {
     let Some((rank, cid)) = cursor_value else { return 0 };
     let mut after: Option<usize> = None;
     for (i, item) in items.iter().enumerate() {
-        match cursor::cmp_by_rank_then_cid((item.rank, &item.quote_cid), (rank, &cid)) {
+        match cmp_rank_then_cid((item.rank, &item.quote_cid), (rank, &cid)) {
             std::cmp::Ordering::Equal => return i + 1,
             std::cmp::Ordering::Greater => {
                 if after.is_none() {
@@ -123,29 +155,32 @@ fn page_start(items: &[FeedItem], cursor_value: Option<(f64, String)>) -> usize 
     after.unwrap_or(items.len())
 }
 
-/// The route's pure core: given `state`'s snapshot (read exactly once, BC8,
-/// AC5) and the raw query params, builds the response body or a
-/// `SkeletonError`. Split out from `handler` so a test can drive it without
-/// a live router.
-fn build(
+/// The route's pure core: given `state`'s snapshot (already read once by
+/// the caller, BC8, AC5) and the raw query params, builds the response body
+/// or a `SkeletonError`. Split out from `handler` so a test can drive it
+/// without a live router. `items` is a parameter, not read again here
+/// (round 2 finding 7): `SkeletonResponse<'a>`'s items borrow from it, so
+/// the borrow's lifetime is the caller's `Arc<Vec<FeedItem>>`, not one local
+/// to this function.
+fn build<'a>(
     state: &AppState,
+    items: &'a [FeedItem],
     params: &HashMap<String, String>,
-) -> Result<SkeletonResponse, SkeletonError> {
+) -> Result<SkeletonResponse<'a>, SkeletonError> {
     // BC3, BC21: `feed` missing, or a value other than the configured feed
     // URI (duplicates already resolved to the last occurrence by `Query`'s
-    // `HashMap` deserialization).
+    // `HashMap` deserialization). BC44, BC45: `state.cfg.feed_uri` is read
+    // straight off `HttpConfig`, never reformatted here.
     let expected = expected_feed_uri(state);
     match params.get("feed") {
-        Some(feed) if *feed == expected => {}
+        Some(feed) if feed == expected => {}
         _ => return Err(SkeletonError::UnknownFeed),
     }
 
     let limit = resolve_limit(params.get("limit").map(String::as_str))?;
     let cursor_value = resolve_cursor(params.get("cursor").map(String::as_str))?;
 
-    // BC8, AC5: the snapshot `Arc` is read exactly once per request.
-    let items = state.snapshot.current();
-    let start = page_start(&items, cursor_value);
+    let start = page_start(items, cursor_value);
     let page: Vec<&FeedItem> = items.iter().skip(start).take(limit).collect();
 
     // BC8: omitted once the page reaches the end of the snapshot.
@@ -158,7 +193,7 @@ fn build(
     let feed = page
         .into_iter()
         .map(|item| SkeletonItem {
-            post: item.quote_uri.clone(),
+            post: item.quote_uri.as_str(),
             // BC9: one decimal place; a plain `f64` formats well under the
             // 2,000-char ceiling BC9 names.
             feed_context: format!("r={:.1}", item.ratio),
@@ -171,14 +206,14 @@ fn build(
 /// BC10: no auth required; a present service JWT (in the `Authorization`
 /// header) is never read here, so it is accepted without validation by
 /// omission.
-///
-/// No non-test caller yet: registered on `router` (`src/http/mod.rs`),
-/// itself uncalled until `run` (`src/ingest/mod.rs`) starts the HTTP task.
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let mut response = match build(&state, &params) {
+    // BC8, AC5: the snapshot `Arc` is read exactly once per request, kept
+    // alive here for as long as `build`'s borrowed response needs it.
+    let items = state.snapshot.current();
+    let mut response = match build(&state, &items, &params) {
         Ok(body) => Json(body).into_response(),
         Err(err) => err.into_response(),
     };
@@ -382,6 +417,91 @@ mod tests {
     fn page_start_cursor_past_the_end_returns_len() {
         let items = vec![item("at://q/1", "cid1", 3.0, 1.0)];
         assert_eq!(page_start(&items, Some((0.0, "zzz".to_string()))), 1);
+    }
+
+    /// A snapshot holding a genuine cap-2 deferral: `cid6`'s rank (50.0) is
+    /// higher than `cid3`, `cid4` and `cid5`'s, yet it sits at array index 6,
+    /// after them — exactly the reviewer's own counterexample for why the
+    /// rejected `min(first-after, exact + 1)` scan never terminates (round
+    /// 2 finding 1, `tasks.md` 6.1). `items` is intentionally not totally
+    /// ordered by `(rank DESC, cid ASC)`, matching what
+    /// `snapshot::apply_cap_one_per_quoter_per_50` can actually produce.
+    fn deferral_snapshot() -> Vec<FeedItem> {
+        vec![
+            item("at://q/0", "cid0", 100.0, 1.0),
+            item("at://q/1", "cid1", 90.0, 1.0),
+            item("at://q/2", "cid2", 89.0, 1.0),
+            item("at://q/3", "cid3", 40.0, 1.0),
+            item("at://q/4", "cid4", 39.9, 1.0),
+            item("at://q/5", "cid5", 39.8, 1.0),
+            item("at://q/6", "cid6", 50.0, 1.0), // deferred past lower ranks
+            item("at://q/7", "cid7", 30.0, 1.0),
+        ]
+    }
+
+    // BC37: the cursor's exact match at index 6 must win over the earlier
+    // index 3, whose (rank, cid) sorts strictly after the cursor's value —
+    // the scan must not stop at that earlier "Greater" the moment it sees
+    // one; it must keep looking for the exact match. Returning index 3 here
+    // would replay cid1..cid3, already served earlier in a real session.
+    #[test]
+    fn page_start_exact_match_wins_over_an_earlier_sorts_after_index() {
+        let items = deferral_snapshot();
+        assert_eq!(page_start(&items, Some((50.0, "cid6".to_string()))), 7);
+    }
+
+    // 6.2: paging one item at a time over `deferral_snapshot` terminates
+    // and serves every item exactly once, in array order, proving BC37's
+    // "never go backwards, so never repeat within a session" invariant
+    // holds across a real cap-2 deferral shape.
+    #[test]
+    fn page_start_pages_a_deferral_snapshot_exactly_once_and_terminates() {
+        let items = deferral_snapshot();
+        let mut cursor: Option<(f64, String)> = None;
+        let mut served = Vec::new();
+
+        for _ in 0..=items.len() {
+            let start = page_start(&items, cursor.clone());
+            if start >= items.len() {
+                break;
+            }
+            served.push(items[start].quote_cid.clone());
+            cursor = Some((items[start].rank, items[start].quote_cid.clone()));
+        }
+
+        let expected: Vec<String> = items.iter().map(|i| i.quote_cid.clone()).collect();
+        assert_eq!(served, expected, "every item served exactly once, in array order");
+    }
+
+    // BC39: pagination across two snapshot generations. Between two
+    // requests the snapshot swaps to a new generation whose every surviving
+    // item now sorts before (higher rank than) the stale cursor — as
+    // happens when cap 2 has deferred the cursor's own item behind items
+    // that sort after it, and a rebuild changes the composition around it.
+    // No index in the new list is (rank, cid) at-or-after the stale cursor,
+    // so the scan finds neither an exact match nor a fallback and returns
+    // `items.len()`: a known, documented truncation, not a hole in the feed
+    // (`decisions.md` carries the proof). A no-cursor refresh against the
+    // same generation still serves everything.
+    #[test]
+    fn page_start_truncates_when_the_next_generation_sorts_entirely_before_the_stale_cursor() {
+        let stale_cursor = (50.0, "cid-old".to_string());
+        let next_generation = vec![
+            item("at://q/a", "cid-a", 100.0, 1.0),
+            item("at://q/b", "cid-b", 90.0, 1.0),
+            item("at://q/c", "cid-c", 60.0, 1.0),
+        ];
+
+        assert_eq!(
+            page_start(&next_generation, Some(stale_cursor)),
+            next_generation.len(),
+            "truncates to an empty page rather than repeating or looping"
+        );
+        assert_eq!(
+            page_start(&next_generation, None),
+            0,
+            "a fresh no-cursor request against the same generation serves everything"
+        );
     }
 
     // AC5: a request against a 100k-item snapshot completes in one scan,
