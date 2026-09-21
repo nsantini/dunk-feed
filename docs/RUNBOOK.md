@@ -10,7 +10,55 @@ You need these before you start.
 
 - Docker and the Compose plugin, installed on the VM.
 - A Cloudflare account.
-- A Bluesky account for the feed.
+- A Bluesky account for the feed. See "Bluesky account setup" below.
+
+## Bluesky account setup
+
+Do this before the first deploy. It gives you the DID that `.env` needs and
+the app password that `dunk publish` needs.
+
+The account is the feed's public identity. The feed shows up under it in the
+Bluesky app, with its handle and its avatar.
+
+1. Create a Bluesky account for the feed, or pick one you already have.
+2. Open Settings in the Bluesky app, then App passwords. Create one.
+3. Copy the app password now. Bluesky shows it one time only.
+4. Get the account DID. Run this from any machine:
+
+   ```
+   curl "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=<your.handle>"
+   ```
+
+   The answer is `{"did":"did:plc:..."}`. Copy that DID.
+5. Keep the DID, the handle and the app password. "First deploy" step 2
+   puts them in `.env`, as `DUNK_PUBLISHER_DID`, `BSKY_HANDLE` and
+   `BSKY_APP_PASSWORD`.
+
+`DUNK_PUBLISHER_DID` holds the DID and not the handle, because a handle can
+change. The at-URI of the feed must not change.
+
+`publish` compares the DID of the account it signs in as against
+`DUNK_PUBLISHER_DID`. A difference fails the command with a DID mismatch
+error, and no record is written.
+
+### The two DIDs
+
+Dunk Feed uses two DIDs. They do different jobs and they are not
+interchangeable.
+
+| DID | Where it comes from | What it identifies |
+|-----|--------------------|--------------------|
+| `did:plc:...`, in `DUNK_PUBLISHER_DID` | Your Bluesky account | The owner of the feed record |
+| `did:web:<hostname>`, built from `DUNK_HOSTNAME` | Your public hostname | The server that computes the feed |
+
+The published record lives in the account's repository, and its own `did`
+field holds `did:web:<hostname>`. This field is the pointer from Bluesky to
+your VM. The server answers for that identity at `/.well-known/did.json`.
+
+The feed's at-URI is
+`at://<DUNK_PUBLISHER_DID>/app.bsky.feed.generator/<DUNK_FEED_RKEY>`.
+Bluesky sends this URI in every feed request. The server serves only this one
+URI and refuses every other.
 
 ## First deploy
 
@@ -42,7 +90,25 @@ docker compose -f <file> run --rm dunk publish
 ```
 
 Set `BSKY_HANDLE` and `BSKY_APP_PASSWORD` in `.env` first. `publish` needs
-both.
+both. See "Bluesky account setup" above for both values.
+
+### What publish does
+
+`publish` writes one record and then stops. The record is one
+`app.bsky.feed.generator` in your account's repository, under the record key
+`DUNK_FEED_RKEY`, `dunks` by default. It goes to `https://bsky.social`, not
+to the App View.
+
+`publish` does not send posts or feed content to Bluesky. The container
+serves the feed live, on every request, from your VM. What this command does
+is register the feed, so that people can find it and pin it. Before it runs,
+the feed does not exist for the Bluesky app.
+
+The display name and the description are fixed in the source. Only a rebuild
+changes them.
+
+The command writes the record unconditionally, so you can run it again. A
+second run replaces the record, which is how you add or change the avatar.
 
 `ENTRYPOINT` in the image is `dunk`. `publish` replaces the default command,
 so `run` does not start while this command runs.
