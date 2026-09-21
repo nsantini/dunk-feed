@@ -29,3 +29,8 @@ tower-http = { version = "0.7.1", features = ["trace", "timeout"] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
