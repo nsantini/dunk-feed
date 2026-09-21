@@ -316,6 +316,16 @@ impl Store {
         pairs::dirty_candidates(&conn, now, ttl_h)
     }
 
+    /// Every `pairs` row first seen at or after `cutoff`, in any state, for
+    /// `dunk dump` (BC1, BC6, BC16, BC21). Locks the read-only connection
+    /// like every other read here, so a dump never waits on a commit. No
+    /// caller yet: slice 2.0's `dump::run` is the first.
+    #[allow(dead_code)]
+    pub fn pairs_since(&self, cutoff: i64) -> Result<Vec<pairs::DumpRow>, StoreError> {
+        let conn = self.read_lock()?;
+        pairs::pairs_since(&conn, cutoff)
+    }
+
     /// `promoted` pairs whose `quoted_at` is at or after `now - h * 3600`
     /// (BC51).
     pub fn promoted_within(

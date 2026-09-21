@@ -404,6 +404,115 @@ pub fn expire(
     Ok(report)
 }
 
+/// One row of `dunk dump`'s CSV, TECH-DESIGN section 6 and `spec.md`'s
+/// column order. Carries the seven `pairs` columns, `state` and
+/// `drop_reason` as the raw text `pairs` stores them, both sides' local
+/// counts, and the six `v_*` verified counts plus `ratio` and
+/// `promoted_at` from `feed` as `None` when the pair has no `feed` row
+/// (BC13) or `Some` when it does (BC14). `dump.rs` renders `E` and `D`
+/// from these; this struct holds no derived value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DumpRow {
+    pub quote_uri: String,
+    pub quote_did: String,
+    pub quote_cid: String,
+    pub original_uri: String,
+    pub original_did: String,
+    pub quoted_at: i64,
+    pub first_seen_at: i64,
+    pub state: String,
+    pub drop_reason: Option<String>,
+    pub counts_q: Counts,
+    pub counts_o: Counts,
+    pub v_likes_q: Option<i64>,
+    pub v_reposts_q: Option<i64>,
+    pub v_replies_q: Option<i64>,
+    pub v_likes_o: Option<i64>,
+    pub v_reposts_o: Option<i64>,
+    pub v_replies_o: Option<i64>,
+    pub ratio: Option<f64>,
+    pub promoted_at: Option<i64>,
+}
+
+/// Same rule as `counts::saturate` (BC5, BC49): a stored count never
+/// exceeds `u32::MAX`, and a `NULL` from the `LEFT JOIN counts` below reads
+/// as zero, matching a side with no `counts` row. Kept local rather than
+/// calling `counts::saturate` because that function is private to
+/// `counts.rs` and `pairs_since` already has the joined value in hand, with
+/// no second query to route through `counts::counts_for`.
+fn saturate_joined_count(value: Option<i64>) -> u32 {
+    match value {
+        Some(value) => u32::try_from(value).unwrap_or(u32::MAX),
+        None => 0,
+    }
+}
+
+/// Every `pairs` row, in any state, first seen at or after `cutoff`
+/// (BC1, BC6, BC16, BC21): `dunk dump`'s read. `pairs LEFT JOIN counts` on
+/// `quote_uri` and again on `original_uri` (aliased `cq` and `co`) attaches
+/// each side's local counts, defaulting to zero when that side has no
+/// `counts` row (BC5). `LEFT JOIN feed` on `quote_uri` attaches the
+/// verified counts, `ratio` and `promoted_at`, `None` across the board for
+/// a pair with no `feed` row (BC13, BC14). Ordered by `first_seen_at`
+/// ascending (BC16), the same order for the same window every run, through
+/// `prepare_cached` on the caller's connection (BC21: `Store::pairs_since`
+/// passes the read-only one).
+pub fn pairs_since(conn: &Connection, cutoff: i64) -> Result<Vec<DumpRow>, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT p.quote_uri, p.quote_did, p.quote_cid, p.original_uri, p.original_did,
+                p.quoted_at, p.first_seen_at, p.state, p.drop_reason,
+                cq.likes, cq.reposts, cq.replies,
+                co.likes, co.reposts, co.replies,
+                f.v_likes_q, f.v_reposts_q, f.v_replies_q,
+                f.v_likes_o, f.v_reposts_o, f.v_replies_o,
+                f.ratio, f.promoted_at
+         FROM pairs p
+         LEFT JOIN counts cq ON cq.post_uri = p.quote_uri
+         LEFT JOIN counts co ON co.post_uri = p.original_uri
+         LEFT JOIN feed f ON f.quote_uri = p.quote_uri
+         WHERE p.first_seen_at >= ?1
+         ORDER BY p.first_seen_at",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![cutoff], |row| {
+        let likes_q: Option<i64> = row.get(9)?;
+        let reposts_q: Option<i64> = row.get(10)?;
+        let replies_q: Option<i64> = row.get(11)?;
+        let likes_o: Option<i64> = row.get(12)?;
+        let reposts_o: Option<i64> = row.get(13)?;
+        let replies_o: Option<i64> = row.get(14)?;
+        Ok(DumpRow {
+            quote_uri: row.get(0)?,
+            quote_did: row.get(1)?,
+            quote_cid: row.get(2)?,
+            original_uri: row.get(3)?,
+            original_did: row.get(4)?,
+            quoted_at: row.get(5)?,
+            first_seen_at: row.get(6)?,
+            state: row.get(7)?,
+            drop_reason: row.get(8)?,
+            counts_q: Counts {
+                likes: saturate_joined_count(likes_q),
+                reposts: saturate_joined_count(reposts_q),
+                replies: saturate_joined_count(replies_q),
+            },
+            counts_o: Counts {
+                likes: saturate_joined_count(likes_o),
+                reposts: saturate_joined_count(reposts_o),
+                replies: saturate_joined_count(replies_o),
+            },
+            v_likes_q: row.get(15)?,
+            v_reposts_q: row.get(16)?,
+            v_replies_q: row.get(17)?,
+            v_likes_o: row.get(18)?,
+            v_reposts_o: row.get(19)?,
+            v_replies_o: row.get(20)?,
+            ratio: row.get(21)?,
+            promoted_at: row.get(22)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
 /// The seven `pairs` columns `dirty_candidates` and `promoted_within` read
 /// before attaching each side's counts.
 struct PairColumns {
@@ -1019,6 +1128,133 @@ mod tests {
             crate::score::Counts { likes: 1, reposts: 0, replies: 0 },
             "the shared original's counts row must survive"
         );
+    }
+
+    // BC1, BC16: the cutoff includes a row exactly on it and excludes one
+    // before it, and rows come back ascending by `first_seen_at`.
+    #[test]
+    fn pairs_since_includes_the_cutoff_and_orders_ascending() {
+        let conn = migrated_conn();
+        let before = "at://did:plc:q/app.bsky.feed.post/before";
+        let on_cutoff = "at://did:plc:q/app.bsky.feed.post/on-cutoff";
+        let after = "at://did:plc:q/app.bsky.feed.post/after";
+        insert_test_pair(&conn, before, "at://did:plc:o/app.bsky.feed.post/before-o");
+        insert_test_pair(&conn, on_cutoff, "at://did:plc:o/app.bsky.feed.post/on-cutoff-o");
+        insert_test_pair(&conn, after, "at://did:plc:o/app.bsky.feed.post/after-o");
+        conn.execute(
+            "UPDATE pairs SET first_seen_at = 1_699_999_999 WHERE quote_uri = ?1",
+            [before],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pairs SET first_seen_at = 1_700_000_000 WHERE quote_uri = ?1",
+            [on_cutoff],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pairs SET first_seen_at = 1_700_000_001 WHERE quote_uri = ?1",
+            [after],
+        )
+        .unwrap();
+
+        let found = pairs_since(&conn, 1_700_000_000).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].quote_uri, on_cutoff);
+        assert_eq!(found[1].quote_uri, after);
+    }
+
+    // BC6: a dropped pair comes back with its `drop_reason`.
+    #[test]
+    fn pairs_since_returns_a_dropped_pair_with_its_reason() {
+        let conn = migrated_conn();
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
+        insert_test_pair(&conn, quote_uri, "at://did:plc:o/app.bsky.feed.post/o1");
+        drop_pair(&conn, quote_uri, crate::store::DropReason::FollowerFloor).unwrap();
+
+        let found = pairs_since(&conn, 0).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].state, "dropped");
+        assert_eq!(found[0].drop_reason, Some("follower_floor".to_string()));
+    }
+
+    // BC13: a candidate with no `feed` row has `None` in every verified
+    // column.
+    #[test]
+    fn pairs_since_candidate_has_no_verified_counts() {
+        let conn = migrated_conn();
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
+        insert_test_pair(&conn, quote_uri, "at://did:plc:o/app.bsky.feed.post/o1");
+
+        let found = pairs_since(&conn, 0).unwrap();
+        assert_eq!(found.len(), 1);
+        let row = &found[0];
+        assert_eq!(row.state, "candidate");
+        assert_eq!(row.v_likes_q, None);
+        assert_eq!(row.v_reposts_q, None);
+        assert_eq!(row.v_replies_q, None);
+        assert_eq!(row.v_likes_o, None);
+        assert_eq!(row.v_reposts_o, None);
+        assert_eq!(row.v_replies_o, None);
+        assert_eq!(row.ratio, None);
+        assert_eq!(row.promoted_at, None);
+    }
+
+    // BC14: a promoted pair has `Some` in every verified column, plus
+    // `ratio` and `promoted_at`.
+    #[test]
+    fn pairs_since_promoted_has_verified_counts() {
+        let conn = migrated_conn();
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
+        insert_test_pair(&conn, quote_uri, "at://did:plc:o/app.bsky.feed.post/o1");
+        insert_feed_row(&conn, quote_uri);
+        conn.execute("UPDATE pairs SET state = 'promoted' WHERE quote_uri = ?1", [quote_uri])
+            .unwrap();
+
+        let found = pairs_since(&conn, 0).unwrap();
+        assert_eq!(found.len(), 1);
+        let row = &found[0];
+        assert_eq!(row.state, "promoted");
+        assert_eq!(row.v_likes_q, Some(0));
+        assert_eq!(row.v_reposts_q, Some(0));
+        assert_eq!(row.v_replies_q, Some(0));
+        assert_eq!(row.v_likes_o, Some(0));
+        assert_eq!(row.v_reposts_o, Some(0));
+        assert_eq!(row.v_replies_o, Some(0));
+        assert_eq!(row.ratio, Some(1.0));
+        assert_eq!(row.promoted_at, Some(1_700_000_000));
+    }
+
+    // BC5: a pair with no `counts` row on either side reads zero, not an
+    // error.
+    #[test]
+    fn pairs_since_missing_counts_reads_as_zero() {
+        let conn = migrated_conn();
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
+        insert_test_pair(&conn, quote_uri, "at://did:plc:o/app.bsky.feed.post/o1");
+
+        let found = pairs_since(&conn, 0).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].counts_q, crate::score::Counts::default());
+        assert_eq!(found[0].counts_o, crate::score::Counts::default());
+    }
+
+    // BC5: a side with a `counts` row reads its real values, saturated the
+    // same way `counts::counts_for` saturates.
+    #[test]
+    fn pairs_since_reads_local_counts_from_both_sides() {
+        let conn = migrated_conn();
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
+        let original_uri = "at://did:plc:o/app.bsky.feed.post/o1";
+        insert_test_pair(&conn, quote_uri, original_uri);
+        counts::incr(&conn, quote_uri, crate::store::writer::CountField::Likes, 1_700_000_100)
+            .unwrap();
+        counts::incr(&conn, original_uri, crate::store::writer::CountField::Reposts, 1_700_000_100)
+            .unwrap();
+
+        let found = pairs_since(&conn, 0).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].counts_q, crate::score::Counts { likes: 1, reposts: 0, replies: 0 });
+        assert_eq!(found[0].counts_o, crate::score::Counts { likes: 0, reposts: 1, replies: 0 });
     }
 
     // BC39: both of `expire`'s `IN (...)` deletes chunk at
