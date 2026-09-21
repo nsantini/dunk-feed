@@ -9,7 +9,8 @@ mode in `docs/TECH-DESIGN.md` section 13.
 You need these before you start.
 
 - Docker and the Compose plugin, installed on the VM.
-- A Cloudflare account.
+- A Cloudflare account, with a domain on it as an active zone. See
+  "Cloudflare setup" below.
 - A Bluesky account for the feed. See "Bluesky account setup" below.
 
 ## Bluesky account setup
@@ -66,6 +67,10 @@ URI and refuses every other.
 2. Fill in `UPSTAGE_HOSTNAME` and `UPSTAGE_PUBLISHER_DID`. These are the only two
    required variables. `src/config.rs` rejects the container start when
    either one is empty or holds only whitespace.
+
+   `UPSTAGE_HOSTNAME` is a hostname you choose on Cloudflare. See "Cloudflare
+   setup" below for how to pick it. `UPSTAGE_PUBLISHER_DID` comes from
+   "Bluesky account setup" above.
 
    Three more variables have no default but are optional: `BSKY_HANDLE`
    and `BSKY_APP_PASSWORD`, needed only when you run `upstage publish`, and
@@ -367,12 +372,53 @@ time.
 
 ## Cloudflare setup
 
+Cloudflare terminates TLS for the feed and forwards plain HTTP to the
+`upstage` container. Bluesky resolves `did:web:<hostname>` over HTTPS only,
+so the hostname must answer on Cloudflare before the feed works.
+
+### Where `UPSTAGE_HOSTNAME` comes from
+
+Cloudflare does not give you this hostname. You choose it, as a subdomain of
+a domain you own. Cloudflare then serves it.
+
+1. Add your domain to Cloudflare as a zone, if it is not there yet.
+2. At your registrar, set the nameservers to the two that Cloudflare shows.
+3. Wait for the zone to reach the Active state. This can take some hours.
+4. Pick a subdomain for the feed, for example `feed.example.com`.
+5. Put this subdomain in `UPSTAGE_HOSTNAME` in `.env`.
+
+The value is the bare hostname. Write no scheme, no port, no path, and no
+trailing slash. Use lowercase only.
+
+| Correct | Wrong |
+|---|---|
+| `feed.example.com` | `https://feed.example.com` |
+| `feed.example.com` | `feed.example.com:3000` |
+| `feed.example.com` | `feed.example.com/` |
+
+The subdomain does not need a DNS record yet. Both variants below create
+that record, and each one creates a different kind.
+
 ### Tunnel variant, `compose.yaml`
 
-1. Create the tunnel in the Cloudflare dashboard.
-2. Copy the tunnel token into `TUNNEL_TOKEN` in `.env`.
-3. Set the tunnel's public hostname to `http://upstage:3000`. This is the
-   Compose service name and port, not a host address.
+1. Open the Cloudflare Zero Trust dashboard. Go to Networks, then Tunnels.
+2. Create a tunnel, and pick the `cloudflared` connector type.
+3. Copy the tunnel token from the install command that Cloudflare shows.
+4. Put the token in `TUNNEL_TOKEN` in `.env`.
+5. Add a public hostname to the tunnel. Set its subdomain and domain to
+   `UPSTAGE_HOSTNAME`. Leave the path empty.
+6. Set the service type to HTTP and the service URL to `upstage:3000`.
+7. Save the public hostname.
+
+The token is the long string after `--token` in the install command, and not
+the whole command.
+
+`upstage:3000` is the Compose service name and its port. It is not a host
+address. `cloudflared` reaches the container over the Compose network, which
+is why `compose.yaml` publishes no port at all.
+
+Step 7 creates the proxied CNAME record for the hostname. Do not also create
+an A record. Two records for one name break the tunnel.
 
 ### Proxied variant, `compose.proxied.yaml`
 
@@ -384,6 +430,32 @@ time.
 3. Restrict the VM firewall to Cloudflare's published IP ranges. Flexible
    TLS leaves the leg between Cloudflare and the VM unencrypted, so only
    Cloudflare's own IPs should reach port 3000.
+
+CAUTION: Keep the record orange-cloud, that is proxied. A grey-cloud record
+sends visitors straight to port 3000 over plain HTTP. Bluesky then cannot
+resolve `did:web:<hostname>`, and the VM IP becomes public.
+
+### Confirming the hostname
+
+Do this check after `up -d` and before `upstage publish`. `publish` writes
+`did:web:<hostname>` into the feed record, so a wrong hostname publishes a
+dead feed.
+
+```
+curl https://<UPSTAGE_HOSTNAME>/.well-known/did.json
+```
+
+The `id` field in the answer must read `did:web:<UPSTAGE_HOSTNAME>`, with the
+same hostname you sent the request to. A difference means `.env` and
+Cloudflare disagree.
+
+| Result | Cause | Action |
+|---|---|---|
+| The `id` field holds another hostname | `UPSTAGE_HOSTNAME` in `.env` is wrong | Correct `.env`, then run `docker compose -f <file> up -d` again |
+| Cloudflare error 1033, or a 502 | The tunnel is not connected | Read `docker compose -f compose.yaml logs -f cloudflared` |
+| Cloudflare error 521 | The proxy cannot reach port 3000 | Make sure that the firewall accepts Cloudflare's IP ranges |
+| A TLS error | The record is grey-cloud, or the TLS mode is Full | Set the record to proxied, and the mode to Flexible |
+| `NXDOMAIN` from the resolver | No DNS record exists for the hostname | Create the record for the variant you picked, above |
 
 In both variants, `UPSTAGE_HOSTNAME` must match the Cloudflare hostname
 exactly. It forms `did:web:<hostname>`, and the feed breaks if the two
