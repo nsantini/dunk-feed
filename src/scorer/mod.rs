@@ -72,7 +72,11 @@ where
 /// `snapshot_len` is written by `snapshot_step`, the pass's step 7.
 /// `profile_calls`, `deferred`, `guard_would_drop` and `guard_histogram` are
 /// story 10's, folded in by `guards::check_batch` once per verify phase and
-/// read by `one_pass`'s log-only histogram line (BC29).
+/// read by `one_pass`'s histogram-period line (BC29). `histogram_o_dids_seen`
+/// is story 10's correction round (BC31a): the `O` author DIDs already
+/// sampled into `guard_histogram` this pass, private to `check_batch`, so a
+/// prolific author's DID on many pairs is counted once, not once per pair.
+/// It resets every pass because `one_pass` builds a fresh `PassCounters`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PassCounters {
     pub selected: usize,
@@ -87,6 +91,7 @@ pub struct PassCounters {
     pub deferred: usize,
     pub guard_would_drop: usize,
     pub guard_histogram: guards::FollowerHistogram,
+    histogram_o_dids_seen: HashSet<String>,
 }
 
 /// The App View surface the scorer needs: one lenient, chunked `getPosts`
@@ -229,21 +234,24 @@ fn build_feed_row(
 /// `PostSource::get_posts_lenient` once (BC5; it does its own chunking at
 /// `AppViewClient::POSTS_BATCH`, round 2 finding 4), then for every pair
 /// whose chunk succeeded runs `verify_pair`. A hard-check `Verdict::Drop`
-/// (BC6 to BC15) is queued directly; every `Verdict::Continue` is collected
-/// and, once the loop is done, handed to `guards::check_batch` in one call
-/// (story 10), which reaches the `authors` cache and the App View itself.
+/// (BC6 to BC15) is queued directly. A `Verdict::Continue` pair is checked
+/// against `score::qualifies` right away (story 10's correction round,
+/// BC39, BC40): a pair that does not qualify never reaches the guard at all,
+/// costing it no `getProfiles` call, and keeps today's behaviour — stays
+/// `candidate` on a first verify (BC17), demotes on a re-verify (BC20) — the
+/// same as before story 10 existed. Only the qualifying subset is collected
+/// and, once the loop is done, handed to `guards::check_batch` in one call,
+/// which reaches the `authors` cache and the App View itself.
 /// `check_batch`'s `GuardResult`s come back one per pair, in the same order,
-/// and drive promote/drop/stay/defer exactly like the hard check: a
-/// `GuardResult::Drop` drops with its reason (BC17, BC18); a `Pass` that
-/// clears `score::qualifies` promotes (BC16), one that does not stays
-/// `candidate` on a first verify (BC17) and demotes on a re-verify (BC20); a
-/// `GuardResult::Defer` (BC21) is left out of both the verdicts and the
-/// dirty-flag clear, so the pair stays `candidate` and dirty for the next
-/// pass to retry, the same treatment a failed `getPosts` chunk already gets.
-/// Every `PairOutcome` is applied in one `Store::apply_verdicts` call
-/// (BC48), and dirty is cleared on every decided pair's local counts in one
-/// `Store::clear_dirty_if_unchanged` call (BC43, BC44). An empty `pairs`
-/// makes no App View call at all (BC4).
+/// and drive promote/drop/defer: a `GuardResult::Drop` drops with its reason
+/// (BC17, BC18); a `Pass` always promotes, since the pair is already known to
+/// qualify (BC40); a `GuardResult::Defer` (BC21) is left out of both the
+/// verdicts and the dirty-flag clear, so the pair stays `candidate` and
+/// dirty for the next pass to retry, the same treatment a failed `getPosts`
+/// chunk already gets. Every `PairOutcome` is applied in one
+/// `Store::apply_verdicts` call (BC48), and dirty is cleared on every
+/// decided pair's local counts in one `Store::clear_dirty_if_unchanged` call
+/// (BC43, BC44). An empty `pairs` makes no App View call at all (BC4).
 #[allow(clippy::too_many_arguments)]
 async fn verify_and_apply<S: PostSource + ProfileSource>(
     store: &Store,
@@ -255,7 +263,7 @@ async fn verify_and_apply<S: PostSource + ProfileSource>(
     phase: VerifyPhase,
     counters: &mut PassCounters,
     guard_cfg: &guards::GuardConfig,
-    log_only: bool,
+    histogram_open: bool,
 ) -> Result<(), ScorerError> {
     if pairs.is_empty() {
         return Ok(());
@@ -289,9 +297,10 @@ async fn verify_and_apply<S: PostSource + ProfileSource>(
 
     let mut pair_outcomes: Vec<PairOutcome> = Vec::with_capacity(pairs.len());
     let mut clear_rows: Vec<(String, Counts)> = Vec::with_capacity(pairs.len() * 2);
-    // Every `Verdict::Continue` pair, alongside the `(quote_uri, counts_q,
-    // original_uri, counts_o)` `clear_dirty_if_unchanged` needs for it once
-    // the guard decides. Kept in step with `continue_pairs` by index.
+    // Every qualifying `Verdict::Continue` pair, alongside the (quote_uri,
+    // counts_q, original_uri, counts_o)` `clear_dirty_if_unchanged` needs
+    // for it once the guard decides. Kept in step with `continue_pairs` by
+    // index.
     let mut continue_pairs: Vec<verify::VerifiedPair> = Vec::new();
     let mut continue_local: Vec<(String, Counts, String, Counts)> = Vec::new();
 
@@ -318,20 +327,43 @@ async fn verify_and_apply<S: PostSource + ProfileSource>(
                 *counters.dropped.entry(reason.as_str()).or_insert(0) += 1;
             }
             Verdict::Continue(verified) => {
-                continue_local.push((
-                    pair.quote_uri.clone(),
-                    pair.counts_q,
-                    pair.original_uri.clone(),
-                    pair.counts_o,
-                ));
-                continue_pairs.push(verified);
+                // BC39, BC40: `score::qualifies` decides right here, before
+                // the guard ever runs, so a non-qualifying pair costs no
+                // `getProfiles` call.
+                let eq = score::engagement(&verified.counts_q, weights);
+                let eo = score::engagement(&verified.counts_o, weights);
+                if score::qualifies(eq, eo, thresholds) {
+                    continue_local.push((
+                        pair.quote_uri.clone(),
+                        pair.counts_q,
+                        pair.original_uri.clone(),
+                        pair.counts_o,
+                    ));
+                    continue_pairs.push(verified);
+                } else {
+                    clear_rows.push((pair.quote_uri.clone(), pair.counts_q));
+                    clear_rows.push((pair.original_uri.clone(), pair.counts_o));
+                    if phase == VerifyPhase::Reverify {
+                        pair_outcomes.push(PairOutcome::Demote { quote_uri: verified.quote_uri });
+                        counters.demoted += 1;
+                    }
+                    // VerifyPhase::First and does not qualify: BC17, the
+                    // pair simply stays `candidate`.
+                }
             }
         }
     }
 
-    let guard_results =
-        guards::check_batch(store, source, guard_cfg, &continue_pairs, now, log_only, counters)
-            .await?;
+    let guard_results = guards::check_batch(
+        store,
+        source,
+        guard_cfg,
+        &continue_pairs,
+        now,
+        histogram_open,
+        counters,
+    )
+    .await?;
 
     for ((verified, local), result) in
         continue_pairs.into_iter().zip(continue_local).zip(guard_results)
@@ -345,22 +377,14 @@ async fn verify_and_apply<S: PostSource + ProfileSource>(
                 *counters.dropped.entry(reason.as_str()).or_insert(0) += 1;
             }
             GuardResult::Pass => {
+                // BC40: every pair reaching the guard already qualifies.
                 clear_rows.push((local.0, local.1));
                 clear_rows.push((local.2, local.3));
-                let eq = score::engagement(&verified.counts_q, weights);
-                let eo = score::engagement(&verified.counts_o, weights);
-                if score::qualifies(eq, eo, thresholds) {
-                    let row = build_feed_row(&verified, weights, thresholds, now);
-                    pair_outcomes.push(PairOutcome::Promote(row));
-                    if phase == VerifyPhase::First {
-                        counters.promoted += 1;
-                    }
-                } else if phase == VerifyPhase::Reverify {
-                    pair_outcomes.push(PairOutcome::Demote { quote_uri: verified.quote_uri });
-                    counters.demoted += 1;
+                let row = build_feed_row(&verified, weights, thresholds, now);
+                pair_outcomes.push(PairOutcome::Promote(row));
+                if phase == VerifyPhase::First {
+                    counters.promoted += 1;
                 }
-                // VerifyPhase::First and does not qualify: BC17, the pair
-                // simply stays `candidate`.
             }
             // BC21: left out of both the clear and the verdicts, exactly
             // like a failed `getPosts` chunk above, so the pair stays
@@ -440,10 +464,12 @@ async fn snapshot_step(
 /// One full pass, TECH-DESIGN section 7.2 steps 1 to 7. `do_reverify` is
 /// the caller's decision, made against `cfg.reverify_interval_s`'s own
 /// timer (BC19); `one_pass` itself never reads a clock beyond the `now` it
-/// is given, so it stays testable without real time passing. The log-only
-/// window (story 10) is resolved once, up front, so both verify phases
-/// suppress or apply the follower floor identically; the histogram it
-/// collects is logged once, after both phases have run (BC29).
+/// is given, so it stays testable without real time passing. The histogram
+/// period (story 10, revised by its correction round) is resolved once, up
+/// front, so both verify phases fold the same pass's follower distribution
+/// into the same `counters`; the follower floor itself is always live
+/// (BC41) regardless of the period, and the histogram line it collects is
+/// logged once, after both phases have run (BC29).
 pub async fn one_pass<S: PostSource + ProfileSource>(
     store: &Store,
     source: &S,
@@ -459,7 +485,7 @@ pub async fn one_pass<S: PostSource + ProfileSource>(
     let thresholds = Thresholds::from(cfg);
     let guard_cfg = guards::GuardConfig::from(cfg);
     let candidate_ttl_h = i64::from(cfg.candidate_ttl_h);
-    let log_only = guards::log_only_window(store, &guard_cfg, now).await?;
+    let histogram_open = guards::log_only_window(store, &guard_cfg, now).await?;
 
     // Steps 1 to 4: select, verify, guard, promote or drop.
     let selected = select_step(store, now, cfg, &weights, &thresholds).await?;
@@ -474,7 +500,7 @@ pub async fn one_pass<S: PostSource + ProfileSource>(
         VerifyPhase::First,
         &mut counters,
         &guard_cfg,
-        log_only,
+        histogram_open,
     )
     .await?;
 
@@ -493,7 +519,7 @@ pub async fn one_pass<S: PostSource + ProfileSource>(
             VerifyPhase::Reverify,
             &mut counters,
             &guard_cfg,
-            log_only,
+            histogram_open,
         )
         .await?;
     }
@@ -524,9 +550,9 @@ pub async fn one_pass<S: PostSource + ProfileSource>(
     );
 
     // BC26, BC27, BC29: exactly one histogram line per pass, and only while
-    // the log-only window is open. Past it, the floor is live and no
-    // distribution needs logging any more.
-    if log_only {
+    // the histogram period is open. The floor itself is always live (BC41);
+    // past the period, only the distribution line stops.
+    if histogram_open {
         let h = &counters.guard_histogram;
         tracing::info!(
             guard_would_drop = counters.guard_would_drop,

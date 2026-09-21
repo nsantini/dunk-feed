@@ -369,13 +369,14 @@ pub fn expire(
     if !expired_feed.is_empty() {
         let quote_uris: Vec<&String> =
             expired_feed.iter().map(|(quote_uri, _)| quote_uri).collect();
-        // BC39: chunked at MAX_BOUND_PARAMS so a large expiry never exceeds
+        // BC39, BC50: chunked at MAX_BOUND_PARAMS, through the shared
+        // `for_each_in_chunk` helper, so a large expiry never exceeds
         // SQLite's bound-parameter limit.
-        for chunk in quote_uris.chunks(crate::store::MAX_BOUND_PARAMS) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
+        crate::store::for_each_in_chunk(&quote_uris, |chunk, placeholders| {
             let sql = format!("DELETE FROM pairs WHERE quote_uri IN ({placeholders})");
             conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
-        }
+            Ok(())
+        })?;
     }
 
     // Round 1 finding 1: only a URI no non-dropped pair still names is
@@ -389,13 +390,13 @@ pub fn expire(
         .collect();
     if !orphaned.is_empty() {
         orphaned.sort();
-        // BC39: chunked at MAX_BOUND_PARAMS, the same as the `pairs` delete
-        // above.
-        for chunk in orphaned.chunks(crate::store::MAX_BOUND_PARAMS) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
+        // BC39, BC50: chunked at MAX_BOUND_PARAMS, the same helper the
+        // `pairs` delete above uses.
+        crate::store::for_each_in_chunk(&orphaned, |chunk, placeholders| {
             let sql = format!("DELETE FROM counts WHERE post_uri IN ({placeholders})");
             conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
-        }
+            Ok(())
+        })?;
     }
     report.evicted_uris = orphaned;
 

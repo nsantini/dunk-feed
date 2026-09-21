@@ -93,8 +93,8 @@ pub fn verify_pair(
         quoted_at,
         counts_q: Counts::from(q),
         counts_o: Counts::from(o),
-        labels_q: q.labels.iter().map(|l| l.val.clone()).collect(),
-        labels_o: o.labels.iter().map(|l| l.val.clone()).collect(),
+        labels_q: q.label_values(),
+        labels_o: o.label_values(),
     })
 }
 

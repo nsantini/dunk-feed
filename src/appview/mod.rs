@@ -105,31 +105,6 @@ pub struct PostsOutcome {
     pub calls: usize,
 }
 
-/// Folds one chunk's `getPosts` result into `outcome` (BC47): the chunk's
-/// posts on success, or every one of `chunk`'s own URIs into `failed_uris`
-/// on failure, after logging at `warn`. Kept separate from
-/// `AppViewClient::get_posts_lenient` so the merge and failed-URI bookkeeping
-/// can be tested with synthetic chunk results, with no live chunk boundary
-/// of exactly `POSTS_BATCH` and no network required.
-fn merge_chunk_outcome(
-    outcome: &mut PostsOutcome,
-    chunk: &[String],
-    result: Result<HashMap<String, PostView>, AppViewError>,
-) {
-    outcome.calls += 1;
-    match result {
-        Ok(map) => outcome.posts.extend(map),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                chunk_len = chunk.len(),
-                "appview: getPosts chunk failed after retries"
-            );
-            outcome.failed_uris.extend(chunk.iter().cloned());
-        }
-    }
-}
-
 /// The result of one lenient, chunked `getProfiles` call, mirroring
 /// [`PostsOutcome`] for the same reason (story 10's guard needs every DID's
 /// outcome, not one `Err` for the whole call): every chunk of at most
@@ -144,28 +119,46 @@ pub struct ProfilesOutcome {
     pub calls: usize,
 }
 
-/// Folds one chunk's `getProfiles` result into `outcome`, the `ProfileView`
-/// counterpart of [`merge_chunk_outcome`]. Kept separate from
-/// `AppViewClient::get_profiles_lenient` so the merge and failed-DID
-/// bookkeeping can be tested with synthetic chunk results, with no live
-/// chunk boundary of exactly `PROFILES_BATCH` and no network required.
-fn merge_profile_chunk_outcome(
-    outcome: &mut ProfilesOutcome,
-    chunk: &[String],
-    result: Result<HashMap<String, ProfileView>, AppViewError>,
-) {
-    outcome.calls += 1;
-    match result {
-        Ok(map) => outcome.profiles.extend(map),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                chunk_len = chunk.len(),
-                "appview: getProfiles chunk failed after retries"
-            );
-            outcome.failed_dids.extend(chunk.iter().cloned());
+/// One generic, chunked, failure-tolerant App View call (BC48, story 10's
+/// correction round): the shared engine behind
+/// [`AppViewClient::get_posts_lenient`] and
+/// [`AppViewClient::get_profiles_lenient`], replacing the two near-identical
+/// `merge_*_chunk_outcome` helpers this story's earlier slices had. Splits
+/// `items` into groups of at most `batch_size`, calls `call` once per group,
+/// and folds each group's outcome into the returned map on success or into
+/// the returned failed set (every one of that group's own items) on
+/// failure, after logging once at `warn`. Returns `(results, failed, calls)`
+/// so each caller builds its own `PostsOutcome`/`ProfilesOutcome` from the
+/// three.
+async fn fetch_lenient<T, F, Fut>(
+    items: &[String],
+    batch_size: usize,
+    method: &'static str,
+    call: F,
+) -> (HashMap<String, T>, HashSet<String>, usize)
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<HashMap<String, T>, AppViewError>>,
+{
+    let mut results = HashMap::new();
+    let mut failed = HashSet::new();
+    let mut calls = 0usize;
+    for chunk in items.chunks(batch_size) {
+        calls += 1;
+        match call(chunk.to_vec()).await {
+            Ok(map) => results.extend(map),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chunk_len = chunk.len(),
+                    method,
+                    "appview: a chunk failed after retries"
+                );
+                failed.extend(chunk.iter().cloned());
+            }
         }
     }
+    (results, failed, calls)
 }
 
 /// A typed client over `app.bsky.feed.getPosts`, `app.bsky.actor.getProfiles`,
@@ -301,12 +294,12 @@ impl AppViewClient {
     /// instead of chunking `uris` itself and calling `get_posts` once per
     /// chunk.
     pub async fn get_posts_lenient(&self, uris: &[String]) -> PostsOutcome {
-        let mut outcome = PostsOutcome::default();
-        for chunk in uris.chunks(Self::POSTS_BATCH) {
-            let result = self.get_posts(chunk).await;
-            merge_chunk_outcome(&mut outcome, chunk, result);
-        }
-        outcome
+        let (posts, failed_uris, calls) =
+            fetch_lenient(uris, Self::POSTS_BATCH, "getPosts", |chunk| async move {
+                self.get_posts(&chunk).await
+            })
+            .await;
+        PostsOutcome { posts, failed_uris, calls }
     }
 
     /// `app.bsky.actor.getProfiles`. Splits `dids` into groups of
@@ -338,12 +331,12 @@ impl AppViewClient {
     /// [`Self::get_posts_lenient`]. Story 10's guard calls this instead of
     /// chunking `dids` itself and calling `get_profiles` once per chunk.
     pub async fn get_profiles_lenient(&self, dids: &[String]) -> ProfilesOutcome {
-        let mut outcome = ProfilesOutcome::default();
-        for chunk in dids.chunks(Self::PROFILES_BATCH) {
-            let result = self.get_profiles(chunk).await;
-            merge_profile_chunk_outcome(&mut outcome, chunk, result);
-        }
-        outcome
+        let (profiles, failed_dids, calls) =
+            fetch_lenient(dids, Self::PROFILES_BATCH, "getProfiles", |chunk| async move {
+                self.get_profiles(&chunk).await
+            })
+            .await;
+        ProfilesOutcome { profiles, failed_dids, calls }
     }
 
     /// `app.bsky.feed.getQuotes`. One page of at most [`Self::PAGE_LIMIT`]
@@ -479,32 +472,38 @@ mod tests {
         assert_eq!(err, AppViewError::InvalidRate);
     }
 
-    // BC47: a chunk that fails keeps its own URIs out of `posts` and names
-    // them in `failed_uris`, while a good chunk's posts still land in
-    // `posts` and every chunk attempted, failed or not, is counted.
-    #[test]
-    fn merge_chunk_outcome_keeps_good_chunk_and_names_failed_chunk() {
+    // BC47, BC48: `fetch_lenient` keeps a good chunk's items out of the
+    // failed set and folds them into the result map, names a failed chunk's
+    // own items in the failed set instead, and counts every chunk attempted,
+    // failed or not. One test over the shared engine now covers both
+    // `get_posts_lenient` and `get_profiles_lenient`, since the merge and
+    // failed-item bookkeeping no longer has a `PostsOutcome`-specific copy.
+    #[tokio::test]
+    async fn fetch_lenient_keeps_good_chunk_and_names_failed_chunk() {
         let decoded: GetPostsResponse = serde_json::from_str(GETPOSTS_OK).expect("fixture decodes");
         let good_post = decoded.posts[0].clone();
-        let good_chunk = vec![good_post.uri.clone()];
-        let bad_chunk = vec!["uri-b".to_string(), "uri-c".to_string()];
+        let good_uri = good_post.uri.clone();
+        let bad_uris = vec!["uri-b".to_string(), "uri-c".to_string()];
+        let items = vec![good_uri.clone(), bad_uris[0].clone(), bad_uris[1].clone()];
 
-        let mut outcome = PostsOutcome::default();
-        merge_chunk_outcome(
-            &mut outcome,
-            &good_chunk,
-            Ok(HashMap::from([(good_post.uri.clone(), good_post.clone())])),
-        );
-        merge_chunk_outcome(
-            &mut outcome,
-            &bad_chunk,
-            Err(AppViewError::Failed { method: "getPosts", status: None, attempts: 3 }),
-        );
+        let (results, failed, calls) =
+            fetch_lenient::<PostView, _, _>(&items, 1, "getPosts", |chunk| {
+                let good_post = good_post.clone();
+                let good_uri = good_uri.clone();
+                async move {
+                    if chunk == [good_uri.clone()] {
+                        Ok(HashMap::from([(good_uri, good_post)]))
+                    } else {
+                        Err(AppViewError::Failed { method: "getPosts", status: None, attempts: 3 })
+                    }
+                }
+            })
+            .await;
 
-        assert_eq!(outcome.calls, 2);
-        assert_eq!(outcome.posts.len(), 1);
-        assert_eq!(outcome.posts.get(&good_post.uri), Some(&good_post));
-        assert_eq!(outcome.failed_uris, bad_chunk.into_iter().collect::<HashSet<_>>());
+        assert_eq!(calls, 3, "one chunk per item at batch_size 1");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results.get(&good_uri), Some(&good_post));
+        assert_eq!(failed, bad_uris.into_iter().collect::<HashSet<_>>());
     }
 
     #[tokio::test]
@@ -514,36 +513,6 @@ mod tests {
                 .expect("positive rate builds a client");
         let outcome = client.get_posts_lenient(&[]).await;
         assert_eq!(outcome, PostsOutcome::default());
-    }
-
-    // The `getProfiles` counterpart of `merge_chunk_outcome_keeps_good_chunk_
-    // and_names_failed_chunk`: a good chunk's profiles land in `profiles`, a
-    // failed chunk's DIDs land in `failed_dids`, and every chunk attempted is
-    // counted.
-    #[test]
-    fn merge_profile_chunk_outcome_keeps_good_chunk_and_names_failed_chunk() {
-        let decoded: GetProfilesResponse =
-            serde_json::from_str(GETPROFILES_OK).expect("fixture decodes");
-        let good_profile = decoded.profiles[0].clone();
-        let good_chunk = vec![good_profile.did.clone()];
-        let bad_chunk = vec!["did:plc:b".to_string(), "did:plc:c".to_string()];
-
-        let mut outcome = ProfilesOutcome::default();
-        merge_profile_chunk_outcome(
-            &mut outcome,
-            &good_chunk,
-            Ok(HashMap::from([(good_profile.did.clone(), good_profile.clone())])),
-        );
-        merge_profile_chunk_outcome(
-            &mut outcome,
-            &bad_chunk,
-            Err(AppViewError::Failed { method: "getProfiles", status: None, attempts: 3 }),
-        );
-
-        assert_eq!(outcome.calls, 2);
-        assert_eq!(outcome.profiles.len(), 1);
-        assert_eq!(outcome.profiles.get(&good_profile.did), Some(&good_profile));
-        assert_eq!(outcome.failed_dids, bad_chunk.into_iter().collect::<HashSet<_>>());
     }
 
     #[tokio::test]

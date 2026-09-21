@@ -17,6 +17,26 @@ pub struct AuthorRow {
     pub checked_at: i64,
 }
 
+impl AuthorRow {
+    /// Whether this row is still fresh enough to skip a `getProfiles`
+    /// refetch, story 10's correction round (BC44, BC46, BC47). Picks the
+    /// TTL for the row's own state first: `ttl_active_s` for an active row
+    /// or one carrying a `!takedown` label (a moderation action, not a
+    /// transient state, BC47), `ttl_inactive_s` for a row written
+    /// `active = false` from a missing profile (BC46), since a deactivation
+    /// is often temporary and worth rechecking sooner. Then checks strict
+    /// freshness (BC44): `now - checked_at < ttl_s`, so a row exactly
+    /// `ttl_s` old is stale, not fresh.
+    pub fn is_fresh(&self, now: i64, ttl_active_s: i64, ttl_inactive_s: i64) -> bool {
+        let has_takedown = self
+            .labels
+            .as_deref()
+            .is_some_and(|labels| labels.iter().any(|label| label == "!takedown"));
+        let ttl_s = if self.active || has_takedown { ttl_active_s } else { ttl_inactive_s };
+        now - self.checked_at < ttl_s
+    }
+}
+
 /// Reads the row for `did`. `Ok(None)` when there is none (BC64). A stored
 /// `labels` value that does not parse as a JSON array of strings is
 /// `StoreError::MalformedRow` (BC66): the row is never returned with a
@@ -83,13 +103,13 @@ fn encode_labels(labels: &Option<Vec<String>>) -> Result<Option<String>, StoreEr
 }
 
 /// Reads the rows for `dids`, skipping any DID with no row. Chunked at
-/// `MAX_BOUND_PARAMS` so a batch larger than SQLite's bound-parameter limit
-/// is split into multiple statements (BC20), each its own `prepare_cached`
-/// call. An empty `dids` makes no query at all.
+/// `MAX_BOUND_PARAMS` through the shared `for_each_in_chunk` (BC50), so a
+/// batch larger than SQLite's bound-parameter limit is split into multiple
+/// statements (BC20), each its own `prepare_cached` call, with no
+/// placeholder string built here. An empty `dids` makes no query at all.
 pub fn authors_get_many(conn: &Connection, dids: &[&str]) -> Result<Vec<AuthorRow>, StoreError> {
     let mut rows = Vec::new();
-    for chunk in dids.chunks(crate::store::MAX_BOUND_PARAMS) {
-        let placeholders = vec!["?"; chunk.len()].join(",");
+    crate::store::for_each_in_chunk(dids, |chunk, placeholders| {
         let sql = format!(
             "SELECT did, followers, active, labels, checked_at FROM authors WHERE did IN ({placeholders})"
         );
@@ -110,7 +130,8 @@ pub fn authors_get_many(conn: &Connection, dids: &[&str]) -> Result<Vec<AuthorRo
             };
             rows.push(AuthorRow { did, followers, active: active != 0, labels, checked_at });
         }
-    }
+        Ok(())
+    })?;
     Ok(rows)
 }
 
@@ -297,5 +318,62 @@ mod tests {
         let conn = migrated_conn();
         authors_put_many(&conn, &[]).unwrap();
         assert_eq!(author_get(&conn, "did:plc:a").unwrap(), None);
+    }
+
+    // BC44: `AuthorRow::is_fresh`'s comparison is strict: `ttl - 1` is
+    // fresh, `ttl` itself is stale. AC5's test path
+    // (`store::authors::tests::cache_hit_within_24h`), kept as a literal
+    // name from the story even though the comparison it exercises is
+    // general, not tied to the 24h default specifically.
+    #[test]
+    fn cache_hit_within_24h() {
+        let ttl = 24 * 3600;
+        let now = 1_700_100_000;
+        let fresh = AuthorRow {
+            did: "did:plc:a".to_string(),
+            followers: Some(10),
+            active: true,
+            labels: None,
+            checked_at: now - (ttl - 1),
+        };
+        assert!(fresh.is_fresh(now, ttl, ttl), "ttl - 1 old is fresh");
+
+        let stale = AuthorRow { checked_at: now - ttl, ..fresh.clone() };
+        assert!(!stale.is_fresh(now, ttl, ttl), "exactly ttl old is stale");
+    }
+
+    // BC46: an inactive row with no `!takedown` label uses the shorter
+    // inactive TTL.
+    #[test]
+    fn is_fresh_inactive_without_takedown_uses_the_inactive_ttl() {
+        let now = 1_700_100_000;
+        let row = AuthorRow {
+            did: "did:plc:a".to_string(),
+            followers: None,
+            active: false,
+            labels: None,
+            checked_at: now - 3600,
+        };
+        assert!(!row.is_fresh(now, 24 * 3600, 3600), "exactly the inactive TTL is stale");
+        assert!(row.is_fresh(now, 24 * 3600, 3601));
+    }
+
+    // BC47: an inactive row carrying a `!takedown` label uses the normal,
+    // active TTL instead: a takedown is a moderation action, not a
+    // transient state.
+    #[test]
+    fn is_fresh_takedown_uses_the_active_ttl() {
+        let now = 1_700_100_000;
+        let row = AuthorRow {
+            did: "did:plc:a".to_string(),
+            followers: None,
+            active: false,
+            labels: Some(vec!["!takedown".to_string()]),
+            checked_at: now - 3600,
+        };
+        assert!(
+            row.is_fresh(now, 24 * 3600, 1),
+            "a takedown row uses the normal TTL, not the inactive one"
+        );
     }
 }

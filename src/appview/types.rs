@@ -113,6 +113,16 @@ pub struct PostView {
     pub embed: Option<EmbedView>,
 }
 
+impl PostView {
+    /// `labels[].val`, owned (BC49, story 10's correction round). Shared by
+    /// `verify.rs`'s `labels_q`/`labels_o` and, through [`ProfileView`]'s own
+    /// copy, `guards.rs`'s profile-label reads, so the `Label -> String`
+    /// mapping is written once instead of at each call site.
+    pub fn label_values(&self) -> Vec<String> {
+        self.labels.iter().map(|label| label.val.clone()).collect()
+    }
+}
+
 /// `app.bsky.feed.getPosts`'s response body.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GetPostsResponse {
@@ -251,6 +261,14 @@ pub struct ProfileView {
     pub followers_count: u32,
     #[serde(default)]
     pub labels: Vec<Label>,
+}
+
+impl ProfileView {
+    /// `labels[].val`, owned (BC49), the [`PostView::label_values`]
+    /// counterpart for a profile.
+    pub fn label_values(&self) -> Vec<String> {
+        self.labels.iter().map(|label| label.val.clone()).collect()
+    }
 }
 
 /// `app.bsky.actor.getProfiles`'s response body.

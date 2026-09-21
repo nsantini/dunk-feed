@@ -72,14 +72,23 @@ pub struct Config {
     /// `/healthz`'s lag threshold, in seconds (story 08, BC27): past this
     /// age on either `HealthState` atomic, `/healthz` returns 503.
     pub health_max_lag_s: u32,
-    /// Hours the follower-floor drop stays log-only before it starts
-    /// dropping pairs (story 10, section 9). `0` disables the window: the
-    /// floor is live from the first pass (BC23, BC32).
-    pub guard_log_only_h: u32,
+    /// Hours the follower-floor histogram period stays open before `one_pass`
+    /// stops logging its distribution line (story 10, section 9, revised by
+    /// the correction round: the floor itself is live from the first pass
+    /// regardless of this window, BC41). `0` disables the period outright
+    /// (BC23, BC32).
+    pub guard_histogram_h: u32,
     /// Hours an `authors` cache row stays fresh before the guard refetches
-    /// it (story 10, section 9). `0` is rejected: it would refetch every DID
-    /// on every pass (BC33).
+    /// it, for an active row or one carrying a `!takedown` label (story 10,
+    /// section 9). `0` is rejected: it would refetch every DID on every pass
+    /// (BC33).
     pub author_ttl_h: u32,
+    /// Hours a row written `active = false` from a missing profile (no
+    /// `!takedown` label) stays fresh before the guard refetches it (story
+    /// 10's correction round, BC45 to BC47): shorter than `author_ttl_h`,
+    /// because a deactivation is often temporary. `0` is rejected, the same
+    /// rule as `author_ttl_h`.
+    pub author_inactive_ttl_h: u32,
 }
 
 impl Config {
@@ -341,8 +350,9 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         bsky_handle: optional(&lookup, "BSKY_HANDLE"),
         bsky_app_password: optional(&lookup, "BSKY_APP_PASSWORD").map(Secret),
         health_max_lag_s: positive_u32_or_default(&lookup, "DUNK_HEALTH_MAX_LAG_S", 300)?,
-        guard_log_only_h: number_or_default(&lookup, "DUNK_GUARD_LOG_ONLY_H", 24)?,
+        guard_histogram_h: number_or_default(&lookup, "DUNK_GUARD_HISTOGRAM_H", 24)?,
         author_ttl_h: positive_u32_or_default(&lookup, "DUNK_AUTHOR_TTL_H", 24)?,
+        author_inactive_ttl_h: positive_u32_or_default(&lookup, "DUNK_AUTHOR_INACTIVE_TTL_H", 1)?,
     })
 }
 
@@ -451,8 +461,9 @@ mod tests {
             config.drop_labels,
             vec!["porn", "sexual", "graphic-media", "nudity", "!hide", "!warn", "spam"]
         );
-        assert_eq!(config.guard_log_only_h, 24);
+        assert_eq!(config.guard_histogram_h, 24);
         assert_eq!(config.author_ttl_h, 24);
+        assert_eq!(config.author_inactive_ttl_h, 1);
     }
 
     #[test]
@@ -745,44 +756,44 @@ mod tests {
     }
 
     #[test]
-    fn zero_guard_log_only_h_disables_the_window() {
+    fn zero_guard_histogram_h_disables_the_period() {
         // BC32: 0 is a valid value, not rejected like the positive_u32 fields.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_GUARD_LOG_ONLY_H", "0"));
+        pairs.push(("DUNK_GUARD_HISTOGRAM_H", "0"));
         let config = load(env(&pairs)).unwrap();
-        assert_eq!(config.guard_log_only_h, 0);
+        assert_eq!(config.guard_histogram_h, 0);
     }
 
     #[test]
-    fn malformed_guard_log_only_h_is_invalid() {
+    fn malformed_guard_histogram_h_is_invalid() {
         // BC32.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_GUARD_LOG_ONLY_H", "soon"));
+        pairs.push(("DUNK_GUARD_HISTOGRAM_H", "soon"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_GUARD_LOG_ONLY_H"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_GUARD_HISTOGRAM_H"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
 
     #[test]
-    fn empty_guard_log_only_h_is_invalid() {
+    fn empty_guard_histogram_h_is_invalid() {
         // BC32: empty is malformed, not the default.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_GUARD_LOG_ONLY_H", ""));
+        pairs.push(("DUNK_GUARD_HISTOGRAM_H", ""));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_GUARD_LOG_ONLY_H"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_GUARD_HISTOGRAM_H"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
 
     #[test]
-    fn custom_guard_log_only_h_is_read() {
+    fn custom_guard_histogram_h_is_read() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_GUARD_LOG_ONLY_H", "12"));
+        pairs.push(("DUNK_GUARD_HISTOGRAM_H", "12"));
         let config = load(env(&pairs)).unwrap();
-        assert_eq!(config.guard_log_only_h, 12);
+        assert_eq!(config.guard_histogram_h, 12);
     }
 
     #[test]
@@ -830,6 +841,53 @@ mod tests {
         pairs.push(("DUNK_AUTHOR_TTL_H", "6"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.author_ttl_h, 6);
+    }
+
+    #[test]
+    fn zero_author_inactive_ttl_h_is_invalid() {
+        // BC45: the same rule as DUNK_AUTHOR_TTL_H.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_AUTHOR_INACTIVE_TTL_H", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "DUNK_AUTHOR_INACTIVE_TTL_H");
+                assert_eq!(reason, "must be greater than zero");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_author_inactive_ttl_h_is_invalid() {
+        // BC45.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_AUTHOR_INACTIVE_TTL_H", "soon"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_AUTHOR_INACTIVE_TTL_H"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_author_inactive_ttl_h_is_invalid() {
+        // BC45: empty is malformed, not the default.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_AUTHOR_INACTIVE_TTL_H", ""));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_AUTHOR_INACTIVE_TTL_H"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_author_inactive_ttl_h_is_read() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("DUNK_AUTHOR_INACTIVE_TTL_H", "2"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.author_inactive_ttl_h, 2);
     }
 
     #[test]

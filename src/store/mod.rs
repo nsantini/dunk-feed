@@ -160,6 +160,25 @@ pub fn unix_now() -> i64 {
 /// `IN (...)` list at all.
 pub const MAX_BOUND_PARAMS: usize = 32_766;
 
+/// Splits `items` into chunks of at most [`MAX_BOUND_PARAMS`] and calls `f`
+/// with each chunk and that chunk's own `?,?,...` placeholder string, story
+/// 10's correction round (BC50): the three call sites that build an
+/// `IN (...)` list (`authors::authors_get_many`, and `pairs::expire`'s two
+/// chunked deletes) build no placeholders of their own any more.
+/// `counts::clear_dirty_if_unchanged` has no `IN (...)` list at all (it
+/// updates one row per statement, round 2 finding 2 of story 07), so it is
+/// not a call site. A chunk's failure stops the loop and returns that error.
+pub(crate) fn for_each_in_chunk<T>(
+    items: &[T],
+    mut f: impl FnMut(&[T], &str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    for chunk in items.chunks(MAX_BOUND_PARAMS) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        f(chunk, &placeholders)?;
+    }
+    Ok(())
+}
+
 /// Applies the pragmas TECH-DESIGN section 6 asks for, on every open
 /// (BC18). On a `:memory:` path SQLite reports `journal_mode` as `memory`
 /// instead of `wal`; that is accepted, not an error (BC19), and every other
@@ -371,18 +390,14 @@ impl Store {
     }
 
     /// Reads the `authors` rows for `dids` on the read connection, skipping
-    /// any DID with no row (BC20). No caller yet; slice 3.0's `check_batch`
-    /// is the first.
-    #[allow(dead_code)]
+    /// any DID with no row (BC20). Called by `guards::check_batch`.
     pub fn authors_get_many(&self, dids: &[&str]) -> Result<Vec<authors::AuthorRow>, StoreError> {
         let conn = self.read_lock()?;
         authors::authors_get_many(&conn, dids)
     }
 
     /// Inserts or replaces every row in `rows` on the write connection,
-    /// inside one transaction (BC19). No caller yet; slice 3.0's
-    /// `check_batch` is the first.
-    #[allow(dead_code)]
+    /// inside one transaction (BC19). Called by `guards::check_batch`.
     pub fn authors_put_many(&self, rows: &[authors::AuthorRow]) -> Result<(), StoreError> {
         let conn = self.lock()?;
         authors::authors_put_many(&conn, rows)
@@ -417,9 +432,9 @@ impl Store {
         interactions::interactions(&conn)
     }
 
-    /// Reads one `meta` key. `Ok(None)` when the key has no row (BC67). No
-    /// production caller yet: `last_scorer_pass` is write-only so far.
-    #[allow(dead_code)]
+    /// Reads one `meta` key. `Ok(None)` when the key has no row (BC67).
+    /// Called by `guards::log_only_window` (`guard_histogram_since`,
+    /// `guard_histogram_floor`).
     pub fn meta_get(&self, key: &str) -> Result<Option<String>, StoreError> {
         let conn = self.read_lock()?;
         meta::meta_get(&conn, key)
