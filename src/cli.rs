@@ -1,9 +1,11 @@
 //! Command-line surface. `Cli` and `Command` derive `clap`'s parser, so
-//! `--help` and usage text come free. `Publish` and `Dump` are still stubs;
-//! later stories replace their bodies without touching this shape. `Run`
-//! and `Validate` are real: `Run` is `dunk run`, story 06's ingest task
-//! (TECH-DESIGN section 5.1), and `Validate` is `dunk validate`,
-//! TECH-DESIGN section 10's phase 0 tool. Both run through [`dispatch`].
+//! `--help` and usage text come free. `Run`, `Validate`, `Publish` and
+//! `Dump` are all real: `Run` is `dunk run`, story 06's ingest task
+//! (TECH-DESIGN section 5.1); `Validate` is `dunk validate`, TECH-DESIGN
+//! section 10's phase 0 tool; `Publish` is `dunk publish`, story 09,
+//! TECH-DESIGN section 11.2; `Dump` is `dunk dump`, story 12, which writes
+//! the tuning CSV `docs/RUNBOOK.md`'s "Tuning with `dunk dump`" section
+//! describes. All four run through [`dispatch`].
 
 use std::path::PathBuf;
 
@@ -12,6 +14,7 @@ use thiserror::Error;
 
 use crate::appview::AppViewClient;
 use crate::config::Config;
+use crate::dump::{self, DumpError};
 use crate::ingest::{self, IngestError};
 use crate::publish::{self, PublishError};
 use crate::score::{Thresholds, Weights};
@@ -26,13 +29,12 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The four subcommands. `Dump` is still a stub that prints its own name and
-/// returns success; a later story adds its real behaviour. `Run` and
-/// `Validate` are real: `Run` is `dunk run`, story 06's ingest task
+/// The four subcommands. `Run` is `dunk run`, story 06's ingest task
 /// (TECH-DESIGN section 5.1), and `Validate` is `dunk validate`, TECH-DESIGN
 /// section 10's phase 0 tool. `Publish` is `dunk publish`, story 09,
 /// TECH-DESIGN section 11.2: it writes the `app.bsky.feed.generator` record.
-/// All three real subcommands run through [`dispatch`].
+/// `Dump` is `dunk dump`, story 12: it writes the tuning CSV `dump::run`
+/// builds. All four run through [`dispatch`].
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
     /// Run the ingest, scorer and HTTP server.
@@ -60,34 +62,39 @@ pub enum Command {
         #[arg(long)]
         avatar: Option<PathBuf>,
     },
-    /// Dump the current feed to stdout.
-    Dump,
+    /// Dump every pair first seen within `--since` to a CSV at `--out`, for
+    /// offline tuning (BC1 to BC21, `docs/RUNBOOK.md`'s "Tuning with `dunk
+    /// dump`" section).
+    Dump {
+        /// The window to dump, `^[0-9]+(h|d)$`, e.g. `24h` or `7d` (BC1,
+        /// BC2, BC3, BC10, BC11).
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Path the CSV is written to. Defaults to
+        /// `./dunk-dump-<since>.csv` when omitted (`dump::run`'s own
+        /// default).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
+#[cfg(test)]
 impl Command {
-    /// Prints this command's own name to stdout (BC12). `Dump` has no other
-    /// behaviour yet; `Run`, `Validate` and `Publish`'s real behaviour runs
-    /// through [`dispatch`] instead, since each needs `Config` (`Run` no
-    /// longer prints its own name; `dispatch` calls `ingest::run` for it
-    /// directly).
-    pub fn run(&self) {
-        println!("{}", self.name());
-    }
-
-    /// The subcommand's name, exactly as printed by `run` and as passed on
-    /// the command line.
-    pub fn name(&self) -> &'static str {
+    /// The subcommand's name, as passed on the command line. Test-only:
+    /// every subcommand's real behaviour runs through [`dispatch`], which
+    /// matches on `command` directly and never needs this name back out.
+    fn name(&self) -> &'static str {
         match self {
             Command::Run => "run",
             Command::Validate { .. } => "validate",
             Command::Publish { .. } => "publish",
-            Command::Dump => "dump",
+            Command::Dump { .. } => "dump",
         }
     }
 }
 
 /// Every error a subcommand can raise, so `main.rs` has one type to catch
-/// (BC34). `Dump` is an infallible stub and never constructs any variant.
+/// (BC34, BC8).
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -96,19 +103,21 @@ pub enum CliError {
     Ingest(#[from] IngestError),
     #[error(transparent)]
     Publish(#[from] PublishError),
+    #[error(transparent)]
+    Dump(#[from] DumpError),
 }
 
 /// Dispatches `command`, built from `config`. `Run` calls `ingest::run`
 /// (BC33 to BC35); `Validate` builds the `AppViewClient`, `Weights` and
 /// `Thresholds` `config` describes and calls `validate::run` with its own
 /// flags; `Publish` calls `publish::run` and prints the at-URI it returns
-/// (BC13); `Dump` only prints its own name (`Command::run`). This is the
-/// only path that can fail: `main.rs` prints the error and exits 1 (BC10,
-/// BC11, BC12, BC34). Round 1 finding 6: `Validate`'s body used to live in a
-/// separate `dispatch_validate`, whose only reason to exist was mapping
-/// `ValidateError` to `CliError::Validate` at its call site;
-/// `CliError::Validate`'s own `#[from]` does that through `?` just as well,
-/// so the indirection is gone.
+/// (BC13); `Dump` calls `dump::run` and prints `wrote <rows> rows to
+/// <path>` (BC19). This is the only path that can fail: `main.rs` prints
+/// the error and exits 1 (BC10, BC11, BC12, BC34, BC8). Round 1 finding 6:
+/// `Validate`'s body used to live in a separate `dispatch_validate`, whose
+/// only reason to exist was mapping `ValidateError` to `CliError::Validate`
+/// at its call site; `CliError::Validate`'s own `#[from]` does that through
+/// `?` just as well, so the indirection is gone.
 pub async fn dispatch(command: &Command, config: &Config) -> Result<(), CliError> {
     match command {
         Command::Run => ingest::run(config).await?,
@@ -123,7 +132,10 @@ pub async fn dispatch(command: &Command, config: &Config) -> Result<(), CliError
             let uri = publish::run(config, avatar.as_deref()).await?;
             println!("{uri}");
         }
-        other => other.run(),
+        Command::Dump { since, out } => {
+            let summary = dump::run(config, since, out.clone())?;
+            println!("wrote {} rows to {}", summary.rows, summary.path.display());
+        }
     }
     Ok(())
 }
@@ -140,17 +152,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stub_subcommands_exit_zero() {
-        for command in
-            [Command::Run, validate_command(), Command::Publish { avatar: None }, Command::Dump]
-        {
-            // `run` only prints; reaching this line without panicking is the
-            // stub's whole contract, matching "exits 0" for a library call.
-            // `Validate` and `Publish`'s real behaviour is `dispatch`, not
-            // `run`, so this never touches the network.
-            command.run();
-        }
+    fn dump_command() -> Command {
+        Command::Dump { since: "24h".to_string(), out: None }
     }
 
     #[test]
@@ -158,7 +161,7 @@ mod tests {
         assert_eq!(Command::Run.name(), "run");
         assert_eq!(validate_command().name(), "validate");
         assert_eq!(Command::Publish { avatar: None }.name(), "publish");
-        assert_eq!(Command::Dump.name(), "dump");
+        assert_eq!(dump_command().name(), "dump");
     }
 
     #[test]
@@ -287,5 +290,94 @@ mod tests {
             Err(CliError::Ingest(IngestError::Store(_))) => {}
             other => panic!("expected CliError::Ingest(IngestError::Store(_)), got {other:?}"),
         }
+    }
+
+    // --- Dump (BC3, BC8, BC19) ------------------------------------------
+
+    #[test]
+    fn dump_flags_default() {
+        let cli = Cli::try_parse_from(["dunk", "dump"]).expect("dump parses with no flags");
+        match cli.command {
+            Command::Dump { since, out } => {
+                assert_eq!(since, "24h");
+                assert_eq!(out, None);
+            }
+            other => panic!("expected Dump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dump_flags_are_parsed() {
+        let cli = Cli::try_parse_from(["dunk", "dump", "--since", "7d", "--out", "out.csv"])
+            .expect("dump parses with every flag set");
+        match cli.command {
+            Command::Dump { since, out } => {
+                assert_eq!(since, "7d");
+                assert_eq!(out, Some(PathBuf::from("out.csv")));
+            }
+            other => panic!("expected Dump, got {other:?}"),
+        }
+    }
+
+    fn dump_test_config(db_path: &str) -> Config {
+        let lookup = |name: &str| match name {
+            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
+            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "DUNK_DB_PATH" => Some(db_path.to_string()),
+            _ => None,
+        };
+        crate::config::load(lookup).expect("minimal config loads")
+    }
+
+    // BC8: a bad `--since` surfaces through `CliError::Dump(DumpError::BadSince)`.
+    #[tokio::test]
+    async fn dispatch_on_bad_since_is_a_cli_dump_bad_since_error() {
+        let config = dump_test_config("/no/such/directory/dunk.db");
+        let command = Command::Dump { since: "nope".to_string(), out: None };
+
+        let result = dispatch(&command, &config).await;
+
+        match result {
+            Err(CliError::Dump(DumpError::BadSince { value })) => assert_eq!(value, "nope"),
+            other => panic!("expected CliError::Dump(BadSince), got {other:?}"),
+        }
+    }
+
+    // BC8: a missing `--out` parent directory surfaces through
+    // `CliError::Dump(DumpError::OutDirMissing)`.
+    #[tokio::test]
+    async fn dispatch_on_missing_out_dir_is_a_cli_dump_out_dir_missing_error() {
+        let config = dump_test_config("/no/such/directory/dunk.db");
+        let out = PathBuf::from("/no/such/out/dir/dump.csv");
+        let command = Command::Dump { since: "24h".to_string(), out: Some(out.clone()) };
+
+        let result = dispatch(&command, &config).await;
+
+        match result {
+            Err(CliError::Dump(DumpError::OutDirMissing { path })) => assert_eq!(path, out),
+            other => panic!("expected CliError::Dump(OutDirMissing), got {other:?}"),
+        }
+    }
+
+    // BC19: over a real (empty) temporary database, `dispatch` writes the
+    // CSV and prints a row count of zero, header only.
+    #[tokio::test]
+    async fn dispatch_over_real_database_writes_csv_and_reports_row_count() {
+        let db_path =
+            std::env::temp_dir().join(format!("dunk-cli-dump-test-{}.db", std::process::id()));
+        let csv_path =
+            std::env::temp_dir().join(format!("dunk-cli-dump-test-{}.csv", std::process::id()));
+        let config = dump_test_config(&db_path.to_string_lossy());
+        let command = Command::Dump { since: "24h".to_string(), out: Some(csv_path.clone()) };
+
+        dispatch(&command, &config).await.expect("dump over a real empty database succeeds");
+
+        let written = std::fs::read_to_string(&csv_path).expect("csv was written");
+        assert_eq!(written.lines().count(), 1); // header only, zero rows
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+        }
+        let _ = std::fs::remove_file(&csv_path);
     }
 }

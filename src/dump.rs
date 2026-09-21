@@ -640,4 +640,149 @@ mod tests {
             }
         }
     }
+
+    // The default `--out` path is `./dunk-dump-<since>.csv` for the value
+    // passed, when the caller passes `None`. This runs against the real
+    // process working directory rather than switching it, since
+    // `std::env::set_current_dir` is process-global and would race other
+    // tests running in parallel threads; the default path itself, not
+    // where it lands, is what BC and the task ask this test to prove.
+    #[test]
+    fn default_out_path_uses_the_since_value() {
+        let db = TestDb::new();
+        let cfg = test_config(&db.path_str());
+        let expected = PathBuf::from("./dunk-dump-71h.csv"); // an unlikely-to-collide since value
+
+        let summary = run(&cfg, "71h", None).expect("run succeeds");
+
+        assert_eq!(summary.path, expected);
+        assert!(expected.exists());
+        let _ = std::fs::remove_file(&expected);
+    }
+
+    // The header holds the 27 columns in the exact order `spec.md`'s
+    // "Answers from the engineer" section names.
+    #[test]
+    fn header_holds_the_27_columns_in_spec_order() {
+        let expected = [
+            "quote_uri",
+            "original_uri",
+            "quote_did",
+            "original_did",
+            "quoted_at",
+            "first_seen_at",
+            "state",
+            "drop_reason",
+            "likes_q",
+            "reposts_q",
+            "replies_q",
+            "likes_o",
+            "reposts_o",
+            "replies_o",
+            "local_e_q",
+            "local_e_o",
+            "local_d",
+            "v_likes_q",
+            "v_reposts_q",
+            "v_replies_q",
+            "v_likes_o",
+            "v_reposts_o",
+            "v_replies_o",
+            "verified_e_q",
+            "verified_e_o",
+            "verified_d",
+            "promoted_at",
+        ];
+        assert_eq!(COLUMN_HEADERS, expected);
+        assert_eq!(COLUMN_HEADERS.len(), 27);
+    }
+
+    // BC1: a row on the cutoff second is included; the second before it is
+    // not.
+    #[test]
+    fn row_on_cutoff_second_is_included_second_before_is_not() {
+        let db = TestDb::new();
+        let conn = db.conn();
+        let now = crate::store::unix_now();
+        let cutoff = now - 24 * 3600;
+        insert_pair(
+            &conn,
+            "at://did:plc:q/app.bsky.feed.post/on-cutoff",
+            "at://did:plc:o/app.bsky.feed.post/o1",
+            cutoff,
+        );
+        insert_pair(
+            &conn,
+            "at://did:plc:q/app.bsky.feed.post/before-cutoff",
+            "at://did:plc:o/app.bsky.feed.post/o2",
+            cutoff - 1,
+        );
+        drop(conn);
+
+        let cfg = test_config(&db.path_str());
+        let out = temp_csv_path("cutoff-boundary");
+        let summary = run(&cfg, "24h", Some(out.clone())).expect("run succeeds");
+
+        assert_eq!(summary.rows, 1);
+        let contents = std::fs::read_to_string(&out).unwrap();
+        assert!(contents.contains("on-cutoff"));
+        assert!(!contents.contains("before-cutoff"));
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // BC15: `local_e_q`, `local_e_o` and `local_d` are formatted to three
+    // decimals, even when the underlying value is a whole number.
+    #[test]
+    fn local_scores_are_formatted_to_three_decimals() {
+        let db = TestDb::new();
+        let conn = db.conn();
+        let now = crate::store::unix_now();
+        insert_pair(
+            &conn,
+            "at://did:plc:q/app.bsky.feed.post/decimals",
+            "at://did:plc:o/app.bsky.feed.post/o1",
+            now,
+        );
+        drop(conn);
+
+        let cfg = test_config(&db.path_str());
+        let out = temp_csv_path("decimals");
+        run(&cfg, "24h", Some(out.clone())).expect("run succeeds");
+
+        let contents = std::fs::read_to_string(&out).unwrap();
+        let data_line = contents.lines().nth(1).expect("one data row");
+        let fields: Vec<&str> = data_line.split(',').collect();
+        // local_e_q, local_e_o, local_d are columns 14..17 (0-indexed): with
+        // no counts row on either side both engagements are 0.0, so both
+        // format as "0.000", and the ratio at k=0 counts is also "0.000".
+        for field in &fields[14..17] {
+            assert!(field.contains('.'), "expected a decimal point in {field:?}");
+            let decimals = field.split('.').nth(1).unwrap();
+            assert_eq!(decimals.len(), 3, "expected three decimal digits in {field:?}");
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // BC12: a `quote_uri` holding a comma is quoted in the rendered line.
+    #[test]
+    fn quote_uri_with_a_comma_is_quoted() {
+        let db = TestDb::new();
+        let conn = db.conn();
+        let now = crate::store::unix_now();
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/has,comma";
+        insert_pair(&conn, quote_uri, "at://did:plc:o/app.bsky.feed.post/o1", now);
+        drop(conn);
+
+        let cfg = test_config(&db.path_str());
+        let out = temp_csv_path("comma-quoted");
+        run(&cfg, "24h", Some(out.clone())).expect("run succeeds");
+
+        let contents = std::fs::read_to_string(&out).unwrap();
+        let data_line = contents.lines().nth(1).expect("one data row");
+        assert!(
+            data_line.starts_with(&format!("\"{quote_uri}\",")),
+            "expected the quote_uri field quoted, got: {data_line}"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
 }

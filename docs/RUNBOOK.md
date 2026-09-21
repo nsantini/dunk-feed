@@ -191,13 +191,32 @@ Each of these lives in `.env`. A change needs `docker compose -f <file> up
 | `DUNK_REVERIFY_INTERVAL_S` (default 600) | Re-checks promoted pairs against the App View less often, using fewer App View calls but catching a block or a takedown later | Re-checks more often, catching a block or a takedown sooner but using more App View calls |
 | `DUNK_HEALTH_MAX_LAG_S` (default 300) | Tolerates a longer gap since the last Jetstream commit or scorer pass before `/healthz` turns 503, so a slow patch is less likely to trip your monitoring | Tolerates a shorter gap, so `/healthz` catches a stall sooner but is more likely to flip on a normal slow pass |
 
-`dunk dump` exists today only as a stub: it prints its own name and does
-nothing else. Story 12 ships its real behaviour: `dunk dump --since 24h
---out <path>` writes a CSV of every pair seen in the window, in all three
-states, `candidate`, `promoted` and `dropped`, with each pair's local and
-verified counts and a `state` and a `drop_reason` column. You can then
-re-fit `DUNK_P`, `DUNK_M` and the weights offline, against real rows
-instead of against logs alone.
+### Tuning with `dunk dump`
+
+`dunk dump --since 24h --out pairs.csv` writes one CSV row for every pair
+first seen in the last 24 hours, in all three states: `candidate`,
+`promoted` and `dropped`. `--since` takes a number and a unit, `h` or `d`,
+for example `7d` for seven days. `--out` defaults to
+`./dunk-dump-<since>.csv` when you leave it out.
+
+Each row carries the pair's local counts from `counts`, its verified
+counts from `feed` when it has a `feed` row, and `E` and `D` recomputed
+from those counts with the config running right now. Open the CSV in a
+spreadsheet and sort by these columns to re-fit each knob:
+
+| Knob | Env var | Sort by |
+|------|---------|---------|
+| `P` | `DUNK_P` | The larger of `verified_e_q` and `verified_e_o`, over rows where `state` is `promoted` |
+| `M` | `DUNK_M` | `verified_d`, over rows where `state` is `promoted` |
+| Repost weight | `DUNK_W_REPOST` | `reposts_q` and `reposts_o` against `local_e_q` and `local_e_o` |
+| Reply weight | `DUNK_W_REPLY` | `replies_q` and `replies_o` against `local_e_q` and `local_e_o` |
+
+After you pick new values, edit `.env` and restart the container, as the
+"Tuning knobs" table above describes. No code change is needed.
+
+A pair that was promoted and later demoted shows local counts only: its
+`v_*` cells, `verified_e_q`, `verified_e_o`, `verified_d` and
+`promoted_at` are empty, because demoting a pair deletes its `feed` row.
 
 ## Failure modes
 
