@@ -30,9 +30,12 @@ USER 10001:10001
 VOLUME ["/data"]
 EXPOSE 3000
 
-# start-period exceeds DUNK_SCORER_INTERVAL_S's 60 s default: /healthz is
-# 503 until the first scorer pass, and a shorter start-period would mark a
-# healthy container unhealthy on boot (BC12). The check sends one
+# /healthz is 503 until both the first Jetstream commit and the first
+# scorer pass. On a fresh volume that takes about 3 s. start-period is
+# 120 s as a margin for a cold start against an existing database, where
+# the first pass has real work to do, and for a slow first Jetstream
+# commit; a check that fails inside start-period does not count toward
+# retries, so a generous value costs nothing (BC12). The check sends one
 # HTTP/1.1 request over /dev/tcp and greps the status line for " 200 ",
 # so a 503, a refused connection and a hung socket all fail it (BC11).
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=120s \

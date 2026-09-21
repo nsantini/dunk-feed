@@ -60,7 +60,9 @@ shows them. Three lines matter.
 
 ### `dunk: ingest stats`
 
-Logged on a fixed interval by the ingest task. Fields:
+Logged every 60 seconds by the ingest task. No line appears at all for the
+first minute after start. If you grep for it right after `up -d` and find
+nothing, that is not a fault. Fields:
 
 | Field | Meaning |
 |-------|---------|
@@ -75,6 +77,11 @@ Logged on a fixed interval by the ingest task. Fields:
 | `channel_depth` | Events waiting in the ingest-to-writer channel at the moment this line was logged |
 | `lag_s` | Seconds between now and the last commit's own timestamp, `0` before the first commit |
 | `compressed` | Whether the Jetstream connection is running with zstd compression |
+
+`events_per_s` and `ops_per_s` are logged with `tracing`'s debug
+formatting, so in the JSON output each one is a quoted string holding a
+Rust map literal, not a nested JSON object. A JSON query tool reads them
+as strings.
 
 ### `scorer: pass complete`
 
@@ -94,6 +101,10 @@ Logged once per scorer pass. Fields:
 | `snapshot_len` | Rows in the feed snapshot after this pass |
 | `duration_ms` | Wall time the pass took, in milliseconds |
 
+`dropped_by_reason` is logged with `tracing`'s debug formatting, so in the
+JSON output it is a quoted string holding a Rust map literal, not a
+nested JSON object. A JSON query tool reads it as a string.
+
 `dropped_by_reason` is a map. Its keys are:
 
 | Key | Meaning |
@@ -104,8 +115,8 @@ Logged once per scorer pass. Fields:
 | `original_gone` | The quoted, original post no longer exists |
 | `detached` | The quote was detached from the original |
 | `blocked` | A block exists between the two authors |
-| `labelled` | The post carries a label in `DUNK_DROP_LABELS` |
-| `author_inactive` | The author's cached profile is inactive or deactivated |
+| `labelled` | A label in `DUNK_DROP_LABELS` was found on the quote, on the original, or on either author's profile |
+| `author_inactive` | The author's account is deactivated or deleted, or the original's author carries a `!takedown` label |
 | `follower_floor` | The author's follower count is under `DUNK_FOLLOWER_FLOOR` |
 
 ### `scorer: guard log-only window follower distribution`
@@ -238,12 +249,16 @@ body `{"jetstream_lag_s":<int>,"last_pass_age_s":<int>,"snapshot_len":<int>}`.
 Either age passing `DUNK_HEALTH_MAX_LAG_S` (300 seconds by default) returns
 the service to 503, with the same body shape and real integers, not `null`.
 
-The healthcheck's `start_period` must stay longer than
-`DUNK_SCORER_INTERVAL_S`. The first scorer pass happens one interval after
-start, and `/healthz` is 503 until then. If you raise
-`DUNK_SCORER_INTERVAL_S`, raise `start_period` by the same margin in both
-`compose.yaml` and `compose.proxied.yaml`, or a healthy container gets
-marked unhealthy on boot.
+The first scorer pass runs at start, not one interval later, so on a fresh
+volume the service normally reaches 200 within a few seconds of `up -d`.
+The healthcheck's `start_period` is 120 seconds, a margin for a cold start
+against an existing database, where the first pass has real work to do,
+and for a slow first Jetstream commit. A check that fails inside
+`start_period` does not count toward `retries`, so a generous value costs
+nothing. A container still unhealthy after two minutes has a real
+problem; read the logs. If you raise `DUNK_SCORER_INTERVAL_S`, raise
+`start_period` in both `compose.yaml` and `compose.proxied.yaml` too, to
+keep the same margin.
 
 ## Cloudflare setup
 
