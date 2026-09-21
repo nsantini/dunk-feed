@@ -1,0 +1,35 @@
+# Cloudflare Tunnel variant. `dunk` publishes no port; `cloudflared` carries
+# all inbound traffic in over an outbound-only connection, so the VM needs
+# no open inbound firewall rule at all. See docs/RUNBOOK.md.
+services:
+  dunk:
+    build: .
+    image: dunk
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    mem_limit: 512m
+    volumes:
+      - dunk-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3000 && printf \"GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && head -n 1 <&3 | grep -q \" 200 \""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    restart: unless-stopped
+    depends_on:
+      - dunk
+
+volumes:
+  dunk-data:

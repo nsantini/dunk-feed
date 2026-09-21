@@ -1,0 +1,31 @@
+# Proxied-DNS variant. `dunk` publishes port 3000 directly; Cloudflare's
+# proxy sits in front over Flexible TLS (TECH-DESIGN section 11), and the VM
+# firewall must be restricted to Cloudflare's published IP ranges. No
+# `cloudflared` service. See docs/RUNBOOK.md.
+services:
+  dunk:
+    build: .
+    image: dunk
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    mem_limit: 512m
+    ports:
+      - "3000:3000"
+    volumes:
+      - dunk-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3000 && printf \"GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && head -n 1 <&3 | grep -q \" 200 \""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  dunk-data:
