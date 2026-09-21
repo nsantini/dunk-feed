@@ -3,7 +3,7 @@
 //! and `FollowerHistogram` are the pure pieces, each a unit test with no
 //! store and no network. `check_batch` is the batch step: it reaches the
 //! `authors` cache and the App View, then calls `decide` once per pair, in
-//! input order. `log_only_window` resolves the histogram period's clock in
+//! input order. `histogram_period` resolves the histogram period's clock in
 //! `meta.guard_histogram_since` and `meta.guard_histogram_floor`.
 //! `verify_and_apply` (`src/scorer/mod.rs`) is the sole caller of both, and
 //! only for the qualifying subset of a phase's pairs (story 10's correction
@@ -85,7 +85,7 @@ fn any_dropped(labels: &[String], cfg: &GuardConfig) -> bool {
 /// removed the `log_only` suppression this function used to take: the
 /// follower floor now drops unconditionally whenever `cfg.follower_floor >
 /// 0` (BC41). Whether `one_pass` also logs a histogram line is
-/// `check_batch`'s and `log_only_window`'s concern, not `decide`'s.
+/// `check_batch`'s and `histogram_period`'s concern, not `decide`'s.
 pub fn decide(
     pair: &VerifiedPair,
     author_o: &AuthorRow,
@@ -154,7 +154,7 @@ pub fn author_row_from_profile(profile: Option<&ProfileView>, did: &str, now: i6
     }
 }
 
-/// A count of `O` authors' `followers`, bucketed for the log-only window's
+/// A count of `O` authors' `followers`, bucketed for the histogram period's
 /// one histogram line per pass (BC29, BC30). A `followers` of `None`
 /// (BC31) is never counted: the histogram measures known values only.
 /// Boundaries: `0` is its own bucket, and each pair on either side of an
@@ -202,7 +202,7 @@ impl FollowerHistogram {
 ///
 /// `counters` collects `profile_calls` (every `getProfiles` chunk attempted,
 /// BC16 to BC18) and `deferred` (BC21) unconditionally. `histogram_open`
-/// (`log_only_window`'s result) only gates whether this pass also folds `O`'s
+/// (`histogram_period`'s result) only gates whether this pass also folds `O`'s
 /// follower distribution and the would-be-drop count into `counters`
 /// (BC26, BC27, BC29 to BC31): the floor itself is always live (BC41), so
 /// `guard_would_drop` simply counts pairs whose `decide` result actually was
@@ -340,7 +340,7 @@ pub async fn check_batch<P: ProfileSource>(
 /// confirmed unchanged, a `since` that does not parse as `i64` is warned
 /// about once and treated as elapsed, its stored value left alone so a
 /// corrupt value can never reopen the period on its own (BC28).
-pub async fn log_only_window(
+pub async fn histogram_period(
     store: &Store,
     cfg: &GuardConfig,
     now: i64,
@@ -602,7 +602,7 @@ mod tests {
     // BC41, story 10's correction round: the follower floor drops whenever
     // `follower_floor > 0`. There is no suppression window on `decide` any
     // more — the histogram period only decides whether `one_pass` also logs
-    // a distribution line, in `check_batch` and `log_only_window` below.
+    // a distribution line, in `check_batch` and `histogram_period` below.
     #[test]
     fn follower_floor_is_always_live() {
         let author_o = author("did:plc:o", Some(1), true, None);
@@ -964,12 +964,12 @@ mod tests {
     // BC23: `DUNK_GUARD_HISTOGRAM_H = 0` disables the period and writes
     // nothing to `meta`.
     #[tokio::test]
-    async fn log_only_window_meta_clock_disabled_writes_nothing() {
+    async fn histogram_period_meta_clock_disabled_writes_nothing() {
         let store = Store::open_memory().unwrap();
         let mut guard_cfg = cfg(2_000, &[]);
         guard_cfg.guard_histogram_h = 0;
 
-        let open = log_only_window(&store, &guard_cfg, 1_700_000_000).await.unwrap();
+        let open = histogram_period(&store, &guard_cfg, 1_700_000_000).await.unwrap();
 
         assert!(!open);
         assert_eq!(store.meta_get("guard_histogram_since").unwrap(), None);
@@ -979,12 +979,12 @@ mod tests {
     // BC24: an absent clock is written as `now`, `guard_histogram_floor` is
     // written as the current floor, and the period is open.
     #[tokio::test]
-    async fn log_only_window_meta_clock_absent_opens_and_writes_now() {
+    async fn histogram_period_meta_clock_absent_opens_and_writes_now() {
         let store = Store::open_memory().unwrap();
         let guard_cfg = cfg(2_000, &[]); // guard_histogram_h: 24
         let now = 1_700_000_000;
 
-        let open = log_only_window(&store, &guard_cfg, now).await.unwrap();
+        let open = histogram_period(&store, &guard_cfg, now).await.unwrap();
 
         assert!(open);
         assert_eq!(store.meta_get("guard_histogram_since").unwrap(), Some(now.to_string()));
@@ -996,14 +996,14 @@ mod tests {
     // period still reads it as open; past the period, the clock is still
     // untouched but the period reads as elapsed.
     #[tokio::test]
-    async fn log_only_window_meta_clock_present_is_never_overwritten() {
+    async fn histogram_period_meta_clock_present_is_never_overwritten() {
         let store = Store::open_memory().unwrap();
         let guard_cfg = cfg(2_000, &[]); // guard_histogram_h: 24, follower_floor: 2000
         let opened_at = 1_700_000_000;
         store.meta_set("guard_histogram_since", &opened_at.to_string()).unwrap();
         store.meta_set("guard_histogram_floor", "2000").unwrap();
 
-        let still_inside = log_only_window(&store, &guard_cfg, opened_at + 3_600).await.unwrap();
+        let still_inside = histogram_period(&store, &guard_cfg, opened_at + 3_600).await.unwrap();
         assert!(still_inside);
         assert_eq!(
             store.meta_get("guard_histogram_since").unwrap(),
@@ -1011,7 +1011,7 @@ mod tests {
             "a restart inside the period does not reset the clock"
         );
 
-        let past = log_only_window(&store, &guard_cfg, opened_at + 25 * 3_600).await.unwrap();
+        let past = histogram_period(&store, &guard_cfg, opened_at + 25 * 3_600).await.unwrap();
         assert!(!past);
         assert_eq!(
             store.meta_get("guard_histogram_since").unwrap(),
@@ -1024,7 +1024,7 @@ mod tests {
     // exactly `guard_histogram_h` hours since `since` reads as elapsed, not
     // open.
     #[tokio::test]
-    async fn log_only_window_boundary_at_exact_equality_is_elapsed() {
+    async fn histogram_period_boundary_at_exact_equality_is_elapsed() {
         let store = Store::open_memory().unwrap();
         let guard_cfg = cfg(2_000, &[]); // guard_histogram_h: 24
         let opened_at = 1_700_000_000;
@@ -1032,11 +1032,11 @@ mod tests {
         store.meta_set("guard_histogram_floor", "2000").unwrap();
 
         let at_boundary =
-            log_only_window(&store, &guard_cfg, opened_at + 24 * 3_600).await.unwrap();
+            histogram_period(&store, &guard_cfg, opened_at + 24 * 3_600).await.unwrap();
         assert!(!at_boundary, "now - since == the period length reads as elapsed, not open");
 
         let just_inside =
-            log_only_window(&store, &guard_cfg, opened_at + 24 * 3_600 - 1).await.unwrap();
+            histogram_period(&store, &guard_cfg, opened_at + 24 * 3_600 - 1).await.unwrap();
         assert!(just_inside);
     }
 
@@ -1045,7 +1045,7 @@ mod tests {
     // current floor, reopening the period even though it had already
     // elapsed.
     #[tokio::test]
-    async fn log_only_window_meta_floor_change_resets_since() {
+    async fn histogram_period_meta_floor_change_resets_since() {
         let store = Store::open_memory().unwrap();
         let guard_cfg = cfg(2_000, &[]); // follower_floor: 2000
         let opened_at = 1_700_000_000;
@@ -1053,7 +1053,7 @@ mod tests {
         store.meta_set("guard_histogram_floor", "500").unwrap(); // a different floor
 
         let now = opened_at + 25 * 3_600; // past the old period, if it hadn't reset
-        let open = log_only_window(&store, &guard_cfg, now).await.unwrap();
+        let open = histogram_period(&store, &guard_cfg, now).await.unwrap();
 
         assert!(open, "a floor change reopens the period even past the old window");
         assert_eq!(store.meta_get("guard_histogram_since").unwrap(), Some(now.to_string()));
@@ -1065,13 +1065,13 @@ mod tests {
     // here, so this exercises the malformed-since branch specifically, not
     // the floor-change branch.
     #[tokio::test]
-    async fn log_only_window_meta_clock_malformed_is_elapsed_and_left_alone() {
+    async fn histogram_period_meta_clock_malformed_is_elapsed_and_left_alone() {
         let store = Store::open_memory().unwrap();
         let guard_cfg = cfg(2_000, &[]);
         store.meta_set("guard_histogram_since", "not-a-number").unwrap();
         store.meta_set("guard_histogram_floor", "2000").unwrap();
 
-        let open = log_only_window(&store, &guard_cfg, 1_700_000_000).await.unwrap();
+        let open = histogram_period(&store, &guard_cfg, 1_700_000_000).await.unwrap();
 
         assert!(!open);
         assert_eq!(
@@ -1080,9 +1080,9 @@ mod tests {
         );
     }
 
-    // AC5's test path (`scorer::guards::tests::log_only_window`) is
-    // satisfied by substring match against the `log_only_window_meta_clock_*`
-    // and `log_only_window_boundary_*`/`log_only_window_meta_floor_*` tests
+    // AC5's test path (`scorer::guards::tests::histogram_period`) is
+    // satisfied by substring match against the `histogram_period_meta_clock_*`
+    // and `histogram_period_boundary_*`/`histogram_period_meta_floor_*` tests
     // above and `check_batch_histogram_open_still_drops_and_counts`, for the
     // same reason noted above `cache_thirty_dids_causes_two_calls`.
 

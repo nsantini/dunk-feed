@@ -485,7 +485,7 @@ pub async fn one_pass<S: PostSource + ProfileSource>(
     let thresholds = Thresholds::from(cfg);
     let guard_cfg = guards::GuardConfig::from(cfg);
     let candidate_ttl_h = i64::from(cfg.candidate_ttl_h);
-    let histogram_open = guards::log_only_window(store, &guard_cfg, now).await?;
+    let histogram_open = guards::histogram_period(store, &guard_cfg, now).await?;
 
     // Steps 1 to 4: select, verify, guard, promote or drop.
     let selected = select_step(store, now, cfg, &weights, &thresholds).await?;
@@ -562,7 +562,7 @@ pub async fn one_pass<S: PostSource + ProfileSource>(
             thousand_to_9999 = h.thousand_to_9999,
             ten_k_to_99999 = h.ten_k_to_99999,
             hundred_k_plus = h.hundred_k_plus,
-            "scorer: guard log-only window follower distribution"
+            "scorer: guard histogram period follower distribution"
         );
     }
 

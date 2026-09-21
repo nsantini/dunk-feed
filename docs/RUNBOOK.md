@@ -123,7 +123,7 @@ nested JSON object. A JSON query tool reads it as a string.
 | `author_inactive` | The author's account is deactivated or deleted, or the original's author carries a `!takedown` label |
 | `follower_floor` | The author's follower count is under `DUNK_FOLLOWER_FLOOR` |
 
-### `scorer: guard log-only window follower distribution`
+### `scorer: guard histogram period follower distribution`
 
 Logged once per pass, but only while the follower-floor histogram period is
 open. It stops after `DUNK_GUARD_HISTOGRAM_H` hours from start. The follower

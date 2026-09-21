@@ -433,7 +433,7 @@ impl Store {
     }
 
     /// Reads one `meta` key. `Ok(None)` when the key has no row (BC67).
-    /// Called by `guards::log_only_window` (`guard_histogram_since`,
+    /// Called by `guards::histogram_period` (`guard_histogram_since`,
     /// `guard_histogram_floor`).
     pub fn meta_get(&self, key: &str) -> Result<Option<String>, StoreError> {
         let conn = self.read_lock()?;
