@@ -24,7 +24,7 @@ pub enum ConfigError {
 pub struct Secret(String);
 
 impl Secret {
-    /// Wraps a value read from somewhere other than `load`. `dunk publish`
+    /// Wraps a value read from somewhere other than `load`. `upstage publish`
     /// carries the session's `accessJwt` in one of these, so a token never
     /// sits in a plain `String` that a `Debug` line could print.
     pub fn new(value: String) -> Self {
@@ -94,7 +94,7 @@ pub struct Config {
 impl Config {
     /// `at://<publisher_did>/app.bsky.feed.generator/<feed_rkey>` (BC45):
     /// the single producer of this feed's own at-URI. `HttpConfig::from`
-    /// (`src/http/mod.rs`) calls this once at startup; `dunk publish`
+    /// (`src/http/mod.rs`) calls this once at startup; `upstage publish`
     /// (story 09) will too, so the format lives here and nowhere else.
     pub fn feed_uri(&self) -> String {
         format!("at://{}/app.bsky.feed.generator/{}", self.publisher_did, self.feed_rkey)
@@ -162,7 +162,7 @@ where
     }
 }
 
-/// Validates `DUNK_LOG` with `EnvFilter::try_new`, falling back to `default`
+/// Validates `UPSTAGE_LOG` with `EnvFilter::try_new`, falling back to `default`
 /// when unset (BC9). A malformed filter directive is invalid (BC14): it must
 /// never degrade silently to error-only logging, so it is rejected here
 /// rather than left for `tracing_subscriber` to swallow later.
@@ -208,7 +208,7 @@ fn nonneg_float_or_default(
 }
 
 /// Parses a `u32` variable via [`number_or_default`], then rejects `0`
-/// (BC23). `DUNK_K`, `DUNK_SCORER_INTERVAL_S` and `DUNK_REVERIFY_INTERVAL_S`
+/// (BC23). `UPSTAGE_K`, `UPSTAGE_SCORER_INTERVAL_S` and `UPSTAGE_REVERIFY_INTERVAL_S`
 /// each divide or gate a timer period, and `0` is never a working setting.
 fn positive_u32_or_default(
     lookup: &impl Fn(&str) -> Option<String>,
@@ -226,7 +226,7 @@ fn positive_u32_or_default(
     Ok(value)
 }
 
-/// Parses `DUNK_APPVIEW_RPS`, rejecting zero, negative and non-finite values
+/// Parses `UPSTAGE_APPVIEW_RPS`, rejecting zero, negative and non-finite values
 /// (BC24) with the same reason string as the strictly-positive integers,
 /// rather than [`nonneg_float_or_default`]'s separate "not a finite number"
 /// and "must be >= 0" reasons, because zero is invalid here too.
@@ -249,7 +249,7 @@ fn positive_float_or_default(
     Ok(value)
 }
 
-/// Splits `DUNK_JETSTREAM_URL` on `,`, trims each entry, and drops empty
+/// Splits `UPSTAGE_JETSTREAM_URL` on `,`, trims each entry, and drops empty
 /// entries (BC26). Falls back to `default` when unset (BC27). At least one
 /// host is required (BC28): an empty, whitespace-only, or all-entries-empty
 /// value is invalid, the same rule as `drop_labels`. Every surviving entry
@@ -288,7 +288,7 @@ fn jetstream_urls(
     Ok(urls)
 }
 
-/// Splits `DUNK_DROP_LABELS` on `,`, trims each entry, and drops empty
+/// Splits `UPSTAGE_DROP_LABELS` on `,`, trims each entry, and drops empty
 /// entries (BC10). Falls back to `default` when unset (BC9). An empty or
 /// whitespace-only value is malformed, the same rule as an empty number
 /// (BC13): disabling every label guard is not a supported setting here.
@@ -318,41 +318,49 @@ fn drop_labels(
 /// into an `Option`, so no test touches the process environment.
 pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigError> {
     Ok(Config {
-        db_path: string_or_default(&lookup, "DUNK_DB_PATH", "/data/dunk.db"),
-        http_addr: string_or_default(&lookup, "DUNK_HTTP_ADDR", "0.0.0.0:3000"),
-        hostname: required(&lookup, "DUNK_HOSTNAME")?,
-        publisher_did: required(&lookup, "DUNK_PUBLISHER_DID")?,
-        feed_rkey: string_or_default(&lookup, "DUNK_FEED_RKEY", "dunks"),
+        db_path: string_or_default(&lookup, "UPSTAGE_DB_PATH", "/data/upstage.db"),
+        http_addr: string_or_default(&lookup, "UPSTAGE_HTTP_ADDR", "0.0.0.0:3000"),
+        hostname: required(&lookup, "UPSTAGE_HOSTNAME")?,
+        publisher_did: required(&lookup, "UPSTAGE_PUBLISHER_DID")?,
+        feed_rkey: string_or_default(&lookup, "UPSTAGE_FEED_RKEY", "upstaged"),
         jetstream_urls: jetstream_urls(
             &lookup,
-            "DUNK_JETSTREAM_URL",
+            "UPSTAGE_JETSTREAM_URL",
             "wss://jetstream.us-east.bsky.network,wss://jetstream.us-west.bsky.network",
         )?,
-        appview_url: string_or_default(&lookup, "DUNK_APPVIEW_URL", "https://public.api.bsky.app"),
-        w_repost: nonneg_float_or_default(&lookup, "DUNK_W_REPOST", 2.0)?,
-        w_reply: nonneg_float_or_default(&lookup, "DUNK_W_REPLY", 0.5)?,
-        k: positive_u32_or_default(&lookup, "DUNK_K", 5)?,
-        p: number_or_default(&lookup, "DUNK_P", 50)?,
-        m: nonneg_float_or_default(&lookup, "DUNK_M", 1.25)?,
-        candidate_ttl_h: number_or_default(&lookup, "DUNK_CANDIDATE_TTL_H", 48)?,
-        feed_ttl_d: number_or_default(&lookup, "DUNK_FEED_TTL_D", 30)?,
-        scorer_interval_s: positive_u32_or_default(&lookup, "DUNK_SCORER_INTERVAL_S", 60)?,
-        reverify_interval_s: positive_u32_or_default(&lookup, "DUNK_REVERIFY_INTERVAL_S", 600)?,
-        follower_floor: number_or_default(&lookup, "DUNK_FOLLOWER_FLOOR", 2000)?,
+        appview_url: string_or_default(
+            &lookup,
+            "UPSTAGE_APPVIEW_URL",
+            "https://public.api.bsky.app",
+        ),
+        w_repost: nonneg_float_or_default(&lookup, "UPSTAGE_W_REPOST", 2.0)?,
+        w_reply: nonneg_float_or_default(&lookup, "UPSTAGE_W_REPLY", 0.5)?,
+        k: positive_u32_or_default(&lookup, "UPSTAGE_K", 5)?,
+        p: number_or_default(&lookup, "UPSTAGE_P", 50)?,
+        m: nonneg_float_or_default(&lookup, "UPSTAGE_M", 1.25)?,
+        candidate_ttl_h: number_or_default(&lookup, "UPSTAGE_CANDIDATE_TTL_H", 48)?,
+        feed_ttl_d: number_or_default(&lookup, "UPSTAGE_FEED_TTL_D", 30)?,
+        scorer_interval_s: positive_u32_or_default(&lookup, "UPSTAGE_SCORER_INTERVAL_S", 60)?,
+        reverify_interval_s: positive_u32_or_default(&lookup, "UPSTAGE_REVERIFY_INTERVAL_S", 600)?,
+        follower_floor: number_or_default(&lookup, "UPSTAGE_FOLLOWER_FLOOR", 2000)?,
         drop_labels: drop_labels(
             &lookup,
-            "DUNK_DROP_LABELS",
+            "UPSTAGE_DROP_LABELS",
             "porn,sexual,graphic-media,nudity,!hide,!warn,spam",
         )?,
-        prefilter_fraction: nonneg_float_or_default(&lookup, "DUNK_PREFILTER_FRACTION", 0.5)?,
-        appview_rps: positive_float_or_default(&lookup, "DUNK_APPVIEW_RPS", 1.0)?,
-        log: log_filter_or_default(&lookup, "DUNK_LOG", "info")?,
+        prefilter_fraction: nonneg_float_or_default(&lookup, "UPSTAGE_PREFILTER_FRACTION", 0.5)?,
+        appview_rps: positive_float_or_default(&lookup, "UPSTAGE_APPVIEW_RPS", 1.0)?,
+        log: log_filter_or_default(&lookup, "UPSTAGE_LOG", "info")?,
         bsky_handle: optional(&lookup, "BSKY_HANDLE"),
         bsky_app_password: optional(&lookup, "BSKY_APP_PASSWORD").map(Secret),
-        health_max_lag_s: positive_u32_or_default(&lookup, "DUNK_HEALTH_MAX_LAG_S", 300)?,
-        guard_histogram_h: number_or_default(&lookup, "DUNK_GUARD_HISTOGRAM_H", 24)?,
-        author_ttl_h: positive_u32_or_default(&lookup, "DUNK_AUTHOR_TTL_H", 24)?,
-        author_inactive_ttl_h: positive_u32_or_default(&lookup, "DUNK_AUTHOR_INACTIVE_TTL_H", 1)?,
+        health_max_lag_s: positive_u32_or_default(&lookup, "UPSTAGE_HEALTH_MAX_LAG_S", 300)?,
+        guard_histogram_h: number_or_default(&lookup, "UPSTAGE_GUARD_HISTOGRAM_H", 24)?,
+        author_ttl_h: positive_u32_or_default(&lookup, "UPSTAGE_AUTHOR_TTL_H", 24)?,
+        author_inactive_ttl_h: positive_u32_or_default(
+            &lookup,
+            "UPSTAGE_AUTHOR_INACTIVE_TTL_H",
+            1,
+        )?,
     })
 }
 
@@ -371,45 +379,46 @@ mod tests {
 
     /// The two variables every deployment must set.
     fn required_pair() -> [(&'static str, &'static str); 2] {
-        [("DUNK_HOSTNAME", "feed.example.com"), ("DUNK_PUBLISHER_DID", "did:plc:abc")]
+        [("UPSTAGE_HOSTNAME", "feed.example.com"), ("UPSTAGE_PUBLISHER_DID", "did:plc:abc")]
     }
 
     #[test]
     fn missing_required_var_fails() {
-        let lookup = env(&[("DUNK_PUBLISHER_DID", "did:plc:abc")]);
+        let lookup = env(&[("UPSTAGE_PUBLISHER_DID", "did:plc:abc")]);
         let err = load(lookup).unwrap_err();
-        assert_eq!(err, ConfigError::Missing("DUNK_HOSTNAME"));
+        assert_eq!(err, ConfigError::Missing("UPSTAGE_HOSTNAME"));
     }
 
     #[test]
     fn missing_publisher_did_fails() {
-        let lookup = env(&[("DUNK_HOSTNAME", "feed.example.com")]);
+        let lookup = env(&[("UPSTAGE_HOSTNAME", "feed.example.com")]);
         let err = load(lookup).unwrap_err();
-        assert_eq!(err, ConfigError::Missing("DUNK_PUBLISHER_DID"));
+        assert_eq!(err, ConfigError::Missing("UPSTAGE_PUBLISHER_DID"));
     }
 
     #[test]
     fn empty_required_var_is_missing() {
-        let lookup = env(&[("DUNK_HOSTNAME", ""), ("DUNK_PUBLISHER_DID", "did:plc:abc")]);
+        let lookup = env(&[("UPSTAGE_HOSTNAME", ""), ("UPSTAGE_PUBLISHER_DID", "did:plc:abc")]);
         let err = load(lookup).unwrap_err();
-        assert_eq!(err, ConfigError::Missing("DUNK_HOSTNAME"));
+        assert_eq!(err, ConfigError::Missing("UPSTAGE_HOSTNAME"));
     }
 
     #[test]
     fn whitespace_required_var_is_missing() {
-        let lookup = env(&[("DUNK_HOSTNAME", "feed.example.com"), ("DUNK_PUBLISHER_DID", "   ")]);
+        let lookup =
+            env(&[("UPSTAGE_HOSTNAME", "feed.example.com"), ("UPSTAGE_PUBLISHER_DID", "   ")]);
         let err = load(lookup).unwrap_err();
-        assert_eq!(err, ConfigError::Missing("DUNK_PUBLISHER_DID"));
+        assert_eq!(err, ConfigError::Missing("UPSTAGE_PUBLISHER_DID"));
     }
 
     #[test]
     fn malformed_number_fails() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_K", "five"));
+        pairs.push(("UPSTAGE_K", "five"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, value, .. } => {
-                assert_eq!(name, "DUNK_K");
+                assert_eq!(name, "UPSTAGE_K");
                 assert_eq!(value, "five");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -419,10 +428,10 @@ mod tests {
     #[test]
     fn empty_number_is_malformed() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_W_REPOST", ""));
+        pairs.push(("UPSTAGE_W_REPOST", ""));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_W_REPOST"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_W_REPOST"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -430,13 +439,13 @@ mod tests {
     #[test]
     fn feed_rkey_falls_back_to_default() {
         let config = load(env(&required_pair())).unwrap();
-        assert_eq!(config.feed_rkey, "dunks");
+        assert_eq!(config.feed_rkey, "upstaged");
     }
 
     #[test]
     fn every_optional_variable_falls_back_to_its_default() {
         let config = load(env(&required_pair())).unwrap();
-        assert_eq!(config.db_path, "/data/dunk.db");
+        assert_eq!(config.db_path, "/data/upstage.db");
         assert_eq!(config.http_addr, "0.0.0.0:3000");
         assert_eq!(
             config.jetstream_urls,
@@ -469,7 +478,7 @@ mod tests {
     #[test]
     fn unrecognised_variable_is_ignored() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_TYPO", "surprise"));
+        pairs.push(("UPSTAGE_TYPO", "surprise"));
         assert!(load(env(&pairs)).is_ok());
     }
 
@@ -478,7 +487,7 @@ mod tests {
         // BC25: one configured host stays one host; the client retries that
         // same host rather than rotating.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_JETSTREAM_URL", "wss://jetstream.example.com"));
+        pairs.push(("UPSTAGE_JETSTREAM_URL", "wss://jetstream.example.com"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.jetstream_urls, vec!["wss://jetstream.example.com"]);
     }
@@ -488,7 +497,7 @@ mod tests {
         // BC26.
         let mut pairs = required_pair().to_vec();
         pairs.push((
-            "DUNK_JETSTREAM_URL",
+            "UPSTAGE_JETSTREAM_URL",
             " wss://a.example.com, ws://b.example.com ,wss://c.example.com",
         ));
         let config = load(env(&pairs)).unwrap();
@@ -512,10 +521,10 @@ mod tests {
     fn empty_jetstream_url_is_invalid() {
         // BC28: at least one host is required.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_JETSTREAM_URL", "   , , "));
+        pairs.push(("UPSTAGE_JETSTREAM_URL", "   , , "));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_JETSTREAM_URL"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_JETSTREAM_URL"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -524,11 +533,11 @@ mod tests {
     fn jetstream_url_bad_scheme_is_invalid() {
         // BC29: every entry must start with wss:// or ws://.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_JETSTREAM_URL", "wss://good.example.com,https://bad.example.com"));
+        pairs.push(("UPSTAGE_JETSTREAM_URL", "wss://good.example.com,https://bad.example.com"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, value, .. } => {
-                assert_eq!(name, "DUNK_JETSTREAM_URL");
+                assert_eq!(name, "UPSTAGE_JETSTREAM_URL");
                 assert_eq!(value, "https://bad.example.com");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -538,7 +547,7 @@ mod tests {
     #[test]
     fn drop_labels_splits_trims_and_drops_empty_entries() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_DROP_LABELS", " porn, , spam ,nudity"));
+        pairs.push(("UPSTAGE_DROP_LABELS", " porn, , spam ,nudity"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.drop_labels, vec!["porn", "spam", "nudity"]);
     }
@@ -546,10 +555,10 @@ mod tests {
     #[test]
     fn empty_drop_labels_is_malformed() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_DROP_LABELS", "   "));
+        pairs.push(("UPSTAGE_DROP_LABELS", "   "));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_DROP_LABELS"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_DROP_LABELS"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -564,10 +573,10 @@ mod tests {
     #[test]
     fn bsky_credentials_are_read_when_set() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("BSKY_HANDLE", "dunk.bsky.social"));
+        pairs.push(("BSKY_HANDLE", "upstage.bsky.social"));
         pairs.push(("BSKY_APP_PASSWORD", "secret"));
         let config = load(env(&pairs)).unwrap();
-        assert_eq!(config.bsky_handle, Some("dunk.bsky.social".to_string()));
+        assert_eq!(config.bsky_handle, Some("upstage.bsky.social".to_string()));
         assert_eq!(config.bsky_app_password.as_ref().map(Secret::expose), Some("secret"));
     }
 
@@ -584,10 +593,10 @@ mod tests {
     #[test]
     fn malformed_log_filter_fails() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_LOG", "target=notalevel"));
+        pairs.push(("UPSTAGE_LOG", "target=notalevel"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_LOG"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_LOG"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -595,19 +604,19 @@ mod tests {
     #[test]
     fn valid_log_filter_is_accepted() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_LOG", "debug,dunk=trace"));
+        pairs.push(("UPSTAGE_LOG", "debug,upstage=trace"));
         let config = load(env(&pairs)).unwrap();
-        assert_eq!(config.log, "debug,dunk=trace");
+        assert_eq!(config.log, "debug,upstage=trace");
     }
 
     #[test]
     fn nan_weight_is_malformed() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_W_REPOST", "nan"));
+        pairs.push(("UPSTAGE_W_REPOST", "nan"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_W_REPOST");
+                assert_eq!(name, "UPSTAGE_W_REPOST");
                 assert_eq!(reason, "not a finite number");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -617,11 +626,11 @@ mod tests {
     #[test]
     fn infinite_weight_is_malformed() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_W_REPOST", "inf"));
+        pairs.push(("UPSTAGE_W_REPOST", "inf"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_W_REPOST");
+                assert_eq!(name, "UPSTAGE_W_REPOST");
                 assert_eq!(reason, "not a finite number");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -630,13 +639,13 @@ mod tests {
 
     #[test]
     fn zero_k_is_invalid() {
-        // BC23: DUNK_K is a divisor, so 0 is never a working setting.
+        // BC23: UPSTAGE_K is a divisor, so 0 is never a working setting.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_K", "0"));
+        pairs.push(("UPSTAGE_K", "0"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_K");
+                assert_eq!(name, "UPSTAGE_K");
                 assert_eq!(reason, "must be greater than zero");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -645,13 +654,13 @@ mod tests {
 
     #[test]
     fn zero_scorer_interval_is_invalid() {
-        // BC23: DUNK_SCORER_INTERVAL_S is a timer period.
+        // BC23: UPSTAGE_SCORER_INTERVAL_S is a timer period.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_SCORER_INTERVAL_S", "0"));
+        pairs.push(("UPSTAGE_SCORER_INTERVAL_S", "0"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_SCORER_INTERVAL_S");
+                assert_eq!(name, "UPSTAGE_SCORER_INTERVAL_S");
                 assert_eq!(reason, "must be greater than zero");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -660,13 +669,13 @@ mod tests {
 
     #[test]
     fn zero_reverify_interval_is_invalid() {
-        // BC23: DUNK_REVERIFY_INTERVAL_S is a timer period.
+        // BC23: UPSTAGE_REVERIFY_INTERVAL_S is a timer period.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_REVERIFY_INTERVAL_S", "0"));
+        pairs.push(("UPSTAGE_REVERIFY_INTERVAL_S", "0"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_REVERIFY_INTERVAL_S");
+                assert_eq!(name, "UPSTAGE_REVERIFY_INTERVAL_S");
                 assert_eq!(reason, "must be greater than zero");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -675,15 +684,15 @@ mod tests {
 
     #[test]
     fn zero_negative_or_nonfinite_appview_rps_is_invalid() {
-        // BC24: DUNK_APPVIEW_RPS rejects zero, negative and non-finite
+        // BC24: UPSTAGE_APPVIEW_RPS rejects zero, negative and non-finite
         // values, all with the same reason string.
         for bad in ["0", "-1.0", "nan", "inf"] {
             let mut pairs = required_pair().to_vec();
-            pairs.push(("DUNK_APPVIEW_RPS", bad));
+            pairs.push(("UPSTAGE_APPVIEW_RPS", bad));
             let err = load(env(&pairs)).unwrap_err();
             match err {
                 ConfigError::Invalid { name, reason, .. } => {
-                    assert_eq!(name, "DUNK_APPVIEW_RPS");
+                    assert_eq!(name, "UPSTAGE_APPVIEW_RPS");
                     assert_eq!(reason, "must be greater than zero");
                 }
                 other => panic!("expected Invalid for {bad}, got {other:?}"),
@@ -693,14 +702,14 @@ mod tests {
 
     #[test]
     fn zero_health_max_lag_is_invalid() {
-        // BC27: DUNK_HEALTH_MAX_LAG_S rejects zero, same as the other
+        // BC27: UPSTAGE_HEALTH_MAX_LAG_S rejects zero, same as the other
         // positive_u32_or_default fields.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_HEALTH_MAX_LAG_S", "0"));
+        pairs.push(("UPSTAGE_HEALTH_MAX_LAG_S", "0"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_HEALTH_MAX_LAG_S");
+                assert_eq!(name, "UPSTAGE_HEALTH_MAX_LAG_S");
                 assert_eq!(reason, "must be greater than zero");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -711,10 +720,10 @@ mod tests {
     fn empty_health_max_lag_is_invalid() {
         // BC27: empty is malformed, not the default.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_HEALTH_MAX_LAG_S", ""));
+        pairs.push(("UPSTAGE_HEALTH_MAX_LAG_S", ""));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_HEALTH_MAX_LAG_S"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_HEALTH_MAX_LAG_S"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -723,10 +732,10 @@ mod tests {
     fn non_numeric_health_max_lag_is_invalid() {
         // BC27.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_HEALTH_MAX_LAG_S", "soon"));
+        pairs.push(("UPSTAGE_HEALTH_MAX_LAG_S", "soon"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_HEALTH_MAX_LAG_S"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_HEALTH_MAX_LAG_S"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -734,7 +743,7 @@ mod tests {
     #[test]
     fn custom_health_max_lag_is_read() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_HEALTH_MAX_LAG_S", "120"));
+        pairs.push(("UPSTAGE_HEALTH_MAX_LAG_S", "120"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.health_max_lag_s, 120);
     }
@@ -743,9 +752,9 @@ mod tests {
     fn feed_uri_is_the_at_uri_of_the_generator_record() {
         // BC45.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_FEED_RKEY", "dunks"));
+        pairs.push(("UPSTAGE_FEED_RKEY", "upstaged"));
         let config = load(env(&pairs)).unwrap();
-        assert_eq!(config.feed_uri(), "at://did:plc:abc/app.bsky.feed.generator/dunks");
+        assert_eq!(config.feed_uri(), "at://did:plc:abc/app.bsky.feed.generator/upstaged");
     }
 
     #[test]
@@ -759,7 +768,7 @@ mod tests {
     fn zero_guard_histogram_h_disables_the_period() {
         // BC32: 0 is a valid value, not rejected like the positive_u32 fields.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_GUARD_HISTOGRAM_H", "0"));
+        pairs.push(("UPSTAGE_GUARD_HISTOGRAM_H", "0"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.guard_histogram_h, 0);
     }
@@ -768,10 +777,10 @@ mod tests {
     fn malformed_guard_histogram_h_is_invalid() {
         // BC32.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_GUARD_HISTOGRAM_H", "soon"));
+        pairs.push(("UPSTAGE_GUARD_HISTOGRAM_H", "soon"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_GUARD_HISTOGRAM_H"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_GUARD_HISTOGRAM_H"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -780,10 +789,10 @@ mod tests {
     fn empty_guard_histogram_h_is_invalid() {
         // BC32: empty is malformed, not the default.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_GUARD_HISTOGRAM_H", ""));
+        pairs.push(("UPSTAGE_GUARD_HISTOGRAM_H", ""));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_GUARD_HISTOGRAM_H"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_GUARD_HISTOGRAM_H"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -791,7 +800,7 @@ mod tests {
     #[test]
     fn custom_guard_histogram_h_is_read() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_GUARD_HISTOGRAM_H", "12"));
+        pairs.push(("UPSTAGE_GUARD_HISTOGRAM_H", "12"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.guard_histogram_h, 12);
     }
@@ -800,11 +809,11 @@ mod tests {
     fn zero_author_ttl_h_is_invalid() {
         // BC33: a zero TTL would refetch every DID on every pass.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_AUTHOR_TTL_H", "0"));
+        pairs.push(("UPSTAGE_AUTHOR_TTL_H", "0"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_AUTHOR_TTL_H");
+                assert_eq!(name, "UPSTAGE_AUTHOR_TTL_H");
                 assert_eq!(reason, "must be greater than zero");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -815,10 +824,10 @@ mod tests {
     fn malformed_author_ttl_h_is_invalid() {
         // BC33.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_AUTHOR_TTL_H", "soon"));
+        pairs.push(("UPSTAGE_AUTHOR_TTL_H", "soon"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_AUTHOR_TTL_H"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_AUTHOR_TTL_H"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -827,10 +836,10 @@ mod tests {
     fn empty_author_ttl_h_is_invalid() {
         // BC33: empty is malformed, not the default.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_AUTHOR_TTL_H", ""));
+        pairs.push(("UPSTAGE_AUTHOR_TTL_H", ""));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_AUTHOR_TTL_H"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_AUTHOR_TTL_H"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -838,20 +847,20 @@ mod tests {
     #[test]
     fn custom_author_ttl_h_is_read() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_AUTHOR_TTL_H", "6"));
+        pairs.push(("UPSTAGE_AUTHOR_TTL_H", "6"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.author_ttl_h, 6);
     }
 
     #[test]
     fn zero_author_inactive_ttl_h_is_invalid() {
-        // BC45: the same rule as DUNK_AUTHOR_TTL_H.
+        // BC45: the same rule as UPSTAGE_AUTHOR_TTL_H.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_AUTHOR_INACTIVE_TTL_H", "0"));
+        pairs.push(("UPSTAGE_AUTHOR_INACTIVE_TTL_H", "0"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_AUTHOR_INACTIVE_TTL_H");
+                assert_eq!(name, "UPSTAGE_AUTHOR_INACTIVE_TTL_H");
                 assert_eq!(reason, "must be greater than zero");
             }
             other => panic!("expected Invalid, got {other:?}"),
@@ -862,10 +871,10 @@ mod tests {
     fn malformed_author_inactive_ttl_h_is_invalid() {
         // BC45.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_AUTHOR_INACTIVE_TTL_H", "soon"));
+        pairs.push(("UPSTAGE_AUTHOR_INACTIVE_TTL_H", "soon"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_AUTHOR_INACTIVE_TTL_H"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_AUTHOR_INACTIVE_TTL_H"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -874,10 +883,10 @@ mod tests {
     fn empty_author_inactive_ttl_h_is_invalid() {
         // BC45: empty is malformed, not the default.
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_AUTHOR_INACTIVE_TTL_H", ""));
+        pairs.push(("UPSTAGE_AUTHOR_INACTIVE_TTL_H", ""));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, .. } => assert_eq!(name, "DUNK_AUTHOR_INACTIVE_TTL_H"),
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_AUTHOR_INACTIVE_TTL_H"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
@@ -885,7 +894,7 @@ mod tests {
     #[test]
     fn custom_author_inactive_ttl_h_is_read() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_AUTHOR_INACTIVE_TTL_H", "2"));
+        pairs.push(("UPSTAGE_AUTHOR_INACTIVE_TTL_H", "2"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.author_inactive_ttl_h, 2);
     }
@@ -893,11 +902,11 @@ mod tests {
     #[test]
     fn negative_weight_is_malformed() {
         let mut pairs = required_pair().to_vec();
-        pairs.push(("DUNK_M", "-1.0"));
+        pairs.push(("UPSTAGE_M", "-1.0"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, reason, .. } => {
-                assert_eq!(name, "DUNK_M");
+                assert_eq!(name, "UPSTAGE_M");
                 assert_eq!(reason, "must be >= 0");
             }
             other => panic!("expected Invalid, got {other:?}"),

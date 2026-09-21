@@ -404,7 +404,7 @@ pub fn expire(
     Ok(report)
 }
 
-/// One row of `dunk dump`'s CSV, TECH-DESIGN section 6 and `spec.md`'s
+/// One row of `upstage dump`'s CSV, TECH-DESIGN section 6 and `spec.md`'s
 /// column order. Carries the seven `pairs` columns, `state` and
 /// `drop_reason` as the raw text `pairs` stores them, both sides' local
 /// counts, and the six `v_*` verified counts plus `promoted_at` from `feed`
@@ -449,7 +449,7 @@ fn saturate_joined_count(value: Option<i64>) -> u32 {
 }
 
 /// Every `pairs` row, in any state, first seen at or after `cutoff`
-/// (BC1, BC6, BC16, BC21): `dunk dump`'s read. `pairs LEFT JOIN counts` on
+/// (BC1, BC6, BC16, BC21): `upstage dump`'s read. `pairs LEFT JOIN counts` on
 /// `quote_uri` and again on `original_uri` (aliased `cq` and `co`) attaches
 /// each side's local counts, defaulting to zero when that side has no
 /// `counts` row (BC5). `LEFT JOIN feed` on `quote_uri` attaches the

@@ -38,8 +38,8 @@ behind Cloudflare's proxy.
 | Path | Change |
 |---|---|
 | `Dockerfile` | Multi-stage build, non-root, `/data` volume |
-| `compose.yaml` | Cloudflare Tunnel variant: `dunk` and `cloudflared` services |
-| `compose.proxied.yaml` | Proxied-DNS variant: `dunk` only, port 3000 published |
+| `compose.yaml` | Cloudflare Tunnel variant: `upstage` and `cloudflared` services |
+| `compose.proxied.yaml` | Proxied-DNS variant: `upstage` only, port 3000 published |
 | `docs/RUNBOOK.md` | Deploy, backup, upgrade, failure modes |
 | `.env.example` | Adds `TUNNEL_TOKEN` (tunnel variant only) |
 
@@ -47,18 +47,18 @@ behind Cloudflare's proxy.
 
 | Id | Subject | Case | Behaviour |
 |---|---|---|---|
-| BC1 | image, `/data` volume missing at container start | edge case | `DUNK_DB_PATH` write fails fast; Docker's restart policy retries; documented in RUNBOOK, not a code path |
+| BC1 | image, `/data` volume missing at container start | edge case | `UPSTAGE_DB_PATH` write fails fast; Docker's restart policy retries; documented in RUNBOOK, not a code path |
 | BC2 | healthcheck | `/healthz` returns 503 | Docker marks the container unhealthy after the configured retries; it does not restart on its own (Compose's default); an operator action, per RUNBOOK |
 | BC3 | healthcheck | `/healthz` returns 200 | Container marked healthy |
-| BC4 | compose, tunnel variant | `TUNNEL_TOKEN` missing | `cloudflared` exits non-zero immediately; `dunk` keeps running, reachable only on the VM's private network until the token is set |
+| BC4 | compose, tunnel variant | `TUNNEL_TOKEN` missing | `cloudflared` exits non-zero immediately; `upstage` keeps running, reachable only on the VM's private network until the token is set |
 | BC5 | compose, proxied variant | port 3000 unreachable from outside | Operator checks the VM's firewall and Cloudflare's proxy status, per RUNBOOK; not a container-level failure |
 | BC6 | memory limit | container RSS approaches 512 MB | Docker's `mem_limit` kills and restarts the container; the Jetstream cursor makes the restart gapless within 36h, per §13 |
 | BC7 | image size | build output | Final image under 40 MB |
 
 ## Acceptance criteria
 
-- [ ] AC1 — `docker build .` produces an image under 40 MB. Checked by: `docker build -t dunk . && docker image inspect dunk --format='{{.Size}}'` (value under 40000000)
-- [ ] AC2 — The container runs as non-root. Checked by: `docker run --rm dunk id -u` (non-zero)
+- [ ] AC1 — `docker build .` produces an image under 40 MB. Checked by: `docker build -t upstage . && docker image inspect upstage --format='{{.Size}}'` (value under 40000000)
+- [ ] AC2 — The container runs as non-root. Checked by: `docker run --rm upstage id -u` (non-zero)
 - [ ] AC3 — Both Compose files validate. Checked by: `docker compose -f compose.yaml config` and `docker compose -f compose.proxied.yaml config` (both exit 0)
 - [ ] AC4 — The healthcheck targets `/healthz`. Checked by: reviewer reads `compose.yaml` and `compose.proxied.yaml`
 - [ ] AC5 — `docs/RUNBOOK.md` covers deploy, backup, upgrade, and every §13 failure mode. Checked by: reviewer reads `docs/RUNBOOK.md`
@@ -72,7 +72,7 @@ behind Cloudflare's proxy.
   retries, 10s start period; `curl` is added to the runtime stage only for
   this check.
 - Backup: documented in RUNBOOK as a cron entry running
-  `sqlite3 /data/dunk.db ".backup /data/backup.db"` nightly, per §13; not
+  `sqlite3 /data/upstage.db ".backup /data/backup.db"` nightly, per §13; not
   automated by Compose itself.
 - `compose.yaml` is the Cloudflare Tunnel variant, the more common path for
   a VM with no public IP; `compose.proxied.yaml` is the alternative.
@@ -80,7 +80,7 @@ behind Cloudflare's proxy.
 
 ## Suggested slices
 
-- 1.0 `Dockerfile` and its healthcheck. Done when `docker build -t dunk .`
+- 1.0 `Dockerfile` and its healthcheck. Done when `docker build -t upstage .`
   succeeds and the image is under 40 MB.
 - 2.0 `compose.yaml` (tunnel) and `compose.proxied.yaml` (proxied DNS).
   Done when both `docker compose ... config` commands validate.

@@ -1,4 +1,4 @@
-# Bluesky traffic analysis for Dunk Feed
+# Bluesky traffic analysis for Upstaged
 
 2026-09-18. Measured from this machine. Every number below is tagged.
 
@@ -12,7 +12,7 @@ Three probes ran on 2026-09-18 between 08:05 and 08:17 NZST (2026-09-17 20:05 to
 
 1. **Jetstream sample.** One websocket to `jetstream2.us-east.bsky.network`, four collections (`post`, `like`, `repost`, `postgate`), no compression, 418 seconds of stream time, 163,772 events. Script: `scripts/measure/sample_jetstream.py`. Raw output: `docs/measurements/2026-09-18-jetstream-sample.json`.
 2. **Hot feed probe.** `app.bsky.feed.getFeed` on Bluesky's `hot-classic` and `whats-hot` (Discover) feeds through `public.api.bsky.app`, unauthenticated, 200 to 300 posts each.
-3. **Dunk probe.** For quote posts found in `hot-classic`, fetched the original with `getPosts` and computed the PRD score with the default constants.
+3. **Upstage probe.** For quote posts found in `hot-classic`, fetched the original with `getPosts` and computed the PRD score with the default constants.
 
 The sample is one Thursday evening in the US. It is not a peak. Jaz's 2024 data shows surges at two to three times baseline. Size for three times these numbers.
 
@@ -73,11 +73,11 @@ A `disableRule` on `O` means new quotes of `O` cannot be created through the app
 Observations:
 
 - `hot-classic` admits posts at **12 likes**. The GitHub issue that says 15 is out of date, or the threshold moved. The feed is a rolling 15-minute window of fresh posts.
-- Discover **contains no quote posts and no replies** at all (0 of 300). Its embed types were external, images, video, or none. This matters for phase 0: you cannot seed dunks from Discover.
+- Discover **contains no quote posts and no replies** at all (0 of 300). Its embed types were external, images, video, or none. This matters for phase 0: you cannot seed upstages from Discover.
 - `hot-classic` is **19% quote posts** (57 of 298). Quote posts are over-represented there versus the firehose (7.8%). Quoting is a popular-post behaviour.
 - The PRD's `P = 50` sits at about p80 of `hot-classic` and p8 of Discover. A post with 50 likes is "would appear near the bottom of Discover". That is a defensible floor. `P = 20` would be "median hot-classic post".
 
-## 6. Dunk probe [Certain for the snapshot, small sample]
+## 6. Upstage probe [Certain for the snapshot, small sample]
 
 Seeded from the 57 quote posts in `hot-classic`. 47 pairs after removing self quotes. Default constants (`Wr = 2`, `Wc = 0.5`, `k = 5`, `P = 50`, `M = 1.25`).
 
@@ -94,8 +94,8 @@ Top pair: `E(Q) = 222` against `E(O) = 47`, ratio 4.3.
 
 Findings:
 
-1. **About one in twelve popular quote posts is a dunk** under the PRD rules. The rule finds things. Whether they are funny is still phase 0's question.
-2. **Seed phase 0 from popular quote posts, not popular originals.** A second probe seeded from the 40 most-quoted Discover posts and their 1,378 quotes found **zero** pairs with `D >= 0.5`. When `O` is popular enough to be in Discover, no quote beats it. Dunks are found from the `Q` side. The PRD's phase 0 recipe ("seed 50 heavily-quoted posts, pull their quotes") will return nothing. Replace it with "seed popular posts that are quotes, fetch what they quote".
+1. **About one in twelve popular quote posts is an upstage** under the PRD rules. The rule finds things. Whether they are funny is still phase 0's question.
+2. **Seed phase 0 from popular quote posts, not popular originals.** A second probe seeded from the 40 most-quoted Discover posts and their 1,378 quotes found **zero** pairs with `D >= 0.5`. When `O` is popular enough to be in Discover, no quote beats it. Upstages are found from the `Q` side. The PRD's phase 0 recipe ("seed 50 heavily-quoted posts, pull their quotes") will return nothing. Replace it with "seed popular posts that are quotes, fetch what they quote".
 3. **The popularity gate binds on `Q`, not `O`.** In every qualifying pair, `Q` cleared 50 and `O` did not. Expect the feed to be "a post that took off by quoting something small", not "a big post beaten by a bigger one". If that is not the product, raise `k` or require `E(O) >= P_O` separately.
 4. **`k = 5` is doing work.** Three of the ten pairs with `D >= 1.25` had `E(O) <= 11`. Without `k` they would have ratios above 10 and would top the feed.
 5. `getPosts` returns `followersCount` on neither side. The follower floor guard needs `app.bsky.actor.getProfiles` (25 DIDs per call).
@@ -145,7 +145,7 @@ A 2 vCPU, 2 GB VM with 10 GB of disk is enough with headroom for a 3x surge. 1 G
 - The share of likes whose subject is in the hot set. This decides the real counter write rate. Story 04 logs it.
 - Promoted pairs per day. This decides the feed's depth and the guard costs. Story 06 logs it.
 - Weekend and surge behaviour. Run the sampler for 24 hours before tuning `P` and `M`.
-- Whether the hot-classic follower profile of dunked-on authors makes the follower floor bite. Story 10 logs follower counts before it drops anything.
+- Whether the hot-classic follower profile of upstaged authors makes the follower floor bite. Story 10 logs follower counts before it drops anything.
 
 ## Sources
 

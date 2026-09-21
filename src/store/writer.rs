@@ -299,7 +299,7 @@ pub(crate) fn spawn(
     let (tx, rx) = mpsc::channel(cfg.capacity);
     let (health_tx, health_rx) = watch::channel(WriterState::Running);
     std::thread::Builder::new()
-        .name("dunk-store-writer".to_string())
+        .name("upstage-store-writer".to_string())
         .spawn(move || writer_loop(conn, rx, cfg, health_tx, evict_tx))
         .expect("failed to spawn the store writer thread");
     WriterHandle { tx, health: health_rx }
@@ -862,7 +862,7 @@ mod tests {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("dunk-store-throughput-{nanos}.sqlite3"));
+        let path = std::env::temp_dir().join(format!("upstage-store-throughput-{nanos}.sqlite3"));
         let path_str = path.to_str().unwrap().to_string();
 
         let rt = tokio::runtime::Runtime::new().unwrap();

@@ -5,7 +5,7 @@
 //! constant the PRD's score table owns. `validate` (story 03) and the scorer
 //! (story 07) call these exact functions instead of writing their own copy.
 
-#![allow(dead_code)] // First callers are `dunk validate` (story 03) and story 07's scorer.
+#![allow(dead_code)] // First callers are `upstage validate` (story 03) and story 07's scorer.
 
 use crate::appview::types::PostView;
 use crate::config::Config;
@@ -174,10 +174,10 @@ mod tests {
     #[test]
     fn weights_come_from_config() {
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
-            "DUNK_W_REPOST" => Some("3.0".to_string()),
-            "DUNK_W_REPLY" => Some("0.75".to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_W_REPOST" => Some("3.0".to_string()),
+            "UPSTAGE_W_REPLY" => Some("0.75".to_string()),
             _ => None,
         };
         let cfg = crate::config::load(lookup).expect("valid config");
@@ -189,11 +189,11 @@ mod tests {
     #[test]
     fn thresholds_come_from_config() {
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
-            "DUNK_K" => Some("7".to_string()),
-            "DUNK_P" => Some("80".to_string()),
-            "DUNK_M" => Some("1.5".to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_K" => Some("7".to_string()),
+            "UPSTAGE_P" => Some("80".to_string()),
+            "UPSTAGE_M" => Some("1.5".to_string()),
             _ => None,
         };
         let cfg = crate::config::load(lookup).expect("valid config");

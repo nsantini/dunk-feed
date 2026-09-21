@@ -1,11 +1,11 @@
-# Proxied-DNS variant. `dunk` publishes port 3000 directly; Cloudflare's
+# Proxied-DNS variant. `upstage` publishes port 3000 directly; Cloudflare's
 # proxy sits in front over Flexible TLS (TECH-DESIGN section 11), and the VM
 # firewall must be restricted to Cloudflare's published IP ranges. No
 # `cloudflared` service. See docs/RUNBOOK.md.
 services:
-  dunk:
+  upstage:
     build: .
-    image: dunk
+    image: upstage
     env_file:
       - path: .env
         required: false
@@ -14,7 +14,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - dunk-data:/data
+      - upstage-data:/data
     logging:
       driver: json-file
       options:
@@ -28,4 +28,4 @@ services:
       start_period: 120s
 
 volumes:
-  dunk-data:
+  upstage-data:

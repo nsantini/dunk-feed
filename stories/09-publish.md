@@ -1,4 +1,4 @@
-# 09 — `dunk publish`
+# 09 — `upstage publish`
 
 - **Follows**: 08
 - **PRD phase**: 2
@@ -7,8 +7,8 @@
 
 ## Outcome
 
-After this ships, `dunk publish` reads `BSKY_HANDLE`, `BSKY_APP_PASSWORD`,
-`DUNK_HOSTNAME`, `DUNK_FEED_RKEY`, and an optional avatar path, creates a
+After this ships, `upstage publish` reads `BSKY_HANDLE`, `BSKY_APP_PASSWORD`,
+`UPSTAGE_HOSTNAME`, `UPSTAGE_FEED_RKEY`, and an optional avatar path, creates a
 session against `bsky.social`, uploads the avatar, and writes the
 `app.bsky.feed.generator` record with `acceptsInteractions: true`. An
 operator runs it once, and the feed appears in the Bluesky app under the
@@ -16,11 +16,11 @@ printed URL; running it again updates the same record in place.
 
 ## Non-goals
 
-- Does not run inside `dunk run`; publish is a separate, manual step per
+- Does not run inside `upstage run`; publish is a separate, manual step per
   §11.2.
 - Does not create the account or the app password; the operator supplies
   both.
-- Does not check that `DUNK_HOSTNAME` already serves
+- Does not check that `UPSTAGE_HOSTNAME` already serves
   `/.well-known/did.json`; that is the operator's responsibility first.
 - Does not retry on failure; a failed call exits non-zero with the App
   View's own error.
@@ -49,8 +49,8 @@ overwrites, and an idempotent write is simpler than a read-modify-write.
 | BC3 | `--avatar` path | omitted | Record is published without an avatar field |
 | BC4 | `createSession` | fails, bad handle or password | `PublishError::Auth`, caught in `src/publish.rs`; user sees the App View's error text |
 | BC5 | `uploadBlob` | fails | `PublishError::Upload`, caught in `src/publish.rs`; publish aborts before `putRecord` |
-| BC6 | `putRecord` | succeeds | Record written with `did: did:web:<DUNK_HOSTNAME>`, `displayName`, `description`, `avatar` (if any), `acceptsInteractions: true`, `createdAt`; prints `at://<publisher_did>/app.bsky.feed.generator/<DUNK_FEED_RKEY>` |
-| BC7 | `publish` run twice, same `DUNK_FEED_RKEY` | idempotence | Second run overwrites the same record; no duplicate created |
+| BC6 | `putRecord` | succeeds | Record written with `did: did:web:<UPSTAGE_HOSTNAME>`, `displayName`, `description`, `avatar` (if any), `acceptsInteractions: true`, `createdAt`; prints `at://<publisher_did>/app.bsky.feed.generator/<UPSTAGE_FEED_RKEY>` |
+| BC7 | `publish` run twice, same `UPSTAGE_FEED_RKEY` | idempotence | Second run overwrites the same record; no duplicate created |
 
 ## Acceptance criteria
 
@@ -69,7 +69,7 @@ overwrites, and an idempotent write is simpler than a read-modify-write.
 - The avatar path is a CLI flag, `--avatar <path>`, not an env variable,
   since §4 lists none.
 - The session is created against `https://bsky.social` (fixed), not
-  `DUNK_APPVIEW_URL`, matching §11.2's exact wording.
+  `UPSTAGE_APPVIEW_URL`, matching §11.2's exact wording.
 
 ## Suggested slices
 

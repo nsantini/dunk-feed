@@ -5,7 +5,7 @@
 //! 03) and the scorer (story 07) call these exact four methods instead of
 //! writing their own copy.
 
-#![allow(dead_code)] // First caller is `dunk validate`, story 03.
+#![allow(dead_code)] // First caller is `upstage validate`, story 03.
 
 pub mod types;
 
@@ -24,7 +24,7 @@ use types::{
 };
 
 /// The HTTP timeout every request carries, TECH-DESIGN section 8.1. It
-/// applies to `dunk publish`'s writes against the PDS too, through
+/// applies to `upstage publish`'s writes against the PDS too, through
 /// [`http_client`], so one edit moves the whole binary's outbound budget.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 

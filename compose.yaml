@@ -1,17 +1,17 @@
-# Cloudflare Tunnel variant. `dunk` publishes no port; `cloudflared` carries
+# Cloudflare Tunnel variant. `upstage` publishes no port; `cloudflared` carries
 # all inbound traffic in over an outbound-only connection, so the VM needs
 # no open inbound firewall rule at all. See docs/RUNBOOK.md.
 services:
-  dunk:
+  upstage:
     build: .
-    image: dunk
+    image: upstage
     env_file:
       - path: .env
         required: false
     restart: unless-stopped
     mem_limit: 512m
     volumes:
-      - dunk-data:/data
+      - upstage-data:/data
     logging:
       driver: json-file
       options:
@@ -29,7 +29,7 @@ services:
     command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
     restart: unless-stopped
     depends_on:
-      - dunk
+      - upstage
 
 volumes:
-  dunk-data:
+  upstage-data:

@@ -11,8 +11,8 @@
 //!
 //! Story 10's correction round changed the design the story shipped with:
 //! the follower floor now drops from the first pass (BC41), and
-//! `DUNK_GUARD_LOG_ONLY_H`/`meta.guard_log_only_since` became
-//! `DUNK_GUARD_HISTOGRAM_H`/`meta.guard_histogram_since` plus a new
+//! `UPSTAGE_GUARD_LOG_ONLY_H`/`meta.guard_log_only_since` became
+//! `UPSTAGE_GUARD_HISTOGRAM_H`/`meta.guard_histogram_since` plus a new
 //! `meta.guard_histogram_floor`: a measurement period, not a suppression
 //! window. `decide` no longer takes a `log_only` flag.
 
@@ -80,7 +80,7 @@ fn any_dropped(labels: &[String], cfg: &GuardConfig) -> bool {
 /// section 9, BC7).
 ///
 /// Order, BC15: author state, then labels, then the follower floor. A
-/// `!takedown` label that also appears in `DUNK_DROP_LABELS` therefore
+/// `!takedown` label that also appears in `UPSTAGE_DROP_LABELS` therefore
 /// reports `author_inactive`, not `labelled`. Story 10's correction round
 /// removed the `log_only` suppression this function used to take: the
 /// follower floor now drops unconditionally whenever `cfg.follower_floor >
@@ -326,14 +326,14 @@ pub async fn check_batch<P: ProfileSource>(
 /// Resolves the histogram period's state, TECH-DESIGN section 9 as revised
 /// by story 10's correction round: `meta.guard_histogram_since` holds the
 /// unix-second timestamp the period opened, and `meta.guard_histogram_floor`
-/// the `DUNK_FOLLOWER_FLOOR` value it is measuring against. Unlike the
+/// the `UPSTAGE_FOLLOWER_FLOOR` value it is measuring against. Unlike the
 /// story's original design, the follower floor itself is live from the
 /// first pass regardless of this period (BC41, `decide`); the period only
 /// decides whether `one_pass` logs a histogram line.
 ///
-/// `DUNK_GUARD_HISTOGRAM_H = 0` disables the period outright and writes
+/// `UPSTAGE_GUARD_HISTOGRAM_H = 0` disables the period outright and writes
 /// nothing (BC23). A stored floor that differs from the current
-/// `DUNK_FOLLOWER_FLOOR`, or that is absent or does not parse, is treated as
+/// `UPSTAGE_FOLLOWER_FLOOR`, or that is absent or does not parse, is treated as
 /// a floor change (BC42, BC43): `since` is reset to `now` and the current
 /// floor is stored, reopening the period even though a present, matching
 /// `since` is otherwise never overwritten (BC24, BC25). Once the floor is
@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(result, GuardResult::Pass);
     }
 
-    // BC9: a label on `Q`'s own `postView` in `DUNK_DROP_LABELS` drops.
+    // BC9: a label on `Q`'s own `postView` in `UPSTAGE_DROP_LABELS` drops.
     #[test]
     fn labels_drop_on_quote_post_label() {
         let mut p = pair();
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(result, GuardResult::Drop(DropReason::Labelled));
     }
 
-    // BC13: a label present but not in `DUNK_DROP_LABELS` passes. Matching
+    // BC13: a label present but not in `UPSTAGE_DROP_LABELS` passes. Matching
     // is exact and case sensitive.
     #[test]
     fn labels_not_in_drop_list_pass() {
@@ -961,7 +961,7 @@ mod tests {
         assert_eq!(counters.guard_histogram.one_to_99, 1, "did:plc:o counted once, not twice");
     }
 
-    // BC23: `DUNK_GUARD_HISTOGRAM_H = 0` disables the period and writes
+    // BC23: `UPSTAGE_GUARD_HISTOGRAM_H = 0` disables the period and writes
     // nothing to `meta`.
     #[tokio::test]
     async fn histogram_period_meta_clock_disabled_writes_nothing() {
@@ -1041,7 +1041,7 @@ mod tests {
     }
 
     // BC42, BC43, story 10's correction round: a stored floor that no longer
-    // matches `DUNK_FOLLOWER_FLOOR` resets `since` to `now` and stores the
+    // matches `UPSTAGE_FOLLOWER_FLOOR` resets `since` to `now` and stores the
     // current floor, reopening the period even though it had already
     // elapsed.
     #[tokio::test]
@@ -1091,15 +1091,15 @@ mod tests {
     // and `did:plc:ofzkhjyyh4kl4a35wxgmobmm`) plus two well-known accounts,
     // printing each DID's real follower count and the resulting histogram
     // bucket so an operator can eyeball a real distribution before setting
-    // `DUNK_FOLLOWER_FLOOR`. `#[ignore]`d, per `AGENTS.md`: run by hand with
+    // `UPSTAGE_FOLLOWER_FLOOR`. `#[ignore]`d, per `AGENTS.md`: run by hand with
     // `cargo test --all-features -- --ignored
     // guards_live_follower_distribution`.
     #[tokio::test]
     #[ignore]
     async fn guards_live_follower_distribution() {
         let config = crate::config::load(|name| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
             _ => None,
         })
         .unwrap();

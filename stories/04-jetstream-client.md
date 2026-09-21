@@ -71,7 +71,7 @@ resume is the whole point of checkpointing.
 
 ## Defaults taken
 
-- Dictionary cache: two plain files next to `DUNK_DB_PATH`, e.g.
+- Dictionary cache: two plain files next to `UPSTAGE_DB_PATH`, e.g.
   `<db_path>.zstd-dict` and `<db_path>.zstd-dict-id`, independent of SQLite.
   The store's `meta.zstd_dict_id` (story 05) is a separate concern; this
   story does not write it.

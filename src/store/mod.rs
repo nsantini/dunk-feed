@@ -264,7 +264,7 @@ impl Store {
 
     /// Opens an in-memory database. Tests use this so the writer thread and
     /// every read share the same connection (BC75). No production caller:
-    /// `dunk run` always opens a file through `open`/`open_path`.
+    /// `upstage run` always opens a file through `open`/`open_path`.
     #[allow(dead_code)]
     pub fn open_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
@@ -317,7 +317,7 @@ impl Store {
     }
 
     /// Every `pairs` row first seen at or after `cutoff`, in any state, for
-    /// `dunk dump` (BC1, BC6, BC16, BC21). Locks the read-only connection
+    /// `upstage dump` (BC1, BC6, BC16, BC21). Locks the read-only connection
     /// like every other read here, so a dump never waits on a commit.
     pub fn pairs_since(&self, cutoff: i64) -> Result<Vec<pairs::DumpRow>, StoreError> {
         let conn = self.read_lock()?;
@@ -455,7 +455,7 @@ impl Store {
     }
 
     /// Starts the one writer thread with `WriterConfig::default()`
-    /// (BC42). No production caller: `dunk run` always uses
+    /// (BC42). No production caller: `upstage run` always uses
     /// `writer_evicting` instead, so eviction is wired in from the start.
     #[allow(dead_code)]
     pub fn writer(&self) -> Result<writer::WriterHandle, StoreError> {
@@ -468,7 +468,7 @@ impl Store {
     /// `:memory:` test sees the writer's rows through the same `Store`. A
     /// second call on this `Store` (or a clone of it) is
     /// `StoreError::WriterAlreadyStarted`: one store has one writer thread
-    /// (BC73). No production caller: `dunk run` always uses
+    /// (BC73). No production caller: `upstage run` always uses
     /// `writer_evicting`.
     #[allow(dead_code)]
     pub fn writer_with(
@@ -526,14 +526,14 @@ mod tests {
 
     #[test]
     fn missing_parent_directory_is_open_error() {
-        let err = Store::open_path("/dunk-store-test-nonexistent-dir/db.sqlite3").unwrap_err();
+        let err = Store::open_path("/upstage-store-test-nonexistent-dir/db.sqlite3").unwrap_err();
         match err {
             StoreError::Open { path, .. } => {
-                assert_eq!(path, "/dunk-store-test-nonexistent-dir/db.sqlite3");
+                assert_eq!(path, "/upstage-store-test-nonexistent-dir/db.sqlite3");
             }
             other => panic!("expected Open, got {other:?}"),
         }
-        assert!(!std::path::Path::new("/dunk-store-test-nonexistent-dir").exists());
+        assert!(!std::path::Path::new("/upstage-store-test-nonexistent-dir").exists());
     }
 
     #[test]
@@ -693,7 +693,7 @@ mod tests {
     fn file_store_reads_through_the_read_only_connection() {
         let nanos =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("dunk-store-read-only-{nanos}.sqlite3"));
+        let path = std::env::temp_dir().join(format!("upstage-store-read-only-{nanos}.sqlite3"));
         let path_str = path.to_str().unwrap().to_string();
 
         let store = Store::open_path(&path_str).unwrap();

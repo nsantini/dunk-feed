@@ -29,10 +29,10 @@ async fn main() -> anyhow::Result<()> {
     let config = config::load(lookup).map_err(|err| anyhow::anyhow!("config error: {err}"))?;
 
     let filter = EnvFilter::try_new(&config.log)
-        .expect("config::load already validates DUNK_LOG with EnvFilter::try_new");
+        .expect("config::load already validates UPSTAGE_LOG with EnvFilter::try_new");
     tracing_subscriber::fmt().json().with_env_filter(filter).init();
 
-    cli::dispatch(&cli.command, &config).await.map_err(|err| anyhow::anyhow!("dunk: {err}"))?;
+    cli::dispatch(&cli.command, &config).await.map_err(|err| anyhow::anyhow!("upstage: {err}"))?;
 
     Ok(())
 }

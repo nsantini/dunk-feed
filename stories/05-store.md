@@ -7,7 +7,7 @@
 
 ## Outcome
 
-After this ships, `store::Store` opens a SQLite file at `DUNK_DB_PATH` in
+After this ships, `store::Store` opens a SQLite file at `UPSTAGE_DB_PATH` in
 WAL mode, creates the versioned schema from TECH-DESIGN §6 if it is
 missing, and runs a single writer thread that commits batched `Op`s and the
 Jetstream `seq` in one transaction. A crash and restart resumes from the
@@ -65,7 +65,7 @@ schema in §6 is small and stable.
 | BC10 | `InsertPair` | duplicate, same `quote_uri` twice | Idempotent; the second insert is a no-op, not an error |
 | BC11 | `Incr` | no existing `counts` row for the target URI | A row is created lazily on first event, not on pair insert, matching §6's note that most `O` rows never exist |
 | BC12 | `StoreError` (new error type) | raised on open, migration, or writer-channel failure | Caught in `src/store/mod.rs` or `src/store/writer.rs`; surfaced to `main.rs` as `anyhow` |
-| BC13 | `DUNK_DB_PATH` | parent directory missing | `StoreError::Open`; `main.rs` exits 1 |
+| BC13 | `UPSTAGE_DB_PATH` | parent directory missing | `StoreError::Open`; `main.rs` exits 1 |
 | BC14 | `schema_version` on open | missing | Runs the initial migration, sets it to 1 |
 | BC15 | `schema_version` on open | present, equal to 1 | No-op |
 | BC16 | `schema_version` on open | present, greater than 1 (a future version this build does not know) | Open fails with `StoreError::UnknownSchemaVersion` |

@@ -63,6 +63,6 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["did"], "did:web:feed.example.com");
-        assert_eq!(json["feeds"][0]["uri"], "at://did:plc:abc/app.bsky.feed.generator/dunks");
+        assert_eq!(json["feeds"][0]["uri"], "at://did:plc:abc/app.bsky.feed.generator/upstaged");
     }
 }

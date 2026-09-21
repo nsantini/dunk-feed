@@ -1,4 +1,4 @@
-# Dunk Feed — AT Protocol Feed Generator Spec
+# Upstaged — AT Protocol Feed Generator Spec
 
 2026-09-17 · @Nico Santini
 
@@ -8,9 +8,9 @@ A custom Bluesky feed that surfaces quote posts that out-engaged the post they q
 
 One item: a quote post whose engagement beat the post it quoted, ranked by how badly it beat it.
 
-**The dunk rule.** Post `O` is quoted by post `Q` when `Q` embeds `O` through `app.bsky.embed.record` or `app.bsky.embed.recordWithMedia`. `Q` is a dunk when `score(Q) > margin x score(O)` and at least one of them clears a popularity floor. Both scores are the weighted composite defined below.
+**The upstage rule.** Post `O` is quoted by post `Q` when `Q` embeds `O` through `app.bsky.embed.record` or `app.bsky.embed.recordWithMedia`. `Q` is an upstage when `score(Q) > margin x score(O)` and at least one of them clears a popularity floor. Both scores are the weighted composite defined below.
 
-**What a reader sees.** Nothing custom. A feed generator returns post URIs only, so the Bluesky client renders `Q` as an ordinary post card with `O` embedded inside it. That happens to be the perfect shape for this feed: the dunk on top, the victim quoted underneath, in one card. No client work, no fork of the app.
+**What a reader sees.** Nothing custom. A feed generator returns post URIs only, so the Bluesky client renders `Q` as an ordinary post card with `O` embedded inside it. That happens to be the perfect shape for this feed: the quote on top, the original quoted underneath, in one card. No client work, no fork of the app.
 
 **What it is not.** Not a ratio detector (replies beating likes on a single post). Not a most-quoted leaderboard. Not a reply-guy feed: only quote posts count, because a quote is the deliberate, public, screenshot-shaped version of the move.
 
@@ -68,7 +68,7 @@ The scorer wakes on a timer, reads pairs whose counters moved since the last pas
 
 The serving path touches none of this. `getFeedSkeleton` reads one pre-ranked, pre-paginated list and returns URIs. It should be a cache read, never a query across the count store.
 
-## The dunk score
+## The upstage score
 
 Engagement for any post `p`:
 
@@ -76,13 +76,13 @@ Engagement for any post `p`:
 E(p) = likes(p) + Wr * reposts(p) + Wc * replies(p)
 ```
 
-The dunk ratio for a pair, with additive smoothing so a quote of a near-dead post cannot score infinity:
+The upstage ratio for a pair, with additive smoothing so a quote of a near-dead post cannot score infinity:
 
 ```
 D = E(Q) / (E(O) + k)
 ```
 
-A pair enters the feed when `max(E(O), E(Q)) >= P` and `D >= M`. Ranking inside the feed favours big dunks over lopsided small ones, and decays with age:
+A pair enters the feed when `max(E(O), E(Q)) >= P` and `D >= M`. Ranking inside the feed favours big upstages over lopsided small ones, and decays with age:
 
 ```
 rank = D * log10(1 + E(Q)) / (age_hours + 2) ^ 1.5
@@ -90,14 +90,14 @@ rank = D * log10(1 + E(Q)) / (age_hours + 2) ^ 1.5
 
 | Constant | Default | What moving it does |
 | --- | --- | --- |
-| `Wr` repost weight | 2.0 | Reposts are the strongest amplification signal and the hardest to fake. Raise it to favour dunks that spread |
-| `Wc` reply weight | 0.5 | Deliberately low. Replies are the noisiest signal, and a post being dunked on collects replies *because* it is being dunked on |
+| `Wr` repost weight | 2.0 | Reposts are the strongest amplification signal and the hardest to fake. Raise it to favour upstages that spread |
+| `Wc` reply weight | 0.5 | Deliberately low. Replies are the noisiest signal, and a post being upstaged collects replies *because* it is being upstaged |
 | `k` smoothing | 5 | Kills the "8 likes beats 1 like" false positive. Raise it if the feed fills with obscure pairs |
 | `P` popularity floor | 50 | The scope gate. Nothing enters the pipeline until one side of the pair clears this |
-| `M` dunk margin | 1.25 | 1.0 means any win counts. 1.25 means the quote must beat the original by a quarter |
+| `M` upstage margin | 1.25 | 1.0 means any win counts. 1.25 means the quote must beat the original by a quarter |
 | `age_hours` cap | 48 | Pairs stop being reconsidered after two days, matching the firehose retention Bluesky's own guidance assumes |
 
-**The reply-weight trap is worth naming.** A viral dunk drives traffic back to the original post, so the original's reply count climbs alongside the quote's. Weighting replies heavily therefore makes the exact posts this feed is for *harder* to qualify, because the denominator grows with the numerator. `Wc = 0.5` keeps replies as a tiebreak rather than a driver. Setting `Wc = 0` is a defensible first version.
+**The reply-weight trap is worth naming.** A viral upstage drives traffic back to the original post, so the original's reply count climbs alongside the quote's. Weighting replies heavily therefore makes the exact posts this feed is for *harder* to qualify, because the denominator grows with the numerator. `Wc = 0.5` keeps replies as a tiebreak rather than a driver. Setting `Wc = 0` is a defensible first version.
 
 **Expect to retune `P` and `M` together.** They interact: a high floor with a low margin gives a feed of big accounts mildly outperforming each other, which is boring. A low floor with a high margin gives spectacular ratios between accounts nobody has heard of. The interesting band is a moderate floor and a margin well above 1.0, and the only way to find it is to run the scorer against a day of real pairs and read the output by hand.
 
@@ -114,7 +114,7 @@ Four tables. Postgres handles all of it at this scale; Redis is worth adding onl
 
 **`counts` rows are created lazily.** The ingest worker looks up the target URI in `pairs` before touching `counts`; a miss is a no-op. This is the mechanism behind the popularity gate, so the lookup must be an in-process cache of recent pair URIs, not a database round trip per like event.
 
-**Deletes decrement.** A Jetstream event with `operation: "delete"` on a like or repost reduces the counter; a delete on a post removes its pair and evicts it from the feed. Ignoring deletes leaves the feed showing dunks of posts that no longer exist, which is both wrong and a moderation liability.
+**Deletes decrement.** A Jetstream event with `operation: "delete"` on a like or repost reduces the counter; a delete on a post removes its pair and evicts it from the feed. Ignoring deletes leaves the feed showing upstages of posts that no longer exist, which is both wrong and a moderation liability.
 
 **Local counts are an index, not the truth.** They exist to decide which of the millions of pairs deserve an App View call. A pair is only ever promoted on `getPosts` numbers, and `verified_at` records when that happened so the scorer can re-verify a stale leader rather than trust a counter that has been drifting for six hours.
 
@@ -176,21 +176,21 @@ A VM with two cores and 4 GB, plus a managed Postgres, is enough to start. Write
 
 **Hard exclusions, applied at ingest:**
 
-- `quote_did == original_did`. Quoting yourself is a thread continuation, not a dunk.
+- `quote_did == original_did`. Quoting yourself is a thread continuation, not an upstage.
 - The embed target is not an `app.bsky.feed.post`.
 - Either side deleted. Watch `operation: "delete"` and evict.
 - **Detached quotes.** An author can publish an `app.bsky.feed.postgate` record listing up to 50 `detachedEmbeddingUris` — quotes of their post they have pulled the rug on — or an `embeddingRules` entry of `disableRule` that blocks quoting outright. Subscribe to `app.bsky.feed.postgate` as a fourth collection and drop any pair whose quote URI is named there. Showing a quote its subject explicitly detached is the single worst thing this feed could do.
 - Blocks between the two accounts. The App View will not hydrate the embed, so the card renders as a stub. On verification, if the quote's `embed` comes back as a detached or blocked view, drop the pair.
 
-**Quote chains.** `Q` quotes `Q'` which quotes `O`. Score each pair against its immediate parent only. Comparing a third-order dunk against the root produces impressive ratios and incoherent cards.
+**Quote chains.** `Q` quotes `Q'` which quotes `O`. Score each pair against its immediate parent only. Comparing a third-order upstage against the root produces impressive ratios and incoherent cards.
 
 **Gaming.** The popularity floor and the `k` smoothing kill the obvious attack — quote a dead post, get eight likes, top the feed. Two caps handle the rest: at most one pair per quoting DID in any 50-item page, and at most one pair per *original* author per day. Without the first, one prolific poster owns the feed. Without the second, the feed becomes a single person's worst afternoon, rendered fifty times.
 
-**Now the part worth deciding before writing code.** A feed that ranks people by how thoroughly they were dunked on is, structurally, a pile-on amplifier. It finds the moment someone is being publicly bettered and puts it in front of an audience that came specifically for that. That is funny when the target is a brand account or a politician and ugly when it is a stranger with 200 followers.
+**Now the part worth deciding before writing code.** A feed that ranks people by how thoroughly they were upstaged is, structurally, a pile-on amplifier. It finds the moment someone is being publicly bettered and puts it in front of an audience that came specifically for that. That is funny when the target is a brand account or a politician and ugly when it is a stranger with 200 followers.
 
 Three guards, in order of how much they matter:
 
-1. **A follower floor on the original author.** If the person being dunked on has fewer than a few thousand followers, the pair does not qualify. This is the punching-down filter and it is the one that does the work. It also happens to improve the feed, because dunks on nobodies are not funny.
+1. **A follower floor on the original author.** If the person being upstaged has fewer than a few thousand followers, the pair does not qualify. This is the punching-down filter and it is the one that does the work. It also happens to improve the feed, because upstages of nobodies are not funny.
 2. **Drop pairs whose original author is deactivated, deleted or taken down.** If they left, the feed should stop.
 3. **Apply labels yourself.** The App View filters for each viewer's own labeler subscriptions, but content labelled by Bluesky's moderation service will still reach viewers who have not subscribed to the relevant labeler. Subscribe to the labeler and drop labelled pairs at the source rather than relying on downstream filtering.
 

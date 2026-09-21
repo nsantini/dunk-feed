@@ -1,4 +1,4 @@
-//! The one CSV field escaper `dunk validate` and `dunk dump` both render
+//! The one CSV field escaper `upstage validate` and `upstage dump` both render
 //! through (spec `2026-09-21-dump`, BC12). Moved out of `src/validate.rs`,
 //! which used to hold a private copy, so the two commands can never drift
 //! apart on the quoting rule.

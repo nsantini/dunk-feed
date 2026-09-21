@@ -6,7 +6,7 @@
 //! network, so it is unit tested with fixtures alone. `EventSource` is the
 //! small trait `run_ingest`'s task loop reads through; `JetstreamClient`
 //! implements it, and a test vector source drives the loop with no socket.
-//! `run` (slice 6.0) is `dunk run`'s entry point, wiring the store, the
+//! `run` (slice 6.0) is `upstage run`'s entry point, wiring the store, the
 //! writer and a real `JetstreamClient` into `run_ingest`.
 
 pub mod embed;
@@ -91,7 +91,7 @@ fn commit_uri(commit: &CommitEvent) -> String {
 /// `NotAQuote`. BC3 needs the last of those three counted separately
 /// (`Dropped::NonPostEmbed`), so this reads the embed's raw `uri` string
 /// itself to tell them apart, rather than widening `embed::detect`'s
-/// signature: `embed.rs` is `dunk validate`'s module too, and it is out of
+/// signature: `embed.rs` is `upstage validate`'s module too, and it is out of
 /// this slice's files.
 enum EmbedClass {
     Quote(AtUri),
@@ -463,7 +463,7 @@ impl Stats {
             channel_depth,
             lag_s = self.lag_s(),
             compressed,
-            "dunk: ingest stats"
+            "upstage: ingest stats"
         );
         *self = Stats::new();
     }
@@ -522,13 +522,13 @@ pub enum IngestError {
     WriterFailed,
     /// The scorer task failed. `run` (slice 6.0's counterpart for story 07)
     /// spawns the scorer alongside `run_ingest`, catches this, and it exits
-    /// `dunk run` non-zero the same way any other `IngestError` does, since
+    /// `upstage run` non-zero the same way any other `IngestError` does, since
     /// `cli.rs` already maps every `IngestError` through `CliError::Ingest`
     /// (BC35).
     #[error("scorer error: {0}")]
     Scorer(#[from] crate::scorer::ScorerError),
     /// The HTTP task failed: `crate::http::serve` could not bind
-    /// `DUNK_HTTP_ADDR` (BC23). `run` (slice 3.0) spawns the HTTP server as
+    /// `UPSTAGE_HTTP_ADDR` (BC23). `run` (slice 3.0) spawns the HTTP server as
     /// the third supervised task and wraps its `HttpError` here the same way
     /// `Scorer` wraps `ScorerError`.
     #[error("http error: {0}")]
@@ -813,7 +813,7 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-/// `dunk run`'s entry point, TECH-DESIGN section 5.1 end to end: opens
+/// `upstage run`'s entry point, TECH-DESIGN section 5.1 end to end: opens
 /// `cfg.db_path` (BC35), starts the writer wired to the eviction channel
 /// (round 1 finding 2), rebuilds the hot set from `pairs` and logs its size
 /// and the elapsed time at `info` (BC22), reads the stored cursor and
@@ -1878,8 +1878,8 @@ mod tests {
     /// reader).
     fn test_config() -> Config {
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
             _ => None,
         };
         crate::config::load(lookup).expect("test config should load")

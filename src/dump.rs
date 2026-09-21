@@ -1,9 +1,9 @@
-//! `dunk dump`, spec `2026-09-21-dump`. Reads every pair first seen inside
+//! `upstage dump`, spec `2026-09-21-dump`. Reads every pair first seen inside
 //! `--since`'s window through `Store::pairs_since` (slice 1.0), renders one
 //! CSV row per pair with the columns `spec.md`'s "Answers from the
 //! engineer" section names, and writes the file atomically. This is the
 //! tool the runbook's tuning loop reads: the operator sorts the CSV and
-//! re-fits `DUNK_P`, `DUNK_M` and the two weights against real rows.
+//! re-fits `UPSTAGE_P`, `UPSTAGE_M` and the two weights against real rows.
 //!
 //! `E` and `D` are computed here with `score::engagement` and `score::ratio`,
 //! the same functions the scorer runs, so the numbers an operator fits
@@ -18,7 +18,7 @@ use crate::score::{self, Counts, Weights};
 use crate::store::pairs::DumpRow;
 use crate::store::{Store, StoreError};
 
-/// `dunk dump`'s own errors. `main.rs` prints one line and exits 1 through
+/// `upstage dump`'s own errors. `main.rs` prints one line and exits 1 through
 /// `CliError::Dump` (BC8). `BadSince` and `OutDirMissing` carry enough
 /// context for that one line with no further lookup.
 #[derive(Debug, Error)]
@@ -73,7 +73,7 @@ pub fn parse_since(value: &str) -> Result<u64, DumpError> {
 }
 
 /// BC4: `--out`'s parent directory must already exist. `path.parent()` on a
-/// bare filename like `dunk-dump-24h.csv` returns `Some("")`, which is the
+/// bare filename like `upstage-dump-24h.csv` returns `Some("")`, which is the
 /// current directory and always exists, so that case is not rejected.
 fn check_out_dir(path: &Path) -> Result<(), DumpError> {
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
@@ -257,17 +257,17 @@ fn write_atomic(path: &Path, rows: &[DumpRow], weights: &Weights, k: f64) -> Res
     Ok(())
 }
 
-/// Runs `dunk dump` end to end. The three failure checks run in this order
+/// Runs `upstage dump` end to end. The three failure checks run in this order
 /// (BC9): `--since` is parsed first, then `--out`'s parent directory is
 /// checked, then the store is opened, so a bad `--since` is always
 /// `BadSince`, even when `cfg.db_path` is unreadable too. `out` defaults to
-/// `./dunk-dump-<since>.csv`, `<since>` the raw flag value (BC3's default
+/// `./upstage-dump-<since>.csv`, `<since>` the raw flag value (BC3's default
 /// lives in `cli.rs`; this default serves a caller that passes `None`
 /// directly). Reads go through `Store::pairs_since`, which uses the
 /// read-only connection (BC21): `dump` never writes to the database.
 pub fn run(cfg: &Config, since: &str, out: Option<PathBuf>) -> Result<DumpSummary, DumpError> {
     let offset_s = parse_since(since)?;
-    let out_path = out.unwrap_or_else(|| PathBuf::from(format!("./dunk-dump-{since}.csv")));
+    let out_path = out.unwrap_or_else(|| PathBuf::from(format!("./upstage-dump-{since}.csv")));
     check_out_dir(&out_path)?;
 
     let store = Store::open(cfg)?;
@@ -321,12 +321,12 @@ mod tests {
     }
 
     // BC9: a bad `--since` is reported before the store ever opens. A
-    // `DUNK_DB_PATH` naming a directory that does not exist proves it: if
+    // `UPSTAGE_DB_PATH` naming a directory that does not exist proves it: if
     // `run` reached `Store::open` first, this would be a `StoreError`
     // wrapped in `DumpError::Store`, not `BadSince`.
     #[test]
     fn malformed_since_never_opens_the_store() {
-        let cfg = test_config("/no/such/directory/dunk.db");
+        let cfg = test_config("/no/such/directory/upstage.db");
         let result = run(&cfg, "nope", None);
         match result {
             Err(DumpError::BadSince { value }) => assert_eq!(value, "nope"),
@@ -338,7 +338,7 @@ mod tests {
     // opens too.
     #[test]
     fn missing_out_dir_fails_before_store_opens() {
-        let cfg = test_config("/no/such/directory/dunk.db");
+        let cfg = test_config("/no/such/directory/upstage.db");
         let out = PathBuf::from("/no/such/out/dir/dump.csv");
         let result = run(&cfg, "24h", Some(out.clone()));
         match result {
@@ -354,7 +354,7 @@ mod tests {
     /// A fresh, unique SQLite file path under the OS temp directory, and a
     /// migrated connection to it: `run` opens its own `Store` against the
     /// same path, so seeding through a second connection and reading it
-    /// back through `dunk dump`'s own code path is exactly what an operator
+    /// back through `upstage dump`'s own code path is exactly what an operator
     /// does against a real database.
     struct TestDb {
         path: PathBuf,
@@ -363,8 +363,8 @@ mod tests {
     impl TestDb {
         fn new() -> Self {
             let id = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("dunk-dump-test-{}-{id}.db", std::process::id()));
+            let path = std::env::temp_dir()
+                .join(format!("upstage-dump-test-{}-{id}.db", std::process::id()));
             let conn = rusqlite::Connection::open(&path).expect("open test db");
             crate::store::schema::migrate(&conn).expect("migrate test db");
             TestDb { path }
@@ -389,9 +389,9 @@ mod tests {
 
     fn test_config(db_path: &str) -> Config {
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
-            "DUNK_DB_PATH" => Some(db_path.to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_DB_PATH" => Some(db_path.to_string()),
             _ => None,
         };
         crate::config::load(lookup).expect("minimal config loads")
@@ -399,7 +399,8 @@ mod tests {
 
     fn temp_csv_path(name: &str) -> PathBuf {
         let id = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("dunk-dump-test-{name}-{}-{id}.csv", std::process::id()))
+        std::env::temp_dir()
+            .join(format!("upstage-dump-test-{name}-{}-{id}.csv", std::process::id()))
     }
 
     fn insert_pair(conn: &rusqlite::Connection, quote_uri: &str, original_uri: &str, at: i64) {
@@ -698,7 +699,7 @@ mod tests {
         }
     }
 
-    // The default `--out` path is `./dunk-dump-<since>.csv` for the value
+    // The default `--out` path is `./upstage-dump-<since>.csv` for the value
     // passed, when the caller passes `None`. This runs against the real
     // process working directory rather than switching it, since
     // `std::env::set_current_dir` is process-global and would race other
@@ -708,7 +709,7 @@ mod tests {
     fn default_out_path_uses_the_since_value() {
         let db = TestDb::new();
         let cfg = test_config(&db.path_str());
-        let expected = PathBuf::from("./dunk-dump-71h.csv"); // an unlikely-to-collide since value
+        let expected = PathBuf::from("./upstage-dump-71h.csv"); // an unlikely-to-collide since value
 
         let summary = run(&cfg, "71h", None).expect("run succeeds");
 

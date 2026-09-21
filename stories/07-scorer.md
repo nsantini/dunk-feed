@@ -7,7 +7,7 @@
 
 ## Outcome
 
-After this ships, the `scorer` task runs every `DUNK_SCORER_INTERVAL_S`,
+After this ships, the `scorer` task runs every `UPSTAGE_SCORER_INTERVAL_S`,
 selects dirty candidate pairs, verifies them against the App View,
 promotes or drops them, re-verifies young promoted pairs, expires old
 rows, and swaps a fresh ranked snapshot into `Arc<RwLock<Arc<Vec<FeedItem>>>>`.
@@ -19,7 +19,7 @@ ordered by the caps in §7.3, and every pass logs its own counters.
 - Does not serve HTTP; story 08 reads the snapshot.
 - Does not implement the follower-floor, author-state, or label guards;
   `guards.rs` here is a stub, replaced by story 10.
-- Does not implement `dunk dump`; story 12.
+- Does not implement `upstage dump`; story 12.
 - Does not tune `P`, `M`, or the weights; only reads config.
 
 ## Approach
@@ -49,7 +49,7 @@ fills with stale items nor ages 30-day items out overnight.
 |---|---|---|---|
 | BC1 | select | `candidate` pair, `first_seen_at` within 48h, either side dirty | Included; local `E` computed both sides; `dirty` cleared on read |
 | BC2 | select, prefilter | `max(E_local) < P*fraction` or `D_local < M*fraction` | Excluded from this pass's App View calls |
-| BC3 | verify batch | `Q` and `O` URIs | Batched 25 per `getPosts` call, capped at `DUNK_APPVIEW_RPS` |
+| BC3 | verify batch | `Q` and `O` URIs | Batched 25 per `getPosts` call, capped at `UPSTAGE_APPVIEW_RPS` |
 | BC4 | `Q.embed` view | `app.bsky.embed.record#view`, `record.$type == #viewRecord` | Normal quote, continue |
 | BC5 | `Q.embed` view | `recordWithMedia#view`, nested `record.record.$type == #viewRecord` | Normal quote with media, continue |
 | BC6 | `Q.embed` view | `record.$type == #viewDetached` | Drop, reason `detached` |
@@ -59,10 +59,10 @@ fills with stale items nor ages 30-day items out overnight.
 | BC10 | `getPosts` response | a requested URI missing | Drop, reason `quote_gone` (`Q` missing) or `original_gone` (`O` missing) |
 | BC11 | promote | qualifies on verified counts, passes the guard stub | Upsert `feed`, `pairs.state = 'promoted'` |
 | BC12 | drop | fails a hard check | `pairs.state = 'dropped'` with the reason; `feed` row deleted if present |
-| BC13 | re-verify | every `DUNK_REVERIFY_INTERVAL_S`, promoted pairs within 48h | Re-runs verify, guard, promote; a pair no longer qualifying is demoted to `candidate`, its `feed` row deleted |
+| BC13 | re-verify | every `UPSTAGE_REVERIFY_INTERVAL_S`, promoted pairs within 48h | Re-runs verify, guard, promote; a pair no longer qualifying is demoted to `candidate`, its `feed` row deleted |
 | BC14 | re-verify, boundary | promoted pair older than 48h | Never re-verified again; counts freeze; rank keeps recomputing (D9) |
-| BC15 | expire | `candidate`/`dropped` pairs older than `DUNK_CANDIDATE_TTL_H` | Deleted with their `counts` rows; URIs removed from the hot set |
-| BC16 | expire | `feed` rows older than `DUNK_FEED_TTL_D` | Deleted with their `pairs` rows |
+| BC15 | expire | `candidate`/`dropped` pairs older than `UPSTAGE_CANDIDATE_TTL_H` | Deleted with their `counts` rows; URIs removed from the hot set |
+| BC16 | expire | `feed` rows older than `UPSTAGE_FEED_TTL_D` | Deleted with their `pairs` rows |
 | BC17 | ordering, base | sort | `feed` sorted by `rank DESC, quote_cid ASC` |
 | BC18 | cap 1, one per original author per day | grouping | Group by `(original_did, day of quoted_at)`; keep only the top-rank item per group |
 | BC19 | cap 2, one per quoting DID per 50 items | boundary | If the quoter appeared in the last 49 kept items, defer to the first spot where it does not; items deferred past the end are dropped |

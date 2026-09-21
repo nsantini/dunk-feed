@@ -311,7 +311,7 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    const FEED_URI: &str = "at://did:plc:abc/app.bsky.feed.generator/dunks";
+    const FEED_URI: &str = "at://did:plc:abc/app.bsky.feed.generator/upstaged";
 
     fn item(quote_uri: &str, quote_cid: &str, rank: f64, ratio: f64) -> FeedItem {
         FeedItem { quote_uri: quote_uri.to_string(), quote_cid: quote_cid.to_string(), rank, ratio }

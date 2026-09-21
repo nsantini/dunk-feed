@@ -1,4 +1,4 @@
-# Dunk Feed runbook
+# Upstaged runbook
 
 This runbook is for an operator. It does not assume you have read the Rust
 source. It covers deploy, logs, backup, upgrade, tuning, and every failure
@@ -15,7 +15,7 @@ You need these before you start.
 ## Bluesky account setup
 
 Do this before the first deploy. It gives you the DID that `.env` needs and
-the app password that `dunk publish` needs.
+the app password that `upstage publish` needs.
 
 The account is the feed's public identity. The feed shows up under it in the
 Bluesky app, with its handle and its avatar.
@@ -31,44 +31,44 @@ Bluesky app, with its handle and its avatar.
 
    The answer is `{"did":"did:plc:..."}`. Copy that DID.
 5. Keep the DID, the handle and the app password. "First deploy" step 2
-   puts them in `.env`, as `DUNK_PUBLISHER_DID`, `BSKY_HANDLE` and
+   puts them in `.env`, as `UPSTAGE_PUBLISHER_DID`, `BSKY_HANDLE` and
    `BSKY_APP_PASSWORD`.
 
-`DUNK_PUBLISHER_DID` holds the DID and not the handle, because a handle can
+`UPSTAGE_PUBLISHER_DID` holds the DID and not the handle, because a handle can
 change. The at-URI of the feed must not change.
 
 `publish` compares the DID of the account it signs in as against
-`DUNK_PUBLISHER_DID`. A difference fails the command with a DID mismatch
+`UPSTAGE_PUBLISHER_DID`. A difference fails the command with a DID mismatch
 error, and no record is written.
 
 ### The two DIDs
 
-Dunk Feed uses two DIDs. They do different jobs and they are not
+Upstaged uses two DIDs. They do different jobs and they are not
 interchangeable.
 
 | DID | Where it comes from | What it identifies |
 |-----|--------------------|--------------------|
-| `did:plc:...`, in `DUNK_PUBLISHER_DID` | Your Bluesky account | The owner of the feed record |
-| `did:web:<hostname>`, built from `DUNK_HOSTNAME` | Your public hostname | The server that computes the feed |
+| `did:plc:...`, in `UPSTAGE_PUBLISHER_DID` | Your Bluesky account | The owner of the feed record |
+| `did:web:<hostname>`, built from `UPSTAGE_HOSTNAME` | Your public hostname | The server that computes the feed |
 
 The published record lives in the account's repository, and its own `did`
 field holds `did:web:<hostname>`. This field is the pointer from Bluesky to
 your VM. The server answers for that identity at `/.well-known/did.json`.
 
 The feed's at-URI is
-`at://<DUNK_PUBLISHER_DID>/app.bsky.feed.generator/<DUNK_FEED_RKEY>`.
+`at://<UPSTAGE_PUBLISHER_DID>/app.bsky.feed.generator/<UPSTAGE_FEED_RKEY>`.
 Bluesky sends this URI in every feed request. The server serves only this one
 URI and refuses every other.
 
 ## First deploy
 
 1. Copy `.env.example` to `.env`.
-2. Fill in `DUNK_HOSTNAME` and `DUNK_PUBLISHER_DID`. These are the only two
+2. Fill in `UPSTAGE_HOSTNAME` and `UPSTAGE_PUBLISHER_DID`. These are the only two
    required variables. `src/config.rs` rejects the container start when
    either one is empty or holds only whitespace.
 
    Three more variables have no default but are optional: `BSKY_HANDLE`
-   and `BSKY_APP_PASSWORD`, needed only when you run `dunk publish`, and
+   and `BSKY_APP_PASSWORD`, needed only when you run `upstage publish`, and
    `TUNNEL_TOKEN`, needed only for the tunnel variant.
 3. Pick one Compose file. Use `compose.yaml` for a Cloudflare Tunnel. Use
    `compose.proxied.yaml` for Cloudflare's proxied DNS with port 3000
@@ -77,7 +77,7 @@ URI and refuses every other.
 5. Watch `/healthz` turn from 503 to 200. See "Health states" below for the
    two bodies.
 
-Both Compose files use the same `dunk-data` volume and the same Compose
+Both Compose files use the same `upstage-data` volume and the same Compose
 project name. Do not run both variants at once against the same project;
 they would share one database and one set of container names.
 
@@ -86,7 +86,7 @@ they would share one database and one set of container names.
 Run this once, after the container is healthy:
 
 ```
-docker compose -f <file> run --rm dunk publish
+docker compose -f <file> run --rm upstage publish
 ```
 
 Set `BSKY_HANDLE` and `BSKY_APP_PASSWORD` in `.env` first. `publish` needs
@@ -96,7 +96,7 @@ both. See "Bluesky account setup" above for both values.
 
 `publish` writes one record and then stops. The record is one
 `app.bsky.feed.generator` in your account's repository, under the record key
-`DUNK_FEED_RKEY`, `dunks` by default. It goes to `https://bsky.social`, not
+`UPSTAGE_FEED_RKEY`, `upstaged` by default. It goes to `https://bsky.social`, not
 to the App View.
 
 `publish` does not send posts or feed content to Bluesky. The container
@@ -110,25 +110,25 @@ changes them.
 The command writes the record unconditionally, so you can run it again. A
 second run replaces the record, which is how you add or change the avatar.
 
-`ENTRYPOINT` in the image is `dunk`. `publish` replaces the default command,
+`ENTRYPOINT` in the image is `upstage`. `publish` replaces the default command,
 so `run` does not start while this command runs.
 
 To publish with an avatar, add `--avatar <path>`. The path must be visible
 inside the container, not just on the host. Add a read-only bind mount to
-the `dunk` service for the one run, for example:
+the `upstage` service for the one run, for example:
 
 ```
-docker compose -f <file> run --rm -v /home/you/avatar.png:/avatar.png:ro dunk publish --avatar /avatar.png
+docker compose -f <file> run --rm -v /home/you/avatar.png:/avatar.png:ro upstage publish --avatar /avatar.png
 ```
 
 Pass the container path, `/avatar.png`, not the host path.
 
 ## Reading the logs
 
-Dunk Feed logs JSON lines to stdout. `docker compose -f <file> logs -f dunk`
+Upstaged logs JSON lines to stdout. `docker compose -f <file> logs -f upstage`
 shows them. Three lines matter.
 
-### `dunk: ingest stats`
+### `upstage: ingest stats`
 
 Logged every 60 seconds by the ingest task. No line appears at all for the
 first minute after start. If you grep for it right after `up -d` and find
@@ -141,7 +141,7 @@ nothing, that is not a fault. Fields:
 | `ops_per_s` | Store operations applied per second, by kind, over the window |
 | `gate_hit_rate` | Share of like and repost creates that passed the gate and produced an increment |
 | `postgate_detaches` | Detach operations applied in the window |
-| `dropped_unknown_collection` | Commits dropped because their collection is not one Dunk Feed tracks |
+| `dropped_unknown_collection` | Commits dropped because their collection is not one Upstaged tracks |
 | `dropped_self_quote` | Commits dropped because a quote post quotes its own author |
 | `dropped_non_post_embed` | Commits dropped because the embed is not a quote of a post |
 | `channel_depth` | Events waiting in the ingest-to-writer channel at the moment this line was logged |
@@ -167,7 +167,7 @@ Logged once per scorer pass. Fields:
 | `demoted` | Feed rows that fell back below the score threshold and left the feed |
 | `dropped` | Candidates dropped this pass, summed across every reason |
 | `dropped_by_reason` | The same total, broken out by reason. See the table below |
-| `expired` | Feed rows removed for age, past `DUNK_FEED_TTL_D` |
+| `expired` | Feed rows removed for age, past `UPSTAGE_FEED_TTL_D` |
 | `snapshot_len` | Rows in the feed snapshot after this pass |
 | `duration_ms` | Wall time the pass took, in milliseconds |
 
@@ -185,14 +185,14 @@ nested JSON object. A JSON query tool reads it as a string.
 | `original_gone` | The quoted, original post no longer exists |
 | `detached` | The quote was detached from the original |
 | `blocked` | A block exists between the two authors |
-| `labelled` | A label in `DUNK_DROP_LABELS` was found on the quote, on the original, or on either author's profile |
+| `labelled` | A label in `UPSTAGE_DROP_LABELS` was found on the quote, on the original, or on either author's profile |
 | `author_inactive` | The author's account is deactivated or deleted, or the original's author carries a `!takedown` label |
-| `follower_floor` | The author's follower count is under `DUNK_FOLLOWER_FLOOR` |
+| `follower_floor` | The author's follower count is under `UPSTAGE_FOLLOWER_FLOOR` |
 
 ### `scorer: guard histogram period follower distribution`
 
 Logged once per pass, but only while the follower-floor histogram period is
-open. It stops after `DUNK_GUARD_HISTOGRAM_H` hours from start. The follower
+open. It stops after `UPSTAGE_GUARD_HISTOGRAM_H` hours from start. The follower
 floor itself still drops candidates from the first pass onward, with or
 without this line. Fields: `guard_would_drop`, and six follower-count
 buckets: `zero`, `one_to_99`, `hundred_to_999`, `thousand_to_9999`,
@@ -204,14 +204,14 @@ Back up the SQLite file nightly, from the host, against the named volume,
 in a one-off container:
 
 ```
-docker run --rm -v dunk-feed_dunk-data:/data -v /var/backups/dunk:/backup alpine/sqlite /data/dunk.db ".backup '/backup/dunk.db'"
+docker run --rm -v upstage-feed_upstage-data:/data -v /var/backups/upstage:/backup alpine/sqlite /data/upstage.db ".backup '/backup/upstage.db'"
 ```
 
 Confirm the volume's real name first, with `docker volume ls`. Compose
 prefixes the volume name with the project name, so it may not be exactly
-`dunk-feed_dunk-data`.
+`upstage-feed_upstage-data`.
 
-This does not run as `docker compose exec dunk sqlite3 ...`. The runtime
+This does not run as `docker compose exec upstage sqlite3 ...`. The runtime
 image carries no `sqlite3` binary. Adding one would cost image size the
 40 MB cap does not have to spare.
 
@@ -233,7 +233,7 @@ resumes with no gap. A restart over 36 hours loses the events in between,
 because Jetstream's own retention window ends at 36 hours.
 
 `compose.yaml` pins `cloudflared` to a specific tag, `2026.9.1` today,
-instead of `latest`. This keeps an unrelated upgrade, such as a Dunk Feed
+instead of `latest`. This keeps an unrelated upgrade, such as an Upstaged
 code change, from also pulling a new `cloudflared` release. To bump the
 pin, check the current release on Docker Hub, edit the tag in
 `compose.yaml`, then run `docker compose -f compose.yaml up -d --build` as
@@ -246,24 +246,24 @@ Each of these lives in `.env`. A change needs `docker compose -f <file> up
 
 | Variable | Raising it | Lowering it |
 |----------|------------|-------------|
-| `DUNK_P` | Requires a more popular original post before a pair can score | Lets less popular original posts score |
-| `DUNK_M` | Requires the quote to beat the original by a wider margin | Lets a smaller margin promote a pair |
-| `DUNK_W_REPOST` | Weighs each repost more heavily in the score | Weighs each repost less heavily |
-| `DUNK_W_REPLY` | Weighs each reply more heavily in the score | Weighs each reply less heavily |
-| `DUNK_K` | Smooths the score more, damping small engagement counts further | Smooths the score less |
-| `DUNK_FOLLOWER_FLOOR` | Requires more followers before an author's post can score. `0` disables the guard | Lets authors with fewer followers score |
-| `DUNK_GUARD_HISTOGRAM_H` | Keeps the follower-distribution log line running longer after start | Stops the log line sooner. `0` disables the period; the floor stays live regardless |
-| `DUNK_SCORER_INTERVAL_S` (default 60) | Runs the scorer pass less often, using less CPU but leaving new candidates unscored longer | Runs the pass more often, scoring candidates sooner but using more CPU. Raise `DUNK_HEALTH_MAX_LAG_S` above the new value too, or `/healthz` flips unhealthy between passes |
-| `DUNK_REVERIFY_INTERVAL_S` (default 600) | Re-checks promoted pairs against the App View less often, using fewer App View calls but catching a block or a takedown later | Re-checks more often, catching a block or a takedown sooner but using more App View calls |
-| `DUNK_HEALTH_MAX_LAG_S` (default 300) | Tolerates a longer gap since the last Jetstream commit or scorer pass before `/healthz` turns 503, so a slow patch is less likely to trip your monitoring | Tolerates a shorter gap, so `/healthz` catches a stall sooner but is more likely to flip on a normal slow pass |
+| `UPSTAGE_P` | Requires a more popular original post before a pair can score | Lets less popular original posts score |
+| `UPSTAGE_M` | Requires the quote to beat the original by a wider margin | Lets a smaller margin promote a pair |
+| `UPSTAGE_W_REPOST` | Weighs each repost more heavily in the score | Weighs each repost less heavily |
+| `UPSTAGE_W_REPLY` | Weighs each reply more heavily in the score | Weighs each reply less heavily |
+| `UPSTAGE_K` | Smooths the score more, damping small engagement counts further | Smooths the score less |
+| `UPSTAGE_FOLLOWER_FLOOR` | Requires more followers before an author's post can score. `0` disables the guard | Lets authors with fewer followers score |
+| `UPSTAGE_GUARD_HISTOGRAM_H` | Keeps the follower-distribution log line running longer after start | Stops the log line sooner. `0` disables the period; the floor stays live regardless |
+| `UPSTAGE_SCORER_INTERVAL_S` (default 60) | Runs the scorer pass less often, using less CPU but leaving new candidates unscored longer | Runs the pass more often, scoring candidates sooner but using more CPU. Raise `UPSTAGE_HEALTH_MAX_LAG_S` above the new value too, or `/healthz` flips unhealthy between passes |
+| `UPSTAGE_REVERIFY_INTERVAL_S` (default 600) | Re-checks promoted pairs against the App View less often, using fewer App View calls but catching a block or a takedown later | Re-checks more often, catching a block or a takedown sooner but using more App View calls |
+| `UPSTAGE_HEALTH_MAX_LAG_S` (default 300) | Tolerates a longer gap since the last Jetstream commit or scorer pass before `/healthz` turns 503, so a slow patch is less likely to trip your monitoring | Tolerates a shorter gap, so `/healthz` catches a stall sooner but is more likely to flip on a normal slow pass |
 
-### Tuning with `dunk dump`
+### Tuning with `upstage dump`
 
-`dunk dump --since 24h --out pairs.csv` writes one CSV row for every pair
+`upstage dump --since 24h --out pairs.csv` writes one CSV row for every pair
 first seen in the last 24 hours, in all three states: `candidate`,
 `promoted` and `dropped`. `--since` takes a number and a unit, `h` or `d`,
 for example `7d` for seven days. `--out` defaults to
-`./dunk-dump-<since>.csv` when you leave it out.
+`./upstage-dump-<since>.csv` when you leave it out.
 
 Each row carries the pair's local counts from `counts`, its verified
 counts from `feed` when it has a `feed` row, and `E` and `D` recomputed
@@ -272,10 +272,10 @@ spreadsheet and sort by these columns to re-fit each knob:
 
 | Knob | Env var | Sort by |
 |------|---------|---------|
-| `P` | `DUNK_P` | The larger of `verified_e_q` and `verified_e_o`, over rows where `state` is `promoted` |
-| `M` | `DUNK_M` | `verified_d`, over rows where `state` is `promoted` |
-| Repost weight | `DUNK_W_REPOST` | `reposts_q` and `reposts_o` against `local_e_q` and `local_e_o` |
-| Reply weight | `DUNK_W_REPLY` | `replies_q` and `replies_o` against `local_e_q` and `local_e_o` |
+| `P` | `UPSTAGE_P` | The larger of `verified_e_q` and `verified_e_o`, over rows where `state` is `promoted` |
+| `M` | `UPSTAGE_M` | `verified_d`, over rows where `state` is `promoted` |
+| Repost weight | `UPSTAGE_W_REPOST` | `reposts_q` and `reposts_o` against `local_e_q` and `local_e_o` |
+| Reply weight | `UPSTAGE_W_REPLY` | `replies_q` and `replies_o` against `local_e_q` and `local_e_o` |
 
 After you pick new values, edit `.env` and restart the container, as the
 "Tuning knobs" table above describes. No code change is needed.
@@ -290,13 +290,13 @@ Each subsection says what you see and what to do.
 
 ### One Jetstream host down
 
-The client rotates to the next host in `DUNK_JETSTREAM_URL` within one
+The client rotates to the next host in `UPSTAGE_JETSTREAM_URL` within one
 backoff step. You see no `/healthz` change. No action needed.
 
 ### All Jetstream hosts down
 
 Ingest backs off and retries. `/healthz` turns 503 after `lag_s` passes
-`DUNK_HEALTH_MAX_LAG_S`, 300 seconds by default. The feed keeps serving its
+`UPSTAGE_HEALTH_MAX_LAG_S`, 300 seconds by default. The feed keeps serving its
 last snapshot while this happens. Check Jetstream's own status. No action
 on the container is needed until Jetstream recovers.
 
@@ -314,7 +314,7 @@ checkpoint. Free disk space on the volume, or the restart loop repeats.
 
 ### A task panicking under the task supervisor
 
-`dunk run` supervises the ingest, scorer and HTTP tasks in one task
+`upstage run` supervises the ingest, scorer and HTTP tasks in one task
 supervisor. A panicking task becomes a logged error, never a re-panic, so
 the writer still flushes. The first task to stop flips a shutdown signal;
 the others are awaited and logged; the process exits with the first error
@@ -332,10 +332,10 @@ restart's gap.
 
 | Contract | Condition | What you see | What you do |
 |----------|-----------|---------------|--------------|
-| BC1 | The `/data` volume is missing at container start | `DUNK_DB_PATH` write fails fast, the process exits non-zero | Docker's restart policy retries. Check that the volume is declared and attached |
+| BC1 | The `/data` volume is missing at container start | `UPSTAGE_DB_PATH` write fails fast, the process exits non-zero | Docker's restart policy retries. Check that the volume is declared and attached |
 | BC2 | `/healthz` returns 503 | Docker marks the container unhealthy after 3 failed checks | This is not a restart on its own. Read the logs and the "Health states" section below, then act |
 | BC3 | `/healthz` returns 200 | Docker marks the container healthy | No action |
-| BC4 | `TUNNEL_TOKEN` is missing or empty, tunnel variant | `cloudflared` exits non-zero immediately | `dunk` keeps running, reachable only on the Compose network. Set `TUNNEL_TOKEN` in `.env` and restart `cloudflared` |
+| BC4 | `TUNNEL_TOKEN` is missing or empty, tunnel variant | `cloudflared` exits non-zero immediately | `upstage` keeps running, reachable only on the Compose network. Set `TUNNEL_TOKEN` in `.env` and restart `cloudflared` |
 | BC5 | Port 3000 is unreachable from outside, proxied variant | No response from the public hostname | Check the VM firewall and Cloudflare's proxy status. This is not a container-level failure |
 | BC6 | Container memory use reaches 512 MB | Docker's `mem_limit` kills the container, `restart: unless-stopped` starts it again | The Jetstream cursor makes the restart gapless within 36 hours, per the upgrade section above. No action needed unless it repeats |
 
@@ -346,10 +346,10 @@ restart's gap.
 **Before the first Jetstream commit and the first scorer pass:** 503, body
 `{"jetstream_lag_s":null,"last_pass_age_s":null,"snapshot_len":0}`.
 
-**In steady state, both ages at or under `DUNK_HEALTH_MAX_LAG_S`:** 200,
+**In steady state, both ages at or under `UPSTAGE_HEALTH_MAX_LAG_S`:** 200,
 body `{"jetstream_lag_s":<int>,"last_pass_age_s":<int>,"snapshot_len":<int>}`.
 
-Either age passing `DUNK_HEALTH_MAX_LAG_S` (300 seconds by default) returns
+Either age passing `UPSTAGE_HEALTH_MAX_LAG_S` (300 seconds by default) returns
 the service to 503, with the same body shape and real integers, not `null`.
 
 The first scorer pass runs at start, not one interval later, so on a fresh
@@ -359,8 +359,8 @@ against an existing database, where the first pass has real work to do,
 and for a slow first Jetstream commit. A check that fails inside
 `start_period` does not count toward `retries`, so a generous value costs
 nothing. A container still unhealthy after two minutes has a real
-problem; read the logs. If you raise `DUNK_SCORER_INTERVAL_S`, raise
-`DUNK_HEALTH_MAX_LAG_S` above it, or the container flips unhealthy between
+problem; read the logs. If you raise `UPSTAGE_SCORER_INTERVAL_S`, raise
+`UPSTAGE_HEALTH_MAX_LAG_S` above it, or the container flips unhealthy between
 passes. `last_pass_age_s` climbs to one full scorer interval between
 passes, so a scorer interval above the threshold trips `/healthz` every
 time.
@@ -371,20 +371,20 @@ time.
 
 1. Create the tunnel in the Cloudflare dashboard.
 2. Copy the tunnel token into `TUNNEL_TOKEN` in `.env`.
-3. Set the tunnel's public hostname to `http://dunk:3000`. This is the
+3. Set the tunnel's public hostname to `http://upstage:3000`. This is the
    Compose service name and port, not a host address.
 
 ### Proxied variant, `compose.proxied.yaml`
 
-1. Create an orange-cloud A record for `DUNK_HOSTNAME`, pointing at the
+1. Create an orange-cloud A record for `UPSTAGE_HOSTNAME`, pointing at the
    VM's public IP.
-2. Set the TLS mode to Flexible. The origin, the `dunk` container, serves
+2. Set the TLS mode to Flexible. The origin, the `upstage` container, serves
    plain HTTP. Full and Full (strict) do not apply here, because there is
    no TLS certificate on the origin.
 3. Restrict the VM firewall to Cloudflare's published IP ranges. Flexible
    TLS leaves the leg between Cloudflare and the VM unencrypted, so only
    Cloudflare's own IPs should reach port 3000.
 
-In both variants, `DUNK_HOSTNAME` must match the Cloudflare hostname
+In both variants, `UPSTAGE_HOSTNAME` must match the Cloudflare hostname
 exactly. It forms `did:web:<hostname>`, and the feed breaks if the two
 differ.

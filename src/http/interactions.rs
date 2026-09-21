@@ -199,7 +199,7 @@ mod tests {
     async fn req_id_reaches_the_written_row() {
         let nanos =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("dunk-interactions-reqid-{nanos}.sqlite3"));
+        let path = std::env::temp_dir().join(format!("upstage-interactions-reqid-{nanos}.sqlite3"));
         let path_str = path.to_str().unwrap().to_string();
 
         let cfg = test_config("127.0.0.1:0");
@@ -249,7 +249,7 @@ mod tests {
         let nanos =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path =
-            std::env::temp_dir().join(format!("dunk-interactions-reqid-absent-{nanos}.sqlite3"));
+            std::env::temp_dir().join(format!("upstage-interactions-reqid-absent-{nanos}.sqlite3"));
         let path_str = path.to_str().unwrap().to_string();
 
         let cfg = test_config("127.0.0.1:0");

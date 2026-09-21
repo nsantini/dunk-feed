@@ -1,4 +1,4 @@
-//! `dunk publish`, TECH-DESIGN section 11.2: writes the
+//! `upstage publish`, TECH-DESIGN section 11.2: writes the
 //! `app.bsky.feed.generator` record. A preflight reads `BSKY_HANDLE`,
 //! `BSKY_APP_PASSWORD` and an optional avatar file before any network call
 //! (BC1, BC2, BC3, BC4, BC5), `record_body` builds the record as a pure
@@ -10,7 +10,7 @@
 //! shape `src/scorer/mod.rs`'s `PostSource` uses over `AppViewClient`,
 //! rather than an injectable base URL plus a test HTTP server: the crate has
 //! no `axum`-based test-server dependency for unit tests, and the trait lets
-//! a fake assert `put_record` was never called. Never run from `dunk run`
+//! a fake assert `put_record` was never called. Never run from `upstage run`
 //! (TECH-DESIGN section 11.2); a separate manual step.
 
 use std::future::Future;
@@ -31,13 +31,13 @@ pub const BSKY_PDS_URL: &str = "https://bsky.social";
 
 /// The feed's own `displayName`, fixed per the engineer's answer (BC15): no
 /// tone, sentiment or keyword wording (TECH-DESIGN D10).
-pub const DISPLAY_NAME: &str = "Out-Quoted";
+pub const DISPLAY_NAME: &str = "Upstaged";
 
 /// The feed's own `description`, fixed per the engineer's answer (BC15): no
 /// tone, sentiment or keyword wording (TECH-DESIGN D10).
 pub const DESCRIPTION: &str = "Quote posts that got more engagement than the post they quoted.";
 
-/// Every way `dunk publish` can fail. `main.rs` prints this and exits 1. No
+/// Every way `upstage publish` can fail. `main.rs` prints this and exits 1. No
 /// variant carries `accessJwt` or `BSKY_APP_PASSWORD` (BC11): `Auth`,
 /// `Upload` and `PutRecord` carry only the server's own status and body
 /// text, never a request header or the credentials that built one.
@@ -58,7 +58,7 @@ pub enum PublishError {
     #[error("createSession failed, status {status}: {body}")]
     Auth { status: u16, body: String },
     #[error(
-        "createSession returned did {session_did}, but DUNK_PUBLISHER_DID is {configured_did}"
+        "createSession returned did {session_did}, but UPSTAGE_PUBLISHER_DID is {configured_did}"
     )]
     DidMismatch { session_did: String, configured_did: String },
     #[error("uploadBlob failed, status {status}: {body}")]
@@ -224,7 +224,7 @@ pub fn validate_blob(response: &UploadResponse) -> Result<Value, PublishError> {
     Ok(blob.clone())
 }
 
-/// The PDS surface `dunk publish` needs: session creation, blob upload and
+/// The PDS surface `upstage publish` needs: session creation, blob upload and
 /// record write. A trait rather than an injectable base URL plus a test HTTP
 /// server, per `## Approach` in `spec.md`: the crate has no HTTP test server
 /// dependency, and `HttpPdsClient` is the one real implementation;
@@ -390,7 +390,7 @@ pub async fn publish_with(
     Ok(cfg.feed_uri())
 }
 
-/// `dunk publish`'s entry point. `preflight` runs first, so a missing
+/// `upstage publish`'s entry point. `preflight` runs first, so a missing
 /// credential or a missing/unsupported avatar file stops the run before
 /// [`HttpPdsClient::new`] is even built (BC1, BC2) and before any network is
 /// reachable.
@@ -408,7 +408,7 @@ mod tests {
     use std::sync::Mutex;
 
     fn required_pairs() -> Vec<(&'static str, &'static str)> {
-        vec![("DUNK_HOSTNAME", "feed.example.com"), ("DUNK_PUBLISHER_DID", "did:plc:abc")]
+        vec![("UPSTAGE_HOSTNAME", "feed.example.com"), ("UPSTAGE_PUBLISHER_DID", "did:plc:abc")]
     }
 
     fn config_with(extra: &[(&str, &str)]) -> Config {
@@ -421,7 +421,7 @@ mod tests {
 
     fn creds() -> Credentials {
         Credentials {
-            handle: "dunk.bsky.social".to_string(),
+            handle: "upstage.bsky.social".to_string(),
             app_password: Secret::new("app-pass".to_string()),
         }
     }
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn missing_app_password_fails() {
         // BC1: handle present, password absent.
-        let cfg = config_with(&[("BSKY_HANDLE", "dunk.bsky.social")]);
+        let cfg = config_with(&[("BSKY_HANDLE", "upstage.bsky.social")]);
         let err = preflight(&cfg, None).unwrap_err();
         match err {
             PublishError::MissingCredentials { var } => assert_eq!(var, "BSKY_APP_PASSWORD"),
@@ -472,9 +472,11 @@ mod tests {
         // only the avatar check can stop this. It goes through `run`, not
         // `preflight`, for the same reason as `missing_credentials_fails_fast`:
         // it proves `run` checks the file before it builds a client.
-        let cfg =
-            config_with(&[("BSKY_HANDLE", "dunk.bsky.social"), ("BSKY_APP_PASSWORD", "app-pass")]);
-        let path = std::env::temp_dir().join("dunk-publish-test-no-such-avatar.png");
+        let cfg = config_with(&[
+            ("BSKY_HANDLE", "upstage.bsky.social"),
+            ("BSKY_APP_PASSWORD", "app-pass"),
+        ]);
+        let path = std::env::temp_dir().join("upstage-publish-test-no-such-avatar.png");
         let _ = std::fs::remove_file(&path);
         let err = run(&cfg, Some(&path)).await.unwrap_err();
         match err {
@@ -497,8 +499,10 @@ mod tests {
     #[test]
     fn no_avatar_flag_reads_no_file_and_returns_none() {
         // BC3.
-        let cfg =
-            config_with(&[("BSKY_HANDLE", "dunk.bsky.social"), ("BSKY_APP_PASSWORD", "app-pass")]);
+        let cfg = config_with(&[
+            ("BSKY_HANDLE", "upstage.bsky.social"),
+            ("BSKY_APP_PASSWORD", "app-pass"),
+        ]);
         let (_, avatar) = preflight(&cfg, None).expect("preflight succeeds with no avatar");
         assert_eq!(avatar, None);
     }
@@ -506,9 +510,11 @@ mod tests {
     #[test]
     fn unsupported_avatar_extension_fails() {
         // BC4.
-        let cfg =
-            config_with(&[("BSKY_HANDLE", "dunk.bsky.social"), ("BSKY_APP_PASSWORD", "app-pass")]);
-        let path = std::env::temp_dir().join("dunk-publish-test-avatar.gif");
+        let cfg = config_with(&[
+            ("BSKY_HANDLE", "upstage.bsky.social"),
+            ("BSKY_APP_PASSWORD", "app-pass"),
+        ]);
+        let path = std::env::temp_dir().join("upstage-publish-test-avatar.gif");
         let mut file = std::fs::File::create(&path).expect("temp file creates");
         file.write_all(b"not really a gif").expect("temp file writes");
         let err = preflight(&cfg, Some(&path)).unwrap_err();
@@ -522,15 +528,17 @@ mod tests {
     #[test]
     fn avatar_extension_maps_to_content_type_case_insensitively() {
         // BC5.
-        let cfg =
-            config_with(&[("BSKY_HANDLE", "dunk.bsky.social"), ("BSKY_APP_PASSWORD", "app-pass")]);
+        let cfg = config_with(&[
+            ("BSKY_HANDLE", "upstage.bsky.social"),
+            ("BSKY_APP_PASSWORD", "app-pass"),
+        ]);
         for (ext, expected) in [
             ("png", "image/png"),
             ("PNG", "image/png"),
             ("jpg", "image/jpeg"),
             ("JPEG", "image/jpeg"),
         ] {
-            let path = std::env::temp_dir().join(format!("dunk-publish-test-avatar.{ext}"));
+            let path = std::env::temp_dir().join(format!("upstage-publish-test-avatar.{ext}"));
             std::fs::write(&path, b"bytes").expect("temp file writes");
             let (_, avatar) = preflight(&cfg, Some(&path)).expect("supported extension succeeds");
             assert_eq!(avatar.expect("avatar present").content_type, expected);
@@ -543,12 +551,12 @@ mod tests {
     #[test]
     fn record_body_shape() {
         // AC3, BC12.
-        let cfg = config_with(&[("DUNK_FEED_RKEY", "dunks")]);
+        let cfg = config_with(&[("UPSTAGE_FEED_RKEY", "upstaged")]);
         let now = DateTime::parse_from_rfc3339("2026-09-21T00:00:00Z").unwrap().with_timezone(&Utc);
         let body = record_body(&cfg, "did:plc:abc", None, now);
         assert_eq!(body["repo"], "did:plc:abc");
         assert_eq!(body["collection"], "app.bsky.feed.generator");
-        assert_eq!(body["rkey"], "dunks");
+        assert_eq!(body["rkey"], "upstaged");
         let record = &body["record"];
         assert_eq!(record["$type"], "app.bsky.feed.generator");
         assert_eq!(record["did"], "did:web:feed.example.com");
@@ -647,10 +655,10 @@ mod tests {
     #[tokio::test]
     async fn prints_at_uri() {
         // AC4, BC13: publish_with returns the at-URI `dispatch` prints.
-        let cfg = config_with(&[("DUNK_FEED_RKEY", "dunks")]);
+        let cfg = config_with(&[("UPSTAGE_FEED_RKEY", "upstaged")]);
         let client = FakePds::ok("did:plc:abc");
         let uri = publish_with(&client, &cfg, &creds(), None).await.expect("publish succeeds");
-        assert_eq!(uri, "at://did:plc:abc/app.bsky.feed.generator/dunks");
+        assert_eq!(uri, "at://did:plc:abc/app.bsky.feed.generator/upstaged");
         assert_eq!(client.create_session_calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(client.upload_blob_calls.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(client.put_record_calls.load(AtomicOrdering::SeqCst), 1);
@@ -658,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_did_mismatch_fails() {
-        // AC5, BC7: the session's own did differs from DUNK_PUBLISHER_DID;
+        // AC5, BC7: the session's own did differs from UPSTAGE_PUBLISHER_DID;
         // put_record never runs.
         let cfg = config_with(&[]);
         let client = FakePds::ok("did:plc:someone-else");
@@ -801,7 +809,7 @@ mod tests {
     async fn second_run_overwrites_the_same_record_unconditionally() {
         // AC-adjacent, BC14: two calls to publish_with both call
         // put_record; nothing reads the record first.
-        let cfg = config_with(&[("DUNK_FEED_RKEY", "dunks")]);
+        let cfg = config_with(&[("UPSTAGE_FEED_RKEY", "upstaged")]);
         let client = FakePds::ok("did:plc:abc");
         publish_with(&client, &cfg, &creds(), None).await.expect("first publish succeeds");
         publish_with(&client, &cfg, &creds(), None).await.expect("second publish succeeds");
@@ -839,7 +847,8 @@ mod tests {
         // BC18: `config::optional` is a bare lookup and does not trim, so a
         // password of three spaces arrives here as Some("   "). The filter
         // in `preflight` is the only thing that rejects it.
-        let cfg = config_with(&[("BSKY_HANDLE", "dunk.bsky.social"), ("BSKY_APP_PASSWORD", "   ")]);
+        let cfg =
+            config_with(&[("BSKY_HANDLE", "upstage.bsky.social"), ("BSKY_APP_PASSWORD", "   ")]);
         assert_eq!(cfg.bsky_app_password.as_ref().map(Secret::expose), Some("   "));
         match preflight(&cfg, None).unwrap_err() {
             PublishError::MissingCredentials { var } => assert_eq!(var, "BSKY_APP_PASSWORD"),
@@ -865,9 +874,11 @@ mod tests {
         // into AvatarNotFound.
         use std::os::unix::fs::PermissionsExt;
 
-        let cfg =
-            config_with(&[("BSKY_HANDLE", "dunk.bsky.social"), ("BSKY_APP_PASSWORD", "app-pass")]);
-        let path = std::env::temp_dir().join("dunk-publish-test-unreadable-avatar.png");
+        let cfg = config_with(&[
+            ("BSKY_HANDLE", "upstage.bsky.social"),
+            ("BSKY_APP_PASSWORD", "app-pass"),
+        ]);
+        let path = std::env::temp_dir().join("upstage-publish-test-unreadable-avatar.png");
         let _ = std::fs::remove_file(&path);
         let mut file = std::fs::File::create(&path).expect("create the avatar");
         file.write_all(b"not really a png").expect("write the avatar");
@@ -898,8 +909,8 @@ mod tests {
 
 /// Live test against a real Bluesky test account. `#[ignore]`d, so
 /// `cargo test --all-features` never touches the network; run by hand with
-/// `BSKY_HANDLE`, `BSKY_APP_PASSWORD`, `DUNK_HOSTNAME` and
-/// `DUNK_PUBLISHER_DID` set: `cargo test -- --ignored publish_live` (AC7).
+/// `BSKY_HANDLE`, `BSKY_APP_PASSWORD`, `UPSTAGE_HOSTNAME` and
+/// `UPSTAGE_PUBLISHER_DID` set: `cargo test -- --ignored publish_live` (AC7).
 #[cfg(test)]
 mod live_tests {
     use super::*;

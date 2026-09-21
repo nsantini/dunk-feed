@@ -27,12 +27,12 @@ RUN touch src/main.rs && cargo build --release --locked
 # probe does not need. The healthcheck below uses bash's /dev/tcp instead.
 FROM debian:bookworm-slim AS runtime
 
-RUN groupadd --gid 10001 dunk \
-    && useradd --uid 10001 --gid dunk --no-create-home --shell /usr/sbin/nologin dunk \
+RUN groupadd --gid 10001 upstage \
+    && useradd --uid 10001 --gid upstage --no-create-home --shell /usr/sbin/nologin upstage \
     && mkdir /data \
     && chown 10001:10001 /data
 
-COPY --from=build /build/target/release/dunk /usr/local/bin/dunk
+COPY --from=build /build/target/release/upstage /usr/local/bin/upstage
 
 USER 10001:10001
 VOLUME ["/data"]
@@ -49,5 +49,5 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=120s \
     CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/3000 && printf "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 && head -n 1 <&3 | grep -q " 200 "'
 
-ENTRYPOINT ["dunk"]
+ENTRYPOINT ["upstage"]
 CMD ["run"]

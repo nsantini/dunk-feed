@@ -7,7 +7,7 @@
 
 ## Outcome
 
-After this ships, `axum` serves five routes on `DUNK_HTTP_ADDR`: the DID
+After this ships, `axum` serves five routes on `UPSTAGE_HTTP_ADDR`: the DID
 document, `describeFeedGenerator`, `getFeedSkeleton`, `sendInteractions`,
 and `/healthz`. A Bluesky client can page through the feed with `limit` and
 `cursor`, and an operator can poll `/healthz` to see the service is
@@ -17,7 +17,7 @@ under the 5 ms budget.
 
 ## Non-goals
 
-- Does not implement `dunk publish`; story 09 writes the generator record
+- Does not implement `upstage publish`; story 09 writes the generator record
   this service describes.
 - Does not implement guards; they are already reflected in the snapshot by
   stories 07 and 10.
@@ -53,7 +53,7 @@ server.
 
 | Id | Subject | Case | Behaviour |
 |---|---|---|---|
-| BC1 | `GET /.well-known/did.json` | request | `{"@context":[...],"id":"did:web:<host>","service":[{"id":"#bsky_fg","type":"BskyFeedGenerator","serviceEndpoint":"https://<host>"}]}`, host from `DUNK_HOSTNAME` |
+| BC1 | `GET /.well-known/did.json` | request | `{"@context":[...],"id":"did:web:<host>","service":[{"id":"#bsky_fg","type":"BskyFeedGenerator","serviceEndpoint":"https://<host>"}]}`, host from `UPSTAGE_HOSTNAME` |
 | BC2 | `GET /xrpc/app.bsky.feed.describeFeedGenerator` | request | `{"did":"did:web:<host>","feeds":[{"uri":"at://<publisher_did>/app.bsky.feed.generator/<rkey>"}]}` |
 | BC3 | `getFeedSkeleton` | `feed` param missing or not the configured URI | 400 `{"error":"UnknownFeed"}` |
 | BC4 | `getFeedSkeleton` | `limit` param non-numeric | 400 `{"error":"InvalidRequest"}` |

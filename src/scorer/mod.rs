@@ -631,8 +631,10 @@ mod tests {
     use std::sync::Arc;
 
     fn cfg(overrides: &[(&str, &str)]) -> Config {
-        let mut pairs =
-            vec![("DUNK_HOSTNAME", "feed.example.com"), ("DUNK_PUBLISHER_DID", "did:plc:abc")];
+        let mut pairs = vec![
+            ("UPSTAGE_HOSTNAME", "feed.example.com"),
+            ("UPSTAGE_PUBLISHER_DID", "did:plc:abc"),
+        ];
         pairs.extend_from_slice(overrides);
         let map: std::collections::HashMap<String, String> =
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();

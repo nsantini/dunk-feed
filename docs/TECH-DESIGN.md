@@ -1,8 +1,8 @@
-# Dunk Feed — Tech Design
+# Upstaged — Tech Design
 
 2026-09-18 · Nico Santini. Status: draft for implementation.
 
-Companion to [PRD.md](../PRD.md). The PRD owns the product rules and the score.
+Companion to [PRD.md](PRD.md). The PRD owns the product rules and the score.
 This document owns how the code is shaped. Where the two disagree, section 12
 lists the deviation and the reason. Numbers come from
 [traffic-analysis.md](traffic-analysis.md).
@@ -12,7 +12,7 @@ lists the deviation and the reason. Numbers come from
 | Decision | Choice | Why |
 |---|---|---|
 | Language | **Rust**, stable toolchain | Lowest and flattest memory on a 1 to 2 GB VM, no GC pauses, one static binary. Go's only edge is a first-party Jetstream client. That edge is about 200 lines we write once (section 5) |
-| Shape | **One crate, one binary `dunk`**, tokio tasks for ingest, scorer and HTTP | One deploy unit, one toolchain. Agreed 2026-09-18 |
+| Shape | **One crate, one binary `upstage`**, tokio tasks for ingest, scorer and HTTP | One deploy unit, one toolchain. Agreed 2026-09-18 |
 | Store | **SQLite** through `rusqlite` (bundled), WAL mode, one writer thread | Working set is under 500 MB on disk and under 250 MB in RAM. No second service to run or back up. Agreed 2026-09-18 |
 | Retention | **Candidates 48 h, feed items 30 d** | Agreed 2026-09-18. Section 7 |
 | Deploy | **Docker Compose** on the VM, plain HTTP on port 3000, **Cloudflare** terminates TLS | Agreed 2026-09-18. Section 11 |
@@ -23,9 +23,9 @@ lists the deviation and the reason. Numbers come from
 **What the feed is, in one line (Nico, 2026-09-21).** Quote posts that got more
 engagement than the post they quoted. Tone is not a criterion. A quote that
 agrees, extends or reframes the original counts exactly as much as one that
-mocks it. The PRD's words "dunk", "victim" and "funny" are shorthand for the
-engagement rule, not extra filters, and no story adds a tone or sentiment
-check. Reference pair, counts read from the App View on 2026-09-21:
+mocks it. The PRD's word "funny" is shorthand for the engagement rule, not an
+extra filter, and no story adds a tone or sentiment check. Reference pair,
+counts read from the App View on 2026-09-21:
 
 | Side | Post | likes | reposts | replies | `E` |
 |---|---|---|---|---|---|
@@ -54,7 +54,7 @@ flowchart LR
   JS[Jetstream v2<br/>post, like, repost, postgate] -->|zstd frames| ING[ingest task]
   ING -->|batched writes| W[(store writer<br/>SQLite WAL)]
   ING <--> HS[hot set<br/>HashSet of u64]
-  W --> DB[(dunk.db)]
+  W --> DB[(upstage.db)]
   SC[scorer task<br/>every 60 s] --> DB
   SC -->|getPosts, getProfiles| AV[public.api.bsky.app]
   SC -->|swap| SNAP[feed snapshot<br/>Arc RwLock Vec]
@@ -135,30 +135,30 @@ once at start and fails fast on a bad value.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DUNK_DB_PATH` | `/data/dunk.db` | SQLite file |
-| `DUNK_HTTP_ADDR` | `0.0.0.0:3000` | Listen address |
-| `DUNK_AUTHOR_TTL_H` | `24` | Freshness of an `authors` cache row |
-| `DUNK_AUTHOR_INACTIVE_TTL_H` | `1` | Freshness of a row written from a profile missing in `getProfiles`, so a transient omission does not suppress an author for a day |
-| `DUNK_GUARD_HISTOGRAM_H` | `24` | Hours after first pass, or after a floor change, during which the scorer logs the `O` author follower histogram; 0 disables |
-| `DUNK_HEALTH_MAX_LAG_S` | `300` | `/healthz` goes 503 when the Jetstream lag or the last scorer pass age passes this |
-| `DUNK_HOSTNAME` | required | Public hostname, forms `did:web:<hostname>` |
-| `DUNK_PUBLISHER_DID` | required | Your account DID. Forms the feed at-URI |
-| `DUNK_FEED_RKEY` | `dunks` | Record key of the generator record |
-| `DUNK_JETSTREAM_URL` | `wss://jetstream.us-east.bsky.network,wss://jetstream.us-west.bsky.network` | Comma-separated host list, no path. The client rotates to the next host on every failed connect. On 2026-09-18 us-east returned 503 for over 40 minutes while us-west served |
-| `DUNK_APPVIEW_URL` | `https://public.api.bsky.app` | |
-| `DUNK_W_REPOST` `DUNK_W_REPLY` | `2.0` `0.5` | `Wr`, `Wc` |
-| `DUNK_K` | `5` | Smoothing |
-| `DUNK_P` | `50` | Popularity floor |
-| `DUNK_M` | `1.25` | Dunk margin |
-| `DUNK_CANDIDATE_TTL_H` | `48` | Unpromoted pair lifetime and re-verify horizon |
-| `DUNK_FEED_TTL_D` | `30` | Promoted item lifetime |
-| `DUNK_SCORER_INTERVAL_S` | `60` | |
-| `DUNK_REVERIFY_INTERVAL_S` | `600` | Promoted pairs under 48 h old |
-| `DUNK_FOLLOWER_FLOOR` | `2000` | Guard, section 9. `0` disables |
-| `DUNK_DROP_LABELS` | `porn,sexual,graphic-media,nudity,!hide,!warn,spam` | Comma-separated label values that drop a pair. Section 9 |
-| `DUNK_PREFILTER_FRACTION` | `0.5` | Local `E` must reach `P * fraction` before an App View call |
-| `DUNK_APPVIEW_RPS` | `1.0` | Verifier rate limit |
-| `DUNK_LOG` | `info` | `tracing` filter |
+| `UPSTAGE_DB_PATH` | `/data/upstage.db` | SQLite file |
+| `UPSTAGE_HTTP_ADDR` | `0.0.0.0:3000` | Listen address |
+| `UPSTAGE_AUTHOR_TTL_H` | `24` | Freshness of an `authors` cache row |
+| `UPSTAGE_AUTHOR_INACTIVE_TTL_H` | `1` | Freshness of a row written from a profile missing in `getProfiles`, so a transient omission does not suppress an author for a day |
+| `UPSTAGE_GUARD_HISTOGRAM_H` | `24` | Hours after first pass, or after a floor change, during which the scorer logs the `O` author follower histogram; 0 disables |
+| `UPSTAGE_HEALTH_MAX_LAG_S` | `300` | `/healthz` goes 503 when the Jetstream lag or the last scorer pass age passes this |
+| `UPSTAGE_HOSTNAME` | required | Public hostname, forms `did:web:<hostname>` |
+| `UPSTAGE_PUBLISHER_DID` | required | Your account DID. Forms the feed at-URI |
+| `UPSTAGE_FEED_RKEY` | `upstaged` | Record key of the generator record |
+| `UPSTAGE_JETSTREAM_URL` | `wss://jetstream.us-east.bsky.network,wss://jetstream.us-west.bsky.network` | Comma-separated host list, no path. The client rotates to the next host on every failed connect. On 2026-09-18 us-east returned 503 for over 40 minutes while us-west served |
+| `UPSTAGE_APPVIEW_URL` | `https://public.api.bsky.app` | |
+| `UPSTAGE_W_REPOST` `UPSTAGE_W_REPLY` | `2.0` `0.5` | `Wr`, `Wc` |
+| `UPSTAGE_K` | `5` | Smoothing |
+| `UPSTAGE_P` | `50` | Popularity floor |
+| `UPSTAGE_M` | `1.25` | Upstage margin |
+| `UPSTAGE_CANDIDATE_TTL_H` | `48` | Unpromoted pair lifetime and re-verify horizon |
+| `UPSTAGE_FEED_TTL_D` | `30` | Promoted item lifetime |
+| `UPSTAGE_SCORER_INTERVAL_S` | `60` | |
+| `UPSTAGE_REVERIFY_INTERVAL_S` | `600` | Promoted pairs under 48 h old |
+| `UPSTAGE_FOLLOWER_FLOOR` | `2000` | Guard, section 9. `0` disables |
+| `UPSTAGE_DROP_LABELS` | `porn,sexual,graphic-media,nudity,!hide,!warn,spam` | Comma-separated label values that drop a pair. Section 9 |
+| `UPSTAGE_PREFILTER_FRACTION` | `0.5` | Local `E` must reach `P * fraction` before an App View call |
+| `UPSTAGE_APPVIEW_RPS` | `1.0` | Verifier rate limit |
+| `UPSTAGE_LOG` | `info` | `tracing` filter |
 | `BSKY_HANDLE` `BSKY_APP_PASSWORD` | publish only | Never read by `run` |
 
 ## 5. Ingest
@@ -347,13 +347,13 @@ config, never literals.
    chunk succeeded. A row the writer moved in between stays dirty, and a
    failed chunk's rows are never cleared, so no pass loses a pair.
 2. **Verify.** Batch the `Q` and `O` URIs, 25 per `getPosts` call, at most
-   `DUNK_APPVIEW_RPS`. Section 8.
+   `UPSTAGE_APPVIEW_RPS`. Section 8.
 3. **Guard.** Section 9.
 4. **Promote.** For each pair that qualifies on verified counts and passes the
    guards: upsert `feed`, set `pairs.state = 'promoted'`. For each pair that
    fails a hard check (deleted, blocked, detached, self, not a post): set
    `state = 'dropped'` with the reason, delete its `feed` row if any.
-5. **Re-verify.** Every `DUNK_REVERIFY_INTERVAL_S`, run steps 2 to 4 over
+5. **Re-verify.** Every `UPSTAGE_REVERIFY_INTERVAL_S`, run steps 2 to 4 over
    promoted pairs with `quoted_at` within 48 h. A pair that no longer qualifies is
    demoted to `candidate`, its feed row deleted. Older promoted pairs are never
    re-verified. Their counts freeze and only `rank` keeps decaying.
@@ -430,7 +430,7 @@ retrofit.
 |---|---|---|
 | Follower floor on `O`'s author | `getProfiles(original_did).followersCount`, cached in `authors` for 24 h | One call per 25 new original authors |
 | Author deactivated, deleted, taken down | Missing from `getProfiles`, or a `!takedown` label, or `getPosts` omits the post | Same call |
-| Labels | `labels[]` on the `postView` for `Q` and `O`, and on the `profileView` for both authors. Drop on any label whose value is in `DUNK_DROP_LABELS` (default: `porn`, `sexual`, `graphic-media`, `nudity`, `!hide`, `!warn`, `spam`) | Free, comes with the calls above |
+| Labels | `labels[]` on the `postView` for `Q` and `O`, and on the `profileView` for both authors. Drop on any label whose value is in `UPSTAGE_DROP_LABELS` (default: `porn`, `sexual`, `graphic-media`, `nudity`, `!hide`, `!warn`, `spam`) | Free, comes with the calls above |
 | Block or detach | Section 8.2 | Free |
 | Caps | Section 7.3 | Free |
 
@@ -440,8 +440,8 @@ step with zero extra traffic. A third-party labeler would still need a
 subscription. That is out of scope.
 
 The follower floor is live from the first pass. Alongside it, for
-`DUNK_GUARD_HISTOGRAM_H` hours after the first pass, and again whenever
-`DUNK_FOLLOWER_FLOOR` changes, the scorer logs one line per pass with the
+`UPSTAGE_GUARD_HISTOGRAM_H` hours after the first pass, and again whenever
+`UPSTAGE_FOLLOWER_FLOOR` changes, the scorer logs one line per pass with the
 follower histogram of distinct `O` authors and the count the floor dropped, so
 the default can be re-set on this deployment's data. Measuring does not need
 the floor suppressed, and suppressing it would put quotes of small accounts in
@@ -449,7 +449,7 @@ the public feed for a day (review of story 10, 2026-09-21). Guards run only
 on pairs that already qualify on verified counts, which is what keeps
 `getProfiles` at one call per 25 new original authors.
 
-## 10. Phase 0 validation, `dunk validate`
+## 10. Phase 0 validation, `upstage validate`
 
 The PRD's recipe seeds from heavily quoted posts. The probe in
 traffic-analysis section 6 shows that finds nothing, because when `O` is that
@@ -469,17 +469,17 @@ constants through env vars between runs. It shares `score.rs` and
 `appview/` with the service, so the formula under test is the formula that
 ships. No notebook, no Python.
 
-`dunk dump --since 24h --out <path>` writes every pair first seen in the window,
+`upstage dump --since 24h --out <path>` writes every pair first seen in the window,
 in all three states, with local counts, the verified counts from `feed` when a
 feed row exists, and `E` and `D` recomputed under the current config, to CSV
 for offline re-fitting of `P`, `M`, and the weights (PRD phase 4). The runbook's
-"Tuning with dunk dump" section says which columns to sort by. A demoted pair
+"Tuning with upstage dump" section says which columns to sort by. A demoted pair
 shows local counts only, because verified counts live only in `feed`.
 
 ## 11. Serving
 
-`axum` router on `DUNK_HTTP_ADDR`, plain HTTP. Cloudflare terminates TLS and
-forwards to the VM. `DUNK_HOSTNAME` is the Cloudflare hostname.
+`axum` router on `UPSTAGE_HTTP_ADDR`, plain HTTP. Cloudflare terminates TLS and
+forwards to the VM. `UPSTAGE_HOSTNAME` is the Cloudflare hostname.
 
 | Route | Response |
 |---|---|
@@ -487,7 +487,7 @@ forwards to the VM. `DUNK_HOSTNAME` is the Cloudflare hostname.
 | `GET /xrpc/app.bsky.feed.describeFeedGenerator` | `{"did":"did:web:<host>","feeds":[{"uri":"at://<publisher_did>/app.bsky.feed.generator/<rkey>"}]}` |
 | `GET /xrpc/app.bsky.feed.getFeedSkeleton?feed=&limit=&cursor=` | Section 11.1 |
 | `POST /xrpc/app.bsky.feed.sendInteractions` | `{}`; rows appended to `interactions` |
-| `GET /healthz` | 200 with `{jetstream_lag_s, last_pass_age_s, snapshot_len}`; 503 if either age passes `DUNK_HEALTH_MAX_LAG_S`, or is `null` because no commit or no scorer pass has been seen yet since start. Docker's `start_period` covers boot |
+| `GET /healthz` | 200 with `{jetstream_lag_s, last_pass_age_s, snapshot_len}`; 503 if either age passes `UPSTAGE_HEALTH_MAX_LAG_S`, or is `null` because no commit or no scorer pass has been seen yet since start. Docker's `start_period` covers boot |
 
 ### 11.1 `getFeedSkeleton`
 
@@ -518,14 +518,14 @@ forwards to the VM. `DUNK_HOSTNAME` is the Cloudflare hostname.
 Budget: a request is one `Arc` clone, at most one scan of 100k items, one
 serialisation. Well under 5 ms.
 
-### 11.2 Publishing, `dunk publish`
+### 11.2 Publishing, `upstage publish`
 
-Reads `BSKY_HANDLE`, `BSKY_APP_PASSWORD`, `DUNK_HOSTNAME`, `DUNK_FEED_RKEY`, an
+Reads `BSKY_HANDLE`, `BSKY_APP_PASSWORD`, `UPSTAGE_HOSTNAME`, `UPSTAGE_FEED_RKEY`, an
 optional avatar path. Creates a session against `https://bsky.social`, uploads
 the avatar, then `putRecord` for `app.bsky.feed.generator` with
 `did: did:web:<host>`, `displayName`, `description`, `avatar`,
 `acceptsInteractions: true`, `createdAt`. Idempotent: `putRecord` overwrites.
-Prints the feed URL. Never runs inside `dunk run`.
+Prints the feed URL. Never runs inside `upstage run`.
 
 ## 12. Deviations from the PRD
 
@@ -535,21 +535,21 @@ Prints the feed URL. Never runs inside `dunk run`.
 | D2 | TypeScript starter kit for serving | axum in the same binary | One runtime. Agreed 2026-09-18 |
 | D3 | Deletes on likes and reposts decrement | **Ignored locally.** Post deletes still evict | A Jetstream delete carries only the rkey, not the subject. Decrementing needs a table of every like that hit the hot set, about 14M rows over 48 h. Local counts are an index, and deletes are 1.1% of likes. The verifier reads the true count before any promotion |
 | D4 | Jetstream v1 (`/subscribe`, `time_us`) | Jetstream v2 (`subscribeEvents`, `seq`, dict-zstd) | v1 is legacy. Verified live |
-| D5 | Phase 0 seeds heavily quoted posts | Seeds popular quote posts | Probe found 0 dunks in 1,378 pairs the PRD's way, 10 in 47 the other way |
+| D5 | Phase 0 seeds heavily quoted posts | Seeds popular quote posts | Probe found 0 upstages in 1,378 pairs the PRD's way, 10 in 47 the other way |
 | D6 | Subscribe to the labeler | Read `labels[]` from the views we already fetch | Same labeler, zero extra traffic. Third-party labelers out of scope |
 | D7 | Feed retention 7 d | 30 d | Agreed 2026-09-18 |
 | D8 | "Non-post embed check discards a meaningful slice" | Kept for correctness | It is 0.3% of quotes |
 | D9 | `age_hours` cap 48 h | Counts freeze at 48 h, rank keeps decaying to 30 d | Otherwise 30-day items would never leave the top |
-| D10 | Phase 0 asks whether the feed is "funny"; the original's author is the "victim" | Tone is not a criterion. Phase 0 is judged on out-engagement alone; no sentiment or keyword filter is built | Nico, 2026-09-21: the product is quote posts that out-engaged their original, whatever their tone. Section 1 has the reference pair. Section 9 guards stay, they are about safety |
+| D10 | Phase 0 asked whether the feed is "funny", and called the original's author the "victim" | Tone is not a criterion. Phase 0 is judged on out-engagement alone; no sentiment or keyword filter is built. The PRD now names that side of the pair `O`, the original, not "victim" | Nico, 2026-09-21: the product is quote posts that out-engaged their original, whatever their tone. Section 1 has the reference pair. Section 9 guards stay, they are about safety |
 
 ## 13. Operations
 
 - **Container.** Multi-stage `Dockerfile`: `rust:1-bookworm` builds, `debian:bookworm-slim` runs, non-root, `/data` volume. Image under 40 MB.
-- **Compose.** `dunk` service with `.env`, restart `unless-stopped`, memory limit 512 MB, healthcheck on `/healthz`. Optional `cloudflared` service with `TUNNEL_TOKEN` for a Cloudflare Tunnel. If the VM has a public IP behind Cloudflare's proxy instead, publish port 3000 and skip the tunnel.
-- **Backup.** `sqlite3 /data/dunk.db ".backup /data/backup.db"` nightly is enough. Losing the DB loses 30 days of feed history and nothing else. The hot set and counters rebuild within 48 h.
+- **Compose.** `upstage` service with `.env`, restart `unless-stopped`, memory limit 512 MB, healthcheck on `/healthz`. Optional `cloudflared` service with `TUNNEL_TOKEN` for a Cloudflare Tunnel. If the VM has a public IP behind Cloudflare's proxy instead, publish port 3000 and skip the tunnel.
+- **Backup.** `sqlite3 /data/upstage.db ".backup /data/backup.db"` nightly is enough. Losing the DB loses 30 days of feed history and nothing else. The hot set and counters rebuild within 48 h.
 - **Logs.** `tracing` JSON to stdout. The ingest and scorer stats lines are the dashboards.
 - **Upgrades.** `docker compose pull && up -d`. The Jetstream cursor makes a restart under 36 h gapless.
-- **Failure modes.** One Jetstream host down: the client rotates to the next host within one backoff step. All hosts down: ingest backs off, `/healthz` goes 503 after 300 s, the feed keeps serving the last snapshot. App View down: no promotions, feed keeps serving. Disk full: writer thread errors, process exits, Docker restarts it, cursor resumes. `dunk run` supervises the ingest, scorer and HTTP tasks in one `JoinSet`: the first to stop flips the shutdown watch, the others are awaited and their errors logged, the writer is flushed, and the first error is the exit reason. A panicking task becomes an error, never a re-panic, so the flush always runs. OOM: memory limit trips at 512 MB, same recovery.
+- **Failure modes.** One Jetstream host down: the client rotates to the next host within one backoff step. All hosts down: ingest backs off, `/healthz` goes 503 after 300 s, the feed keeps serving the last snapshot. App View down: no promotions, feed keeps serving. Disk full: writer thread errors, process exits, Docker restarts it, cursor resumes. `upstage run` supervises the ingest, scorer and HTTP tasks in one `JoinSet`: the first to stop flips the shutdown watch, the others are awaited and their errors logged, the writer is flushed, and the first error is the exit reason. A panicking task becomes an error, never a re-panic, so the flush always runs. OOM: memory limit trips at 512 MB, same recovery.
 
 ## 14. Testing strategy
 
@@ -576,16 +576,16 @@ PRD's phases with phase 0 first, as the PRD insists.
 |---|---|---|---|
 | 01 | Crate scaffold, config, CLI, gates green | — | — |
 | 02 | Score module, quote detector, App View client | 0 | 01 |
-| 03 | `dunk validate` phase 0 tool | 0 | 02 |
+| 03 | `upstage validate` phase 0 tool | 0 | 02 |
 | 04 | Jetstream v2 client | 1 | 01 |
 | 05 | SQLite store, schema, writer, checkpoint | 1 | 01 |
 | 06 | Ingest task: hot set, ops, stats | 1 | 02, 04, 05 |
 | 07 | Scorer task: select, verify, promote, expire, snapshot, caps | 1 | 02, 05, 06 |
 | 08 | HTTP serving: did, describe, skeleton, interactions, health | 2 | 07 |
-| 09 | `dunk publish` | 2 | 08 |
+| 09 | `upstage publish` | 2 | 08 |
 | 10 | Guards: follower floor, author state, labels | 3 | 07 |
 | 11 | Docker, Compose, Cloudflare, runbook | 2 | 08 |
-| 12 | `dunk dump` and tuning notes | 4 | 07 |
+| 12 | `upstage dump` and tuning notes | 4 | 07 |
 
 **Stop after 03 and read the output.** If the top 30 are not quote posts that
 clearly out-engaged their original, change the score before writing the
@@ -598,13 +598,13 @@ top pairs were all real out-engagements, so the score stood.
 None block story 01. Each is defaulted in this document and can be changed by
 one env var or one line.
 
-1. `DUNK_FOLLOWER_FLOOR` default 2,000. Story 10 measures before it drops.
-2. `DUNK_DROP_LABELS` default list. Section 9.
+1. `UPSTAGE_FOLLOWER_FLOOR` default 2,000. Story 10 measures before it drops.
+2. `UPSTAGE_DROP_LABELS` default list. Section 9.
 3. Whether the feed should also require `E(O) >= P_O` for a separate, lower
    floor on the original, so the feed is not only "small post, big quote".
    Traffic-analysis §6 finding 3. Under the product intent in section 1 a
    quote of a zero-engagement post does qualify, so the default stays "no
-   floor on `O`". Revisit with `dunk dump` output in story 12 if the feed
+   floor on `O`". Revisit with `upstage dump` output in story 12 if the feed
    reads as noise.
 4. Cloudflare Tunnel or proxied DNS. Both work with the same container. Story 11
    ships both compose variants.

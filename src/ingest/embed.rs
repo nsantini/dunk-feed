@@ -13,7 +13,7 @@ impl AtUri {
     /// Parses `at://<did>/app.bsky.feed.post/<rkey>`. `None` when the scheme
     /// is wrong, the authority is not a `did:`, the collection is not
     /// `app.bsky.feed.post`, or the rkey is empty. A quote of a list or a
-    /// feed generator is not a dunk pair.
+    /// feed generator is not an upstage pair.
     pub fn parse(uri: &str) -> Option<Self> {
         let rest = uri.strip_prefix("at://")?;
         let mut parts = rest.splitn(3, '/');

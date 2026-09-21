@@ -1,8 +1,8 @@
 # AGENTS.md
 
-Dunk Feed is one Rust binary. It consumes Jetstream, scores quote posts, and
+Upstaged is one Rust binary. It consumes Jetstream, scores quote posts, and
 serves an AT Protocol feed generator over HTTP. Read `docs/TECH-DESIGN.md`
-before you change code. Read `PRD.md` for the product rules.
+before you change code. Read `docs/PRD.md` for the product rules.
 
 ## Prerequisites
 

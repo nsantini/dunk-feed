@@ -1,4 +1,4 @@
-# 03 — `dunk validate` phase 0 tool
+# 03 — `upstage validate` phase 0 tool
 
 - **Follows**: 02
 - **PRD phase**: 0
@@ -7,7 +7,7 @@
 
 ## Outcome
 
-After this ships, `dunk validate` seeds candidate pairs from `hot-classic`
+After this ships, `upstage validate` seeds candidate pairs from `hot-classic`
 (or a supplied list of quote URIs), verifies them against the App View, and
 prints a table sorted by rank, plus a CSV, using the exact `score.rs` the
 service ships with. An engineer runs it, reads the top 30 by hand, and if
@@ -69,7 +69,7 @@ table and a CSV, not a database, because phase 0 needs no persistence.
 ## Defaults taken
 
 - Default `--pages` is 3 (300 posts), matching §10.
-- Default `--csv-path` is `./dunk-validate.csv` in the working directory.
+- Default `--csv-path` is `./upstage-validate.csv` in the working directory.
 - `--seed-file` format: one `at://` URI per line; blank lines and `#`
   comments are skipped.
 - Quote-view detection is written locally in `validate.rs`, against the

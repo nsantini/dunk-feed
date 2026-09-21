@@ -1,4 +1,4 @@
-# 12 — `dunk dump` and tuning notes
+# 12 — `upstage dump` and tuning notes
 
 - **Follows**: 07
 - **PRD phase**: 4
@@ -7,7 +7,7 @@
 
 ## Outcome
 
-After this ships, `dunk dump --since 24h` writes every pair with its local
+After this ships, `upstage dump --since 24h` writes every pair with its local
 and verified counts to CSV. An operator re-fits `P`, `M`, and the weights
 offline against real traffic, then changes the matching env variables and
 restarts, without touching code, closing the PRD's phase 4 tuning loop.
@@ -71,7 +71,7 @@ suffix.
 - CSV is written with a manual writer, comma-joined fields with `"`
   escaping for commas and quotes; no `csv` crate, since none is listed in
   §3.
-- Default `--out` path: `./dunk-dump-<since>.csv` in the working
+- Default `--out` path: `./upstage-dump-<since>.csv` in the working
   directory.
 
 ## Suggested slices

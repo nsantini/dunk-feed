@@ -89,7 +89,7 @@ for its size on a small VM. The rate limiter is a token bucket built from
 - Retry policy: 3 attempts, backoff `1s, 2s, 4s`, on 429 and 5xx only,
   matching ingest's own backoff shape in §5.1 for consistency.
 - Token-bucket rate limiter built with `tokio::time::interval`, capped by
-  `DUNK_APPVIEW_RPS` (already parsed in story 01).
+  `UPSTAGE_APPVIEW_RPS` (already parsed in story 01).
 - Batch size: 25 for `getPosts` and `getProfiles`, 100 for `getQuotes` and
   `getFeed`, per §8.1.
 

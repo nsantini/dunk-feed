@@ -1,4 +1,4 @@
-//! `dunk validate` phase 0 tool, TECH-DESIGN section 10. Every decision here
+//! `upstage validate` phase 0 tool, TECH-DESIGN section 10. Every decision here
 //! is a pure function over values already in memory: seeding, the quote
 //! filter, scoring, row ordering, and rendering. Only `run` touches the
 //! network or the filesystem, so this module's fixture tests cover the whole
@@ -274,7 +274,7 @@ pub fn sort_rows(mut rows: Vec<Row>) -> Vec<Row> {
     rows
 }
 
-/// `dunk validate`'s own errors. `AGENTS.md` keeps `anyhow` in `main.rs`
+/// `upstage validate`'s own errors. `AGENTS.md` keeps `anyhow` in `main.rs`
 /// only, so every variant here carries enough context for `main.rs` to
 /// print one line and exit 1 (BC10, BC11, BC12) with no further lookup.
 #[derive(Debug, Error)]
@@ -612,8 +612,8 @@ mod tests {
     /// `run` returns from before any request goes out.
     fn test_client() -> AppViewClient {
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
             _ => None,
         };
         let config = crate::config::load(lookup).expect("minimal config loads");
@@ -630,8 +630,8 @@ mod tests {
             &weights(),
             &thresholds(),
             0,
-            Some(Path::new("/nonexistent/dunk-validate-seed.txt")),
-            Path::new("/tmp/dunk-validate-should-not-be-written.csv"),
+            Some(Path::new("/nonexistent/upstage-validate-seed.txt")),
+            Path::new("/tmp/upstage-validate-should-not-be-written.csv"),
         )
         .await
         .unwrap_err();
@@ -651,7 +651,7 @@ mod tests {
             &thresholds(),
             0,
             None,
-            Path::new("/nonexistent-dir/dunk-validate.csv"),
+            Path::new("/nonexistent-dir/upstage-validate.csv"),
         )
         .await
         .unwrap_err();
@@ -1242,7 +1242,7 @@ mod tests {
 /// `cargo test --all-features` never touches the network, run by hand with
 /// `cargo test --all-features -- --ignored`. Mirrors `appview`'s own live
 /// tests, and the spec's own answer that `validate` needs no database: only
-/// `DUNK_HOSTNAME` and `DUNK_PUBLISHER_DID` are set.
+/// `UPSTAGE_HOSTNAME` and `UPSTAGE_PUBLISHER_DID` are set.
 #[cfg(test)]
 mod live_tests {
     use super::*;
@@ -1254,15 +1254,15 @@ mod live_tests {
         // AC9: a live run against `hot-classic` prints a table and writes a
         // CSV with the expected header.
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:z72i7hdynmk6r22z27h6tvur".to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:z72i7hdynmk6r22z27h6tvur".to_string()),
             _ => None,
         };
         let config = crate::config::load(lookup).expect("minimal config loads");
         let client = AppViewClient::new(&config).expect("the default rate builds a client");
         let weights = Weights::from(&config);
         let thresholds = Thresholds::from(&config);
-        let csv_path = std::env::temp_dir().join("dunk-validate-live-test.csv");
+        let csv_path = std::env::temp_dir().join("upstage-validate-live-test.csv");
 
         run(&client, &weights, &thresholds, 1, None, &csv_path)
             .await

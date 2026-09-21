@@ -22,7 +22,7 @@ pub struct FeedItem {
     pub quote_uri: String,
     pub quote_cid: String,
     pub rank: f64,
-    /// `D`, the dunk ratio `recompute_ranks` computed for this row on the
+    /// `D`, the upstage ratio `recompute_ranks` computed for this row on the
     /// same pass, not `FeedRow.ratio` (the promotion-time record, left
     /// untouched). `getFeedSkeleton`'s `feedContext` (story 08, BC24) reads
     /// this field.

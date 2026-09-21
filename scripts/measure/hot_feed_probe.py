@@ -38,7 +38,7 @@ for name, uri in feeds.items():
     except Exception as e:
         out[name] = {"error": str(e)}
 
-# mini phase-0: for the most-quoted hot posts, pull quotes and compute dunk ratios
+# mini phase-0: for the most-quoted hot posts, pull quotes and compute upstage ratios
 src = out.get("hot-classic", {}).get("_posts") or out.get("whats-hot", {}).get("_posts") or []
 cands = sorted(src, key=lambda p: -p.get("quoteCount",0))[:30]
 pairs = []; calls = 0
@@ -60,4 +60,4 @@ summary = {"hot_posts_checked": len([c for c in cands if c.get("quoteCount",0)>0
            "pairs_EQ_ge_50": sum(1 for p in pairs if p["EQ"]>=50), "top10": pairs[:10]}
 for k in out:
     out[k].pop("_posts", None)
-print(json.dumps({"feeds": out, "dunk_probe": summary}, indent=1))
+print(json.dumps({"feeds": out, "upstage_probe": summary}, indent=1))

@@ -25,7 +25,7 @@ pub struct PostViewAuthor {
 
 /// `postView.record`, TECH-DESIGN section 8.2's `record.createdAt`. `rest`
 /// keeps every other field of the record, `$type`, `embed`, `facets` and the
-/// rest, as one JSON object: `dunk validate` (story 03) passes it straight
+/// rest, as one JSON object: `upstage validate` (story 03) passes it straight
 /// to `ingest::embed::detect`, which reads the record's own `embed`, not
 /// `postView.embed`, the App View's separate hydrated view a guard walks
 /// instead (story 07). `PostRecord` cannot derive `Eq`: `serde_json::Value`

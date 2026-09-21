@@ -845,13 +845,13 @@ mod tests {
 
     fn test_config(cache_dir: &Path, jetstream_urls: &[&str]) -> Config {
         let lookup = {
-            let db_path = cache_dir.join("dunk.db").to_string_lossy().to_string();
+            let db_path = cache_dir.join("upstage.db").to_string_lossy().to_string();
             let urls = jetstream_urls.join(",");
             move |name: &str| match name {
-                "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-                "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
-                "DUNK_DB_PATH" => Some(db_path.clone()),
-                "DUNK_JETSTREAM_URL" => Some(urls.clone()),
+                "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+                "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+                "UPSTAGE_DB_PATH" => Some(db_path.clone()),
+                "UPSTAGE_JETSTREAM_URL" => Some(urls.clone()),
                 _ => None,
             }
         };

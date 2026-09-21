@@ -1,10 +1,10 @@
 //! Command-line surface. `Cli` and `Command` derive `clap`'s parser, so
 //! `--help` and usage text come free. `Run`, `Validate`, `Publish` and
-//! `Dump` are all real: `Run` is `dunk run`, story 06's ingest task
-//! (TECH-DESIGN section 5.1); `Validate` is `dunk validate`, TECH-DESIGN
-//! section 10's phase 0 tool; `Publish` is `dunk publish`, story 09,
-//! TECH-DESIGN section 11.2; `Dump` is `dunk dump`, story 12, which writes
-//! the tuning CSV `docs/RUNBOOK.md`'s "Tuning with `dunk dump`" section
+//! `Dump` are all real: `Run` is `upstage run`, story 06's ingest task
+//! (TECH-DESIGN section 5.1); `Validate` is `upstage validate`, TECH-DESIGN
+//! section 10's phase 0 tool; `Publish` is `upstage publish`, story 09,
+//! TECH-DESIGN section 11.2; `Dump` is `upstage dump`, story 12, which writes
+//! the tuning CSV `docs/RUNBOOK.md`'s "Tuning with `upstage dump`" section
 //! describes. All four run through [`dispatch`].
 
 use std::path::PathBuf;
@@ -20,26 +20,26 @@ use crate::publish::{self, PublishError};
 use crate::score::{Thresholds, Weights};
 use crate::validate::{self, ValidateError};
 
-/// Dunk Feed: ingests Jetstream, scores quote posts, and serves an AT
+/// Upstaged: ingests Jetstream, scores quote posts, and serves an AT
 /// Protocol feed generator.
 #[derive(Debug, Parser)]
-#[command(name = "dunk", version, about)]
+#[command(name = "upstage", version, about)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
 
-/// The four subcommands. `Run` is `dunk run`, story 06's ingest task
-/// (TECH-DESIGN section 5.1), and `Validate` is `dunk validate`, TECH-DESIGN
-/// section 10's phase 0 tool. `Publish` is `dunk publish`, story 09,
+/// The four subcommands. `Run` is `upstage run`, story 06's ingest task
+/// (TECH-DESIGN section 5.1), and `Validate` is `upstage validate`, TECH-DESIGN
+/// section 10's phase 0 tool. `Publish` is `upstage publish`, story 09,
 /// TECH-DESIGN section 11.2: it writes the `app.bsky.feed.generator` record.
-/// `Dump` is `dunk dump`, story 12: it writes the tuning CSV `dump::run`
+/// `Dump` is `upstage dump`, story 12: it writes the tuning CSV `dump::run`
 /// builds. All four run through [`dispatch`].
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
     /// Run the ingest, scorer and HTTP server.
     Run,
-    /// Score candidate dunks, seeded from `hot-classic` or `--seed-file`,
+    /// Score candidate upstages, seeded from `hot-classic` or `--seed-file`,
     /// and print a ranked table plus a CSV of the same rows.
     Validate {
         /// Pages of `hot-classic` to fetch (100 posts each) when no
@@ -51,7 +51,7 @@ pub enum Command {
         #[arg(long)]
         seed_file: Option<PathBuf>,
         /// Path the same rows are written to as a CSV.
-        #[arg(long, default_value = "./dunk-validate.csv")]
+        #[arg(long, default_value = "./upstage-validate.csv")]
         csv_path: PathBuf,
     },
     /// Publish the feed generator record.
@@ -63,7 +63,7 @@ pub enum Command {
         avatar: Option<PathBuf>,
     },
     /// Dump every pair first seen within `--since` to a CSV at `--out`, for
-    /// offline tuning (BC1 to BC21, `docs/RUNBOOK.md`'s "Tuning with `dunk
+    /// offline tuning (BC1 to BC21, `docs/RUNBOOK.md`'s "Tuning with `upstage
     /// dump`" section).
     Dump {
         /// The window to dump, `^[0-9]+(h|d)$`, e.g. `24h` or `7d` (BC1,
@@ -71,7 +71,7 @@ pub enum Command {
         #[arg(long, default_value = "24h")]
         since: String,
         /// Path the CSV is written to. Defaults to
-        /// `./dunk-dump-<since>.csv` when omitted (`dump::run`'s own
+        /// `./upstage-dump-<since>.csv` when omitted (`dump::run`'s own
         /// default).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -148,7 +148,7 @@ mod tests {
         Command::Validate {
             pages: 3,
             seed_file: None,
-            csv_path: PathBuf::from("./dunk-validate.csv"),
+            csv_path: PathBuf::from("./upstage-validate.csv"),
         }
     }
 
@@ -166,12 +166,13 @@ mod tests {
 
     #[test]
     fn validate_flags_default() {
-        let cli = Cli::try_parse_from(["dunk", "validate"]).expect("validate parses with no flags");
+        let cli =
+            Cli::try_parse_from(["upstage", "validate"]).expect("validate parses with no flags");
         match cli.command {
             Command::Validate { pages, seed_file, csv_path } => {
                 assert_eq!(pages, 3);
                 assert_eq!(seed_file, None);
-                assert_eq!(csv_path, PathBuf::from("./dunk-validate.csv"));
+                assert_eq!(csv_path, PathBuf::from("./upstage-validate.csv"));
             }
             other => panic!("expected Validate, got {other:?}"),
         }
@@ -180,7 +181,7 @@ mod tests {
     #[test]
     fn validate_flags_are_parsed() {
         let cli = Cli::try_parse_from([
-            "dunk",
+            "upstage",
             "validate",
             "--pages",
             "5",
@@ -202,13 +203,14 @@ mod tests {
 
     #[test]
     fn missing_subcommand_prints_usage_and_exits_non_zero() {
-        let err = Cli::try_parse_from(["dunk"]).unwrap_err();
+        let err = Cli::try_parse_from(["upstage"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
     }
 
     #[test]
     fn publish_flags_default_to_no_avatar() {
-        let cli = Cli::try_parse_from(["dunk", "publish"]).expect("publish parses with no flags");
+        let cli =
+            Cli::try_parse_from(["upstage", "publish"]).expect("publish parses with no flags");
         match cli.command {
             Command::Publish { avatar } => assert_eq!(avatar, None),
             other => panic!("expected Publish, got {other:?}"),
@@ -217,7 +219,7 @@ mod tests {
 
     #[test]
     fn publish_avatar_flag_is_parsed() {
-        let cli = Cli::try_parse_from(["dunk", "publish", "--avatar", "avatar.png"])
+        let cli = Cli::try_parse_from(["upstage", "publish", "--avatar", "avatar.png"])
             .expect("publish parses with --avatar");
         match cli.command {
             Command::Publish { avatar } => assert_eq!(avatar, Some(PathBuf::from("avatar.png"))),
@@ -230,8 +232,8 @@ mod tests {
     #[tokio::test]
     async fn publish_with_missing_credentials_is_a_cli_publish_error() {
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
             _ => None,
         };
         let config = crate::config::load(lookup).expect("minimal config loads");
@@ -249,17 +251,17 @@ mod tests {
     #[tokio::test]
     async fn validate_with_zero_pages_makes_no_call() {
         // Finding 5, BC13: `pages == 0` with no `--seed-file` makes no
-        // network call at all. `DUNK_APPVIEW_URL` points at a local address
+        // network call at all. `UPSTAGE_APPVIEW_URL` points at a local address
         // nothing listens on, so a call that did go out would fail or hang
         // instead of returning `Ok`.
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
-            "DUNK_APPVIEW_URL" => Some("http://127.0.0.1:9".to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_APPVIEW_URL" => Some("http://127.0.0.1:9".to_string()),
             _ => None,
         };
         let config = crate::config::load(lookup).expect("minimal config loads");
-        let csv_path = std::env::temp_dir().join("dunk-validate-zero-pages-test.csv");
+        let csv_path = std::env::temp_dir().join("upstage-validate-zero-pages-test.csv");
         let command = Command::Validate { pages: 0, seed_file: None, csv_path: csv_path.clone() };
 
         dispatch(&command, &config).await.expect("zero pages with no seed file makes no call");
@@ -269,7 +271,7 @@ mod tests {
         let _ = std::fs::remove_file(&csv_path);
     }
 
-    // BC34, BC35: `Command::Run` with a `DUNK_DB_PATH` whose parent
+    // BC34, BC35: `Command::Run` with a `UPSTAGE_DB_PATH` whose parent
     // directory does not exist never reaches the network. `Store::open`
     // fails first, `ingest::run` returns `IngestError::Store`, and
     // `dispatch` surfaces it through `CliError::Ingest` for `main.rs` to
@@ -277,9 +279,9 @@ mod tests {
     #[tokio::test]
     async fn run_with_unreadable_db_path_is_a_cli_ingest_store_error() {
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
-            "DUNK_DB_PATH" => Some("/no/such/directory/dunk.db".to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_DB_PATH" => Some("/no/such/directory/upstage.db".to_string()),
             _ => None,
         };
         let config = crate::config::load(lookup).expect("minimal config loads");
@@ -296,7 +298,7 @@ mod tests {
 
     #[test]
     fn dump_flags_default() {
-        let cli = Cli::try_parse_from(["dunk", "dump"]).expect("dump parses with no flags");
+        let cli = Cli::try_parse_from(["upstage", "dump"]).expect("dump parses with no flags");
         match cli.command {
             Command::Dump { since, out } => {
                 assert_eq!(since, "24h");
@@ -308,7 +310,7 @@ mod tests {
 
     #[test]
     fn dump_flags_are_parsed() {
-        let cli = Cli::try_parse_from(["dunk", "dump", "--since", "7d", "--out", "out.csv"])
+        let cli = Cli::try_parse_from(["upstage", "dump", "--since", "7d", "--out", "out.csv"])
             .expect("dump parses with every flag set");
         match cli.command {
             Command::Dump { since, out } => {
@@ -321,9 +323,9 @@ mod tests {
 
     fn dump_test_config(db_path: &str) -> Config {
         let lookup = |name: &str| match name {
-            "DUNK_HOSTNAME" => Some("feed.example.com".to_string()),
-            "DUNK_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
-            "DUNK_DB_PATH" => Some(db_path.to_string()),
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_DB_PATH" => Some(db_path.to_string()),
             _ => None,
         };
         crate::config::load(lookup).expect("minimal config loads")
@@ -332,7 +334,7 @@ mod tests {
     // BC8: a bad `--since` surfaces through `CliError::Dump(DumpError::BadSince)`.
     #[tokio::test]
     async fn dispatch_on_bad_since_is_a_cli_dump_bad_since_error() {
-        let config = dump_test_config("/no/such/directory/dunk.db");
+        let config = dump_test_config("/no/such/directory/upstage.db");
         let command = Command::Dump { since: "nope".to_string(), out: None };
 
         let result = dispatch(&command, &config).await;
@@ -347,7 +349,7 @@ mod tests {
     // `CliError::Dump(DumpError::OutDirMissing)`.
     #[tokio::test]
     async fn dispatch_on_missing_out_dir_is_a_cli_dump_out_dir_missing_error() {
-        let config = dump_test_config("/no/such/directory/dunk.db");
+        let config = dump_test_config("/no/such/directory/upstage.db");
         let out = PathBuf::from("/no/such/out/dir/dump.csv");
         let command = Command::Dump { since: "24h".to_string(), out: Some(out.clone()) };
 
@@ -364,9 +366,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_over_real_database_writes_csv_and_reports_row_count() {
         let db_path =
-            std::env::temp_dir().join(format!("dunk-cli-dump-test-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("upstage-cli-dump-test-{}.db", std::process::id()));
         let csv_path =
-            std::env::temp_dir().join(format!("dunk-cli-dump-test-{}.csv", std::process::id()));
+            std::env::temp_dir().join(format!("upstage-cli-dump-test-{}.csv", std::process::id()));
         let config = dump_test_config(&db_path.to_string_lossy());
         let command = Command::Dump { since: "24h".to_string(), out: Some(csv_path.clone()) };
 

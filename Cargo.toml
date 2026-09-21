@@ -1,10 +1,10 @@
 [package]
-name = "dunk"
+name = "upstage"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "dunk"
+name = "upstage"
 path = "src/main.rs"
 
 [dependencies]

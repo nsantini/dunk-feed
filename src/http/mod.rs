@@ -77,11 +77,11 @@ pub struct AppState {
 }
 
 /// Every way `serve` can fail. `run` (`src/ingest/mod.rs`) wraps this as
-/// `IngestError::Http`; `main.rs` prints it and `dunk run` exits non-zero
+/// `IngestError::Http`; `main.rs` prints it and `upstage run` exits non-zero
 /// (BC23, BC43).
 #[derive(Debug, Error)]
 pub enum HttpError {
-    /// `DUNK_HTTP_ADDR` is already taken, or otherwise unbindable.
+    /// `UPSTAGE_HTTP_ADDR` is already taken, or otherwise unbindable.
     #[error("failed to bind {addr}: {source}")]
     Bind { addr: String, source: std::io::Error },
     /// `axum::serve` itself failed after a successful bind (BC43). `Bind`
@@ -178,9 +178,9 @@ mod tests {
     /// date.
     pub(crate) fn test_config(http_addr: &str) -> Config {
         let mut pairs: HashMap<String, String> = HashMap::new();
-        pairs.insert("DUNK_HOSTNAME".to_string(), "feed.example.com".to_string());
-        pairs.insert("DUNK_PUBLISHER_DID".to_string(), "did:plc:abc".to_string());
-        pairs.insert("DUNK_HTTP_ADDR".to_string(), http_addr.to_string());
+        pairs.insert("UPSTAGE_HOSTNAME".to_string(), "feed.example.com".to_string());
+        pairs.insert("UPSTAGE_PUBLISHER_DID".to_string(), "did:plc:abc".to_string());
+        pairs.insert("UPSTAGE_HTTP_ADDR".to_string(), http_addr.to_string());
         crate::config::load(move |name| pairs.get(name).cloned())
             .expect("test config must be valid")
     }
