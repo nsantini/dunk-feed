@@ -53,21 +53,21 @@ pub struct DumpSummary {
 /// seconds uses `checked_mul`, so a value with more digits than fit, or one
 /// whose seconds overflow `u64`, is `BadSince` rather than a wrapped value
 /// (BC11). No spaces, no sign, no other unit, no uppercase suffix (BC2).
+/// Splits on the `h` or `d` suffix with `strip_suffix`, never by byte index
+/// (BC22): a byte-index split panics on a value whose last character is more
+/// than one byte, for example `24é`.
 pub fn parse_since(value: &str) -> Result<u64, DumpError> {
     let bad = || DumpError::BadSince { value: value.to_string() };
-    if value.is_empty() {
+    let (digits, seconds_per_unit) = if let Some(digits) = value.strip_suffix('h') {
+        (digits, 3600u64)
+    } else if let Some(digits) = value.strip_suffix('d') {
+        (digits, 86400u64)
+    } else {
         return Err(bad());
-    }
-    let split_at = value.len() - 1;
-    let (digits, unit) = value.split_at(split_at);
+    };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad());
     }
-    let seconds_per_unit: u64 = match unit {
-        "h" => 3600,
-        "d" => 86400,
-        _ => return Err(bad()),
-    };
     let n: u64 = digits.parse().map_err(|_| bad())?;
     n.checked_mul(seconds_per_unit).ok_or_else(bad)
 }
@@ -126,24 +126,20 @@ fn fmt_opt_score(value: Option<f64>) -> String {
     value.map(|v| format!("{v:.3}")).unwrap_or_default()
 }
 
-/// The verified `Counts` a pair's six `v_*` columns describe, or `None`
-/// when the pair has no `feed` row (BC13): all six are set together by
-/// `feed::promote`, so checking `v_likes_q` alone tells whether the other
-/// five are present too.
-fn verified_counts(row: &DumpRow) -> Option<Counts> {
+/// The verified `Counts` one side's three `v_*` columns describe, or `None`
+/// when any of the three is missing (BC13): all six of a row's `v_*`
+/// columns are set together by `feed::promote`, so a `None` likes column
+/// means the whole `feed` row is absent. Called once per side with that
+/// side's three columns.
+fn verified_counts(
+    likes: Option<i64>,
+    reposts: Option<i64>,
+    replies: Option<i64>,
+) -> Option<Counts> {
     Some(Counts {
-        likes: u32::try_from(row.v_likes_q?).unwrap_or(u32::MAX),
-        reposts: u32::try_from(row.v_reposts_q?).unwrap_or(u32::MAX),
-        replies: u32::try_from(row.v_replies_q?).unwrap_or(u32::MAX),
-    })
-}
-
-/// Same as [`verified_counts`] for the original side.
-fn verified_counts_o(row: &DumpRow) -> Option<Counts> {
-    Some(Counts {
-        likes: u32::try_from(row.v_likes_o?).unwrap_or(u32::MAX),
-        reposts: u32::try_from(row.v_reposts_o?).unwrap_or(u32::MAX),
-        replies: u32::try_from(row.v_replies_o?).unwrap_or(u32::MAX),
+        likes: u32::try_from(likes?).unwrap_or(u32::MAX),
+        reposts: u32::try_from(reposts?).unwrap_or(u32::MAX),
+        replies: u32::try_from(replies?).unwrap_or(u32::MAX),
     })
 }
 
@@ -151,26 +147,27 @@ fn verified_counts_o(row: &DumpRow) -> Option<Counts> {
 /// `local_e_o` and `local_d` come from `row`'s own local counts (BC5: a
 /// missing `counts` row already reads zero by the time `pairs_since` built
 /// `row`). `verified_e_q`, `verified_e_o` and `verified_d` are recomputed
-/// from the six `v_*` columns with `weights` and `k`, not read from
-/// `row.ratio`: `feed.ratio` was computed against whatever config was
-/// running at promotion time, and an operator refitting the running config
-/// needs today's formula applied to the stored counts (BC14, BC15). Both
-/// sets of three cells are empty together when `row` has no `feed` row
+/// from the six `v_*` columns with `weights` and `k`, not read from a stored
+/// ratio: the value `feed` stored at promotion time was computed against
+/// whatever config was running then, and an operator refitting the running
+/// config needs today's formula applied to the stored counts (BC14, BC15).
+/// Both sets of three cells are empty together when `row` has no `feed` row
 /// (BC13).
 fn row_fields(row: &DumpRow, weights: &Weights, k: f64) -> [String; 27] {
     let local_e_q = score::engagement(&row.counts_q, weights);
     let local_e_o = score::engagement(&row.counts_o, weights);
     let local_d = score::ratio(local_e_q, local_e_o, k);
 
-    let (verified_e_q, verified_e_o, verified_d) =
-        match (verified_counts(row), verified_counts_o(row)) {
-            (Some(vq), Some(vo)) => {
-                let eq = score::engagement(&vq, weights);
-                let eo = score::engagement(&vo, weights);
-                (Some(eq), Some(eo), Some(score::ratio(eq, eo, k)))
-            }
-            _ => (None, None, None),
-        };
+    let vq = verified_counts(row.v_likes_q, row.v_reposts_q, row.v_replies_q);
+    let vo = verified_counts(row.v_likes_o, row.v_reposts_o, row.v_replies_o);
+    let (verified_e_q, verified_e_o, verified_d) = match (vq, vo) {
+        (Some(vq), Some(vo)) => {
+            let eq = score::engagement(&vq, weights);
+            let eo = score::engagement(&vo, weights);
+            (Some(eq), Some(eo), Some(score::ratio(eq, eo, k)))
+        }
+        _ => (None, None, None),
+    };
 
     [
         row.quote_uri.clone(),
@@ -203,33 +200,60 @@ fn row_fields(row: &DumpRow, weights: &Weights, k: f64) -> [String; 27] {
     ]
 }
 
-/// Renders `rows` as CSV: one header line (BC7: printed even with zero
-/// data rows) and one line per `DumpRow`, in the order `rows` is already in
-/// (BC16: `pairs_since` orders ascending by `first_seen_at`). Every field
-/// goes through `crate::csv::quote` (BC12).
-fn render_csv(rows: &[DumpRow], weights: &Weights, k: f64) -> String {
-    let mut out = String::new();
-    out.push_str(&COLUMN_HEADERS.join(","));
-    out.push('\n');
-    for row in rows {
-        let fields = row_fields(row, weights, k);
-        let quoted: Vec<String> = fields.iter().map(|field| crate::csv::quote(field)).collect();
-        out.push_str(&quoted.join(","));
-        out.push('\n');
-    }
-    out
+/// One `DumpRow` rendered as a CSV line, with every field through
+/// `crate::csv::quote` (BC12). Kept as a pure function, separate from the
+/// streaming write below, so a test can check one row's rendering without
+/// touching a file.
+fn render_row_line(row: &DumpRow, weights: &Weights, k: f64) -> String {
+    let fields = row_fields(row, weights, k);
+    let quoted: Vec<String> = fields.iter().map(|field| crate::csv::quote(field)).collect();
+    quoted.join(",")
 }
 
-/// Writes `contents` to `<path>.tmp` and renames it onto `path` (BC17,
-/// BC18): a write that fails part way through leaves no partial file at
-/// `path`, since nothing is ever written there directly, and a successful
-/// run leaves no `.tmp` beside it, since the rename consumes it.
-fn write_atomic(path: &Path, contents: &str) -> Result<(), DumpError> {
+/// `<path>.tmp`, the file `write_csv_atomic` writes to before the rename.
+fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
-    let tmp_path = PathBuf::from(tmp);
-    std::fs::write(&tmp_path, contents)?;
-    std::fs::rename(&tmp_path, path)?;
+    PathBuf::from(tmp)
+}
+
+/// Streams `rows` to `path` through a `BufWriter` instead of building one
+/// `String` in memory first: the header line (BC7: printed even with zero
+/// data rows), then one line per `DumpRow`, in the order `rows` is already
+/// in (BC16: `pairs_since` orders ascending by `first_seen_at`, then
+/// `quote_uri`). No `sync_all` is needed; the write is followed by a
+/// rename, not relied on to survive a crash on its own.
+fn write_csv_streamed(
+    path: &Path,
+    rows: &[DumpRow],
+    weights: &Weights,
+    k: f64,
+) -> Result<(), DumpError> {
+    use std::io::Write;
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    writeln!(writer, "{}", COLUMN_HEADERS.join(","))?;
+    for row in rows {
+        writeln!(writer, "{}", render_row_line(row, weights, k))?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Writes `rows` to `<path>.tmp` and renames it onto `path` (BC17, BC18): a
+/// write that fails part way through leaves no partial file at `path`,
+/// since nothing is ever written there directly, and a successful run
+/// leaves no `.tmp` beside it, since the rename consumes it. A failed
+/// rename removes the `.tmp` it left behind before returning the error; the
+/// removal is best effort, so its own failure never replaces the error the
+/// caller sees (BC17).
+fn write_atomic(path: &Path, rows: &[DumpRow], weights: &Weights, k: f64) -> Result<(), DumpError> {
+    let tmp_path = tmp_path_for(path);
+    write_csv_streamed(&tmp_path, rows, weights, k)?;
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(DumpError::Io(err));
+    }
     Ok(())
 }
 
@@ -253,9 +277,8 @@ pub fn run(cfg: &Config, since: &str, out: Option<PathBuf>) -> Result<DumpSummar
 
     let weights = Weights::from(cfg);
     let k = f64::from(cfg.k);
-    let csv = render_csv(&rows, &weights, k);
     let row_count = rows.len();
-    write_atomic(&out_path, &csv)?;
+    write_atomic(&out_path, &rows, &weights, k)?;
 
     Ok(DumpSummary { path: out_path, rows: row_count })
 }
@@ -278,7 +301,18 @@ mod tests {
 
     #[test]
     fn malformed_since_fails_fast() {
-        for bad in ["nope", "24", "24H", " 24h", "1w", "99999999999999999999h", ""] {
+        for bad in [
+            "nope",
+            "24",
+            "24H",
+            " 24h",
+            "1w",
+            "99999999999999999999h",
+            "",
+            "24é",
+            "2\u{ff14}h",
+            "h",
+        ] {
             match parse_since(bad) {
                 Err(DumpError::BadSince { value }) => assert_eq!(value, bad),
                 other => panic!("expected BadSince for {bad:?}, got {other:?}"),
@@ -598,28 +632,48 @@ mod tests {
     // one leaves no `.tmp` file beside it.
     #[test]
     fn write_atomic_leaves_no_tmp_on_success_and_no_output_on_failure() {
+        let weights = Weights { repost: 1.0, reply: 1.0 };
         let out = temp_csv_path("atomic-success");
-        write_atomic(&out, "header\n").expect("write succeeds");
+        write_atomic(&out, &[], &weights, 1.0).expect("write succeeds");
         assert!(out.exists());
         assert!(!PathBuf::from(format!("{}.tmp", out.display())).exists());
         let _ = std::fs::remove_file(&out);
 
         // Simulate a failed write by making the `.tmp` path a directory:
-        // `std::fs::write` to it fails with an `Io` error, and `write_atomic`
-        // never reaches the rename, so `out` itself is never created.
+        // `std::fs::File::create` on it fails with an `Io` error, and
+        // `write_atomic` never reaches the rename, so `out` itself is never
+        // created.
         let out = temp_csv_path("atomic-failure");
         let tmp_path = PathBuf::from(format!("{}.tmp", out.display()));
         std::fs::create_dir(&tmp_path).unwrap();
-        let result = write_atomic(&out, "header\n");
+        let result = write_atomic(&out, &[], &weights, 1.0);
         assert!(matches!(result, Err(DumpError::Io(_))));
         assert!(!out.exists());
         let _ = std::fs::remove_dir(&tmp_path);
     }
 
+    // BC17: a failed rename removes the `.tmp` it left behind, so no
+    // partial file survives at either path. Making the destination path a
+    // directory forces `std::fs::rename` to fail after the `.tmp` file was
+    // written successfully.
+    #[test]
+    fn write_atomic_removes_tmp_when_rename_fails() {
+        let weights = Weights { repost: 1.0, reply: 1.0 };
+        let out = temp_csv_path("atomic-rename-failure");
+        std::fs::create_dir(&out).unwrap();
+        let tmp_path = PathBuf::from(format!("{}.tmp", out.display()));
+
+        let result = write_atomic(&out, &[], &weights, 1.0);
+
+        assert!(matches!(result, Err(DumpError::Io(_))));
+        assert!(!tmp_path.exists(), "the .tmp file must be removed after a failed rename");
+        let _ = std::fs::remove_dir(&out);
+    }
+
     // BC2, BC11: the full `--since` table the story names.
     #[test]
     fn since_table_is_exhaustive() {
-        let cases: [(&str, Option<u64>); 9] = [
+        let cases: [(&str, Option<u64>); 12] = [
             ("24h", Some(24 * 3600)),
             ("7d", Some(7 * 86400)),
             ("0h", Some(0)),
@@ -629,6 +683,9 @@ mod tests {
             (" 24h", None),
             ("1w", None),
             ("99999999999999999999h", None),
+            ("24é", None),
+            ("2\u{ff14}h", None),
+            ("h", None),
         ];
         for (input, expected) in cases {
             match (parse_since(input), expected) {

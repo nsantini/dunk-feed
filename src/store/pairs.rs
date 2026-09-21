@@ -407,10 +407,12 @@ pub fn expire(
 /// One row of `dunk dump`'s CSV, TECH-DESIGN section 6 and `spec.md`'s
 /// column order. Carries the seven `pairs` columns, `state` and
 /// `drop_reason` as the raw text `pairs` stores them, both sides' local
-/// counts, and the six `v_*` verified counts plus `ratio` and
-/// `promoted_at` from `feed` as `None` when the pair has no `feed` row
-/// (BC13) or `Some` when it does (BC14). `dump.rs` renders `E` and `D`
-/// from these; this struct holds no derived value.
+/// counts, and the six `v_*` verified counts plus `promoted_at` from `feed`
+/// as `None` when the pair has no `feed` row (BC13) or `Some` when it does
+/// (BC14). `dump.rs` renders `E` and `D` from these; this struct holds no
+/// derived value, and carries no `ratio`: `dump.rs` recomputes `verified_d`
+/// from the six `v_*` counts with the running config rather than reading
+/// `feed.ratio`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DumpRow {
     pub quote_uri: String,
@@ -430,7 +432,6 @@ pub struct DumpRow {
     pub v_likes_o: Option<i64>,
     pub v_reposts_o: Option<i64>,
     pub v_replies_o: Option<i64>,
-    pub ratio: Option<f64>,
     pub promoted_at: Option<i64>,
 }
 
@@ -452,11 +453,12 @@ fn saturate_joined_count(value: Option<i64>) -> u32 {
 /// `quote_uri` and again on `original_uri` (aliased `cq` and `co`) attaches
 /// each side's local counts, defaulting to zero when that side has no
 /// `counts` row (BC5). `LEFT JOIN feed` on `quote_uri` attaches the
-/// verified counts, `ratio` and `promoted_at`, `None` across the board for
-/// a pair with no `feed` row (BC13, BC14). Ordered by `first_seen_at`
-/// ascending (BC16), the same order for the same window every run, through
-/// `prepare_cached` on the caller's connection (BC21: `Store::pairs_since`
-/// passes the read-only one).
+/// verified counts and `promoted_at`, `None` across the board for a pair
+/// with no `feed` row (BC13, BC14). Ordered by `first_seen_at` ascending,
+/// then `quote_uri` ascending (BC16), so two pairs sharing a `first_seen_at`
+/// come out in the same order every run, through `prepare_cached` on the
+/// caller's connection (BC21: `Store::pairs_since` passes the read-only
+/// one).
 pub fn pairs_since(conn: &Connection, cutoff: i64) -> Result<Vec<DumpRow>, StoreError> {
     let mut stmt = conn.prepare_cached(
         "SELECT p.quote_uri, p.quote_did, p.quote_cid, p.original_uri, p.original_did,
@@ -465,13 +467,13 @@ pub fn pairs_since(conn: &Connection, cutoff: i64) -> Result<Vec<DumpRow>, Store
                 co.likes, co.reposts, co.replies,
                 f.v_likes_q, f.v_reposts_q, f.v_replies_q,
                 f.v_likes_o, f.v_reposts_o, f.v_replies_o,
-                f.ratio, f.promoted_at
+                f.promoted_at
          FROM pairs p
          LEFT JOIN counts cq ON cq.post_uri = p.quote_uri
          LEFT JOIN counts co ON co.post_uri = p.original_uri
          LEFT JOIN feed f ON f.quote_uri = p.quote_uri
          WHERE p.first_seen_at >= ?1
-         ORDER BY p.first_seen_at",
+         ORDER BY p.first_seen_at, p.quote_uri",
     )?;
     let rows = stmt.query_map(rusqlite::params![cutoff], |row| {
         let likes_q: Option<i64> = row.get(9)?;
@@ -506,8 +508,7 @@ pub fn pairs_since(conn: &Connection, cutoff: i64) -> Result<Vec<DumpRow>, Store
             v_likes_o: row.get(18)?,
             v_reposts_o: row.get(19)?,
             v_replies_o: row.get(20)?,
-            ratio: row.get(21)?,
-            promoted_at: row.get(22)?,
+            promoted_at: row.get(21)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -1195,12 +1196,11 @@ mod tests {
         assert_eq!(row.v_likes_o, None);
         assert_eq!(row.v_reposts_o, None);
         assert_eq!(row.v_replies_o, None);
-        assert_eq!(row.ratio, None);
         assert_eq!(row.promoted_at, None);
     }
 
     // BC14: a promoted pair has `Some` in every verified column, plus
-    // `ratio` and `promoted_at`.
+    // `promoted_at`.
     #[test]
     fn pairs_since_promoted_has_verified_counts() {
         let conn = migrated_conn();
@@ -1220,8 +1220,29 @@ mod tests {
         assert_eq!(row.v_likes_o, Some(0));
         assert_eq!(row.v_reposts_o, Some(0));
         assert_eq!(row.v_replies_o, Some(0));
-        assert_eq!(row.ratio, Some(1.0));
         assert_eq!(row.promoted_at, Some(1_700_000_000));
+    }
+
+    // BC16: two pairs sharing a `first_seen_at` come back ordered by
+    // `quote_uri`, the tie-break, so the same window returns the same order
+    // every run.
+    #[test]
+    fn pairs_since_ties_on_first_seen_at_break_by_quote_uri() {
+        let conn = migrated_conn();
+        let earlier_uri = "at://did:plc:q/app.bsky.feed.post/a";
+        let later_uri = "at://did:plc:q/app.bsky.feed.post/b";
+        insert_test_pair(&conn, later_uri, "at://did:plc:o/app.bsky.feed.post/b-o");
+        insert_test_pair(&conn, earlier_uri, "at://did:plc:o/app.bsky.feed.post/a-o");
+        conn.execute(
+            "UPDATE pairs SET first_seen_at = 1_700_000_000 WHERE quote_uri IN (?1, ?2)",
+            [later_uri, earlier_uri],
+        )
+        .unwrap();
+
+        let found = pairs_since(&conn, 0).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].quote_uri, earlier_uri);
+        assert_eq!(found[1].quote_uri, later_uri);
     }
 
     // BC5: a pair with no `counts` row on either side reads zero, not an
