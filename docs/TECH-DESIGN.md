@@ -469,8 +469,12 @@ constants through env vars between runs. It shares `score.rs` and
 `appview/` with the service, so the formula under test is the formula that
 ships. No notebook, no Python.
 
-`dunk dump --since 24h` writes every pair with its local and verified counts to
-CSV for offline re-fitting of `P`, `M`, and the weights (PRD phase 4).
+`dunk dump --since 24h --out <path>` writes every pair first seen in the window,
+in all three states, with local counts, the verified counts from `feed` when a
+feed row exists, and `E` and `D` recomputed under the current config, to CSV
+for offline re-fitting of `P`, `M`, and the weights (PRD phase 4). The runbook's
+"Tuning with dunk dump" section says which columns to sort by. A demoted pair
+shows local counts only, because verified counts live only in `feed`.
 
 ## 11. Serving
 
