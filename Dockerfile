@@ -8,8 +8,16 @@
 FROM rust:1.98.1-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# Dependency cache layer. The binary crate is one compilation unit, so
+# touching the crate root recompiles every module; building once against a
+# stub main.rs compiles every dependency first, so a change confined to
+# src/ reuses this layer instead of rebuilding the dependency graph.
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release --locked
 COPY src/ src/
-RUN cargo build --release --locked
+# touch is not optional: without it, Docker's cached src/main.rs keeps the
+# mtime cargo already built against, so cargo sees no change and links the
+# stub binary instead of the real one.
+RUN touch src/main.rs && cargo build --release --locked
 
 # --- Runtime stage -------------------------------------------------------
 # debian:bookworm-slim, no added package. curl was measured and rejected:

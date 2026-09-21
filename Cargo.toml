@@ -30,6 +30,9 @@ tower-http = { version = "0.7.1", features = ["trace", "timeout"] }
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 
+# Strip, thin LTO and one codegen unit keep the release image under the
+# 40 MB cap (BC7). Fat LTO is out: the Docker builder has less memory than
+# the host, and the linker was killed under it.
 [profile.release]
 strip = true
 lto = "thin"

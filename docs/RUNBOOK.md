@@ -16,8 +16,12 @@ You need these before you start.
 
 1. Copy `.env.example` to `.env`.
 2. Fill in `DUNK_HOSTNAME` and `DUNK_PUBLISHER_DID`. These are the only two
-   variables with no default. `src/config.rs` rejects the container start
-   when either one is empty or holds only whitespace.
+   required variables. `src/config.rs` rejects the container start when
+   either one is empty or holds only whitespace.
+
+   Three more variables have no default but are optional: `BSKY_HANDLE`
+   and `BSKY_APP_PASSWORD`, needed only when you run `dunk publish`, and
+   `TUNNEL_TOKEN`, needed only for the tunnel variant.
 3. Pick one Compose file. Use `compose.yaml` for a Cloudflare Tunnel. Use
    `compose.proxied.yaml` for Cloudflare's proxied DNS with port 3000
    published. See "Cloudflare setup" below for both.
@@ -162,6 +166,13 @@ The Jetstream cursor is checkpointed to SQLite. A restart under 36 hours
 resumes with no gap. A restart over 36 hours loses the events in between,
 because Jetstream's own retention window ends at 36 hours.
 
+`compose.yaml` pins `cloudflared` to a specific tag, `2026.9.1` today,
+instead of `latest`. This keeps an unrelated upgrade, such as a Dunk Feed
+code change, from also pulling a new `cloudflared` release. To bump the
+pin, check the current release on Docker Hub, edit the tag in
+`compose.yaml`, then run `docker compose -f compose.yaml up -d --build` as
+a normal upgrade.
+
 ## Tuning knobs
 
 Each of these lives in `.env`. A change needs `docker compose -f <file> up
@@ -176,11 +187,17 @@ Each of these lives in `.env`. A change needs `docker compose -f <file> up
 | `DUNK_K` | Smooths the score more, damping small engagement counts further | Smooths the score less |
 | `DUNK_FOLLOWER_FLOOR` | Requires more followers before an author's post can score. `0` disables the guard | Lets authors with fewer followers score |
 | `DUNK_GUARD_HISTOGRAM_H` | Keeps the follower-distribution log line running longer after start | Stops the log line sooner. `0` disables the period; the floor stays live regardless |
+| `DUNK_SCORER_INTERVAL_S` (default 60) | Runs the scorer pass less often, using less CPU but leaving new candidates unscored longer | Runs the pass more often, scoring candidates sooner but using more CPU. Raise `DUNK_HEALTH_MAX_LAG_S` above the new value too, or `/healthz` flips unhealthy between passes |
+| `DUNK_REVERIFY_INTERVAL_S` (default 600) | Re-checks promoted pairs against the App View less often, using fewer App View calls but catching a block or a takedown later | Re-checks more often, catching a block or a takedown sooner but using more App View calls |
+| `DUNK_HEALTH_MAX_LAG_S` (default 300) | Tolerates a longer gap since the last Jetstream commit or scorer pass before `/healthz` turns 503, so a slow patch is less likely to trip your monitoring | Tolerates a shorter gap, so `/healthz` catches a stall sooner but is more likely to flip on a normal slow pass |
 
 `dunk dump` exists today only as a stub: it prints its own name and does
-nothing else. Story 12 ships its real behaviour, printing the current feed
-snapshot, so you can judge a tuning change against real rows instead of
-against logs alone.
+nothing else. Story 12 ships its real behaviour: `dunk dump --since 24h
+--out <path>` writes a CSV of every pair seen in the window, in all three
+states, `candidate`, `promoted` and `dropped`, with each pair's local and
+verified counts and a `state` and a `drop_reason` column. You can then
+re-fit `DUNK_P`, `DUNK_M` and the weights offline, against real rows
+instead of against logs alone.
 
 ## Failure modes
 
@@ -210,14 +227,15 @@ The writer thread errors and the process exits non-zero. Docker's restart
 policy starts it again. The Jetstream cursor resumes from its last
 checkpoint. Free disk space on the volume, or the restart loop repeats.
 
-### A task panicking under `JoinSet` supervision
+### A task panicking under the task supervisor
 
-`dunk run` supervises the ingest, scorer and HTTP tasks in one `JoinSet`. A
-panicking task becomes a logged error, never a re-panic, so the writer
-still flushes. The first task to stop flips a shutdown signal; the others
-are awaited and logged; the process exits with the first error as its exit
-reason. Docker's restart policy starts a fresh process. Read the logs for
-the task name and the error before you restart, so you know what to check.
+`dunk run` supervises the ingest, scorer and HTTP tasks in one task
+supervisor. A panicking task becomes a logged error, never a re-panic, so
+the writer still flushes. The first task to stop flips a shutdown signal;
+the others are awaited and logged; the process exits with the first error
+as its exit reason. Docker's restart policy starts a fresh process. Read
+the logs for the task name and the error before you restart, so you know
+what to check.
 
 ### Out of memory at the 512 MB limit
 
@@ -234,7 +252,7 @@ restart's gap.
 | BC3 | `/healthz` returns 200 | Docker marks the container healthy | No action |
 | BC4 | `TUNNEL_TOKEN` is missing or empty, tunnel variant | `cloudflared` exits non-zero immediately | `dunk` keeps running, reachable only on the Compose network. Set `TUNNEL_TOKEN` in `.env` and restart `cloudflared` |
 | BC5 | Port 3000 is unreachable from outside, proxied variant | No response from the public hostname | Check the VM firewall and Cloudflare's proxy status. This is not a container-level failure |
-| BC6 | Container RSS reaches 512 MB | Docker's `mem_limit` kills the container, `restart: unless-stopped` starts it again | The Jetstream cursor makes the restart gapless within 36 hours, per the upgrade section above. No action needed unless it repeats |
+| BC6 | Container memory use reaches 512 MB | Docker's `mem_limit` kills the container, `restart: unless-stopped` starts it again | The Jetstream cursor makes the restart gapless within 36 hours, per the upgrade section above. No action needed unless it repeats |
 
 ## Health states
 
@@ -257,8 +275,10 @@ and for a slow first Jetstream commit. A check that fails inside
 `start_period` does not count toward `retries`, so a generous value costs
 nothing. A container still unhealthy after two minutes has a real
 problem; read the logs. If you raise `DUNK_SCORER_INTERVAL_S`, raise
-`start_period` in both `compose.yaml` and `compose.proxied.yaml` too, to
-keep the same margin.
+`DUNK_HEALTH_MAX_LAG_S` above it, or the container flips unhealthy between
+passes. `last_pass_age_s` climbs to one full scorer interval between
+passes, so a scorer interval above the threshold trips `/healthz` every
+time.
 
 ## Cloudflare setup
 

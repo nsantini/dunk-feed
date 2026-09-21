@@ -17,3 +17,6 @@ each story through the workflow plugin. Gate commands and code rules are in
 
 To build and run this project you need a stable Rust toolchain through
 `rustup` (`cargo`, `rustfmt`, `clippy`), and Docker for the container build.
+
+To deploy, back up, or upgrade a running feed, see
+[docs/RUNBOOK.md](docs/RUNBOOK.md).
