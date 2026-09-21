@@ -13,8 +13,10 @@ RUN cargo build --release --locked
 
 # --- Runtime stage -------------------------------------------------------
 # debian:bookworm-slim, no added package. curl was measured and rejected:
-# it pushes this layer past the 40 MB image cap (BC7), so the healthcheck
-# below uses bash's /dev/tcp instead.
+# it fits under the 40 MB image cap (BC7) but leaves only 2.3 MB of
+# headroom on an architecture this build has not measured, and it would
+# add libcurl and its dependencies to a runtime surface a localhost health
+# probe does not need. The healthcheck below uses bash's /dev/tcp instead.
 FROM debian:bookworm-slim AS runtime
 
 RUN groupadd --gid 10001 dunk \
