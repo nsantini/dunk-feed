@@ -5,6 +5,8 @@
 mod appview;
 mod cli;
 mod config;
+mod csv;
+mod dump;
 mod health;
 mod http;
 mod ingest;

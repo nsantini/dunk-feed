@@ -374,27 +374,17 @@ pub fn render_table(rows: &[Row]) -> String {
     out
 }
 
-/// Wraps `field` in `"..."` when it holds a `,`, a `"` or a newline,
-/// doubling each inner `"` (BC20). Hand-written: the spec's Non-goals rule
-/// out a CSV crate for one column set this small.
-fn csv_quote(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_string()
-    }
-}
-
 /// Renders `rows` as CSV, TECH-DESIGN section 10 step 4. The same rows, in
 /// the same order, as [`render_table`] (BC19), one header line, and no post
-/// text: [`Row`] never carries any.
+/// text: [`Row`] never carries any. Field quoting (BC20) goes through
+/// `crate::csv::quote`, the one escaper `validate` and `dump` share.
 pub fn render_csv(rows: &[Row]) -> String {
     let mut out = String::new();
     out.push_str(&COLUMN_HEADERS.join(","));
     out.push('\n');
     for row in rows {
         let fields = row_fields(row);
-        let quoted: Vec<String> = fields.iter().map(|field| csv_quote(field)).collect();
+        let quoted: Vec<String> = fields.iter().map(|field| crate::csv::quote(field)).collect();
         out.push_str(&quoted.join(","));
         out.push('\n');
     }
@@ -1215,11 +1205,13 @@ mod tests {
 
     #[test]
     fn csv_quoting_wraps_fields_that_need_it() {
-        // BC20.
-        assert_eq!(csv_quote("plain"), "plain");
-        assert_eq!(csv_quote("has,comma"), "\"has,comma\"");
-        assert_eq!(csv_quote("has\"quote"), "\"has\"\"quote\"");
-        assert_eq!(csv_quote("has\nnewline"), "\"has\nnewline\"");
+        // BC20. The escaper itself now lives in `crate::csv`, whose own
+        // tests cover its rules directly; this test only proves `validate`
+        // still calls through it and gets the same behaviour.
+        assert_eq!(crate::csv::quote("plain"), "plain");
+        assert_eq!(crate::csv::quote("has,comma"), "\"has,comma\"");
+        assert_eq!(crate::csv::quote("has\"quote"), "\"has\"\"quote\"");
+        assert_eq!(crate::csv::quote("has\nnewline"), "\"has\nnewline\"");
     }
 
     #[test]
