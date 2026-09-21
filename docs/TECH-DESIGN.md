@@ -137,6 +137,9 @@ once at start and fails fast on a bad value.
 |---|---|---|
 | `DUNK_DB_PATH` | `/data/dunk.db` | SQLite file |
 | `DUNK_HTTP_ADDR` | `0.0.0.0:3000` | Listen address |
+| `DUNK_AUTHOR_TTL_H` | `24` | Freshness of an `authors` cache row |
+| `DUNK_AUTHOR_INACTIVE_TTL_H` | `1` | Freshness of a row written from a profile missing in `getProfiles`, so a transient omission does not suppress an author for a day |
+| `DUNK_GUARD_HISTOGRAM_H` | `24` | Hours after first pass, or after a floor change, during which the scorer logs the `O` author follower histogram; 0 disables |
 | `DUNK_HEALTH_MAX_LAG_S` | `300` | `/healthz` goes 503 when the Jetstream lag or the last scorer pass age passes this |
 | `DUNK_HOSTNAME` | required | Public hostname, forms `did:web:<hostname>` |
 | `DUNK_PUBLISHER_DID` | required | Your account DID. Forms the feed at-URI |
@@ -436,8 +439,15 @@ views we already fetch. That replaces the PRD's "subscribe to the labeler"
 step with zero extra traffic. A third-party labeler would still need a
 subscription. That is out of scope.
 
-Before the follower floor drops anything, story 10 logs the follower count
-distribution of `O` authors for one day so the default can be set on data.
+The follower floor is live from the first pass. Alongside it, for
+`DUNK_GUARD_HISTOGRAM_H` hours after the first pass, and again whenever
+`DUNK_FOLLOWER_FLOOR` changes, the scorer logs one line per pass with the
+follower histogram of distinct `O` authors and the count the floor dropped, so
+the default can be re-set on this deployment's data. Measuring does not need
+the floor suppressed, and suppressing it would put quotes of small accounts in
+the public feed for a day (review of story 10, 2026-09-21). Guards run only
+on pairs that already qualify on verified counts, which is what keeps
+`getProfiles` at one call per 25 new original authors.
 
 ## 10. Phase 0 validation, `dunk validate`
 

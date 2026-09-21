@@ -81,6 +81,13 @@ measurement uses the exact code path that later drops pairs.
   window, carrying the full histogram of `O` authors' follower counts seen
   that pass.
 
+## Superseded on 2026-09-21 (review)
+
+BC11 and BC12 changed: the follower floor drops from the first pass; the
+window (`DUNK_GUARD_HISTOGRAM_H`, was `DUNK_GUARD_LOG_ONLY_H`) only controls
+histogram logging and reopens when the floor changes. Guards run after the
+score check. TECH-DESIGN §9 has the reason.
+
 ## Suggested slices
 
 - 1.0 `store/authors.rs` 24h cache. Done when `cargo test store::authors`
