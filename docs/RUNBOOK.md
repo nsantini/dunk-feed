@@ -9,6 +9,8 @@ mode in `docs/TECH-DESIGN.md` section 13.
 You need these before you start.
 
 - Docker and the Compose plugin, installed on the VM.
+- For the host-proxy variant only: `cloudflared` and nginx, both already
+  running on the host.
 - A Cloudflare account, with a domain on it as an active zone. See
   "Cloudflare setup" below.
 - A Bluesky account for the feed. See "Bluesky account setup" below.
@@ -75,16 +77,22 @@ URI and refuses every other.
    Three more variables have no default but are optional: `BSKY_HANDLE`
    and `BSKY_APP_PASSWORD`, needed only when you run `upstage publish`, and
    `TUNNEL_TOKEN`, needed only for the tunnel variant.
-3. Pick one Compose file. Use `compose.yaml` for a Cloudflare Tunnel. Use
-   `compose.proxied.yaml` for Cloudflare's proxied DNS with port 3000
-   published. See "Cloudflare setup" below for both.
+3. Pick one Compose file:
+
+   | File | Use it when |
+   |---|---|
+   | `compose.yaml` | The host runs no tunnel yet. Compose starts one |
+   | `compose.hostproxy.yaml` | The host already runs `cloudflared` and nginx |
+   | `compose.proxied.yaml` | Cloudflare's proxied DNS reaches port 3000 directly |
+
+   See "Cloudflare setup" below for all three.
 4. Run `docker compose -f <file> up -d --build`.
 5. Watch `/healthz` turn from 503 to 200. See "Health states" below for the
    two bodies.
 
-Both Compose files use the same `upstage-data` volume and the same Compose
-project name. Do not run both variants at once against the same project;
-they would share one database and one set of container names.
+All three Compose files use the same `upstage-data` volume and the same
+Compose project name. Do not run two variants at once against the same
+project. They share one database and one set of container names.
 
 ## Publishing the feed record
 
@@ -435,6 +443,70 @@ CAUTION: Keep the record orange-cloud, that is proxied. A grey-cloud record
 sends visitors straight to port 3000 over plain HTTP. Bluesky then cannot
 resolve `did:web:<hostname>`, and the VM IP becomes public.
 
+### Host-proxy variant, `compose.hostproxy.yaml`
+
+When the host already runs `cloudflared` and nginx, use this variant. The
+tunnel and its token stay as they are. You add one public hostname and one
+nginx server block.
+
+`compose.hostproxy.yaml` starts no `cloudflared` service. It publishes port
+3000 on the loopback interface, as `127.0.0.1:3000:3000`. nginx reaches the
+container over loopback. Nothing else reaches it, so the host needs no
+inbound firewall rule.
+
+The feed needs the root of its own hostname. It serves
+`/.well-known/did.json` and the `/xrpc/` paths there. A path under an
+existing hostname does not work.
+
+1. Pick a subdomain for the feed. See "Where `UPSTAGE_HOSTNAME` comes from"
+   above.
+2. Make sure that port 3000 is free on the host:
+
+   ```
+   lsof -nP -iTCP:3000 -sTCP:LISTEN
+   ```
+
+   If another process holds the port, change the host side of the port line
+   in `compose.hostproxy.yaml`, for example `127.0.0.1:3100:3000`. Keep the
+   container side at 3000, or set `UPSTAGE_HTTP_ADDR` to the new port.
+3. Add an nginx server block for the subdomain. The `listen` port is the
+   port that the tunnel already sends traffic to:
+
+   ```
+   server {
+       listen 8080;
+       server_name <UPSTAGE_HOSTNAME>;
+
+       location / {
+           proxy_pass http://127.0.0.1:3000;
+           proxy_set_header Host              $host;
+           proxy_set_header X-Real-IP         $remote_addr;
+           proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+           proxy_set_header X-Forwarded-Proto https;
+       }
+   }
+   ```
+
+4. Test the nginx configuration with `nginx -t`. Then reload nginx.
+5. Open the Cloudflare Zero Trust dashboard. Go to Networks, then Tunnels.
+6. Open the tunnel that the host already runs. Add a public hostname.
+7. Set its subdomain and domain to `UPSTAGE_HOSTNAME`. Leave the path
+   empty.
+8. Set the service type to HTTP. Set the service URL to `localhost:8080`,
+   the nginx `listen` port.
+9. Save the public hostname.
+
+Leave `TUNNEL_TOKEN` empty. The connector on the host carries the traffic,
+and `src/config.rs` never reads this variable.
+
+Step 9 creates the proxied CNAME record for the hostname. Do not also
+create an A record. Two records for one name break the tunnel.
+
+CAUTION: Do not start a second `cloudflared` with the token of the tunnel
+that the host already runs. Both connectors then serve one tunnel, and
+Cloudflare divides the traffic between them. The connector that cannot
+reach `upstage` answers with error 502.
+
 ### Confirming the hostname
 
 Do this check after `up -d` and before `upstage publish`. `publish` writes
@@ -452,11 +524,13 @@ Cloudflare disagree.
 | Result | Cause | Action |
 |---|---|---|
 | The `id` field holds another hostname | `UPSTAGE_HOSTNAME` in `.env` is wrong | Correct `.env`, then run `docker compose -f <file> up -d` again |
-| Cloudflare error 1033, or a 502 | The tunnel is not connected | Read `docker compose -f compose.yaml logs -f cloudflared` |
+| Cloudflare error 1033 | The tunnel is not connected | Tunnel variant: read `docker compose -f compose.yaml logs -f cloudflared`. Host-proxy variant: read the logs of the host's `cloudflared` |
+| A 502, tunnel variant | `cloudflared` cannot reach `upstage:3000` | Make sure that the container runs and that `/healthz` answers |
+| A 502, host-proxy variant | nginx cannot reach the container, or `server_name` does not match | Run `nginx -t`. Then run `curl localhost:3000/healthz` on the host |
 | Cloudflare error 521 | The proxy cannot reach port 3000 | Make sure that the firewall accepts Cloudflare's IP ranges |
 | A TLS error | The record is grey-cloud, or the TLS mode is Full | Set the record to proxied, and the mode to Flexible |
 | `NXDOMAIN` from the resolver | No DNS record exists for the hostname | Create the record for the variant you picked, above |
 
-In both variants, `UPSTAGE_HOSTNAME` must match the Cloudflare hostname
+In every variant, `UPSTAGE_HOSTNAME` must match the Cloudflare hostname
 exactly. It forms `did:web:<hostname>`, and the feed breaks if the two
 differ.
