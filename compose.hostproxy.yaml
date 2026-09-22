@@ -1,0 +1,36 @@
+# Host-proxy variant. `cloudflared` and nginx already run on the host, so
+# this file starts no tunnel of its own. `upstage` publishes port 3000 on
+# the loopback interface only. nginx reverse-proxies the feed's subdomain
+# to it, and the existing tunnel carries the traffic in. Nothing listens on
+# a public interface, so the host needs no inbound firewall rule.
+# See docs/RUNBOOK.md.
+services:
+  upstage:
+    build: .
+    image: upstage
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    mem_limit: 512m
+    ports:
+      # Loopback only. nginx reaches this; nothing else can.
+      # Change the host side if 3000 is taken on the host. Keep the
+      # container side at 3000, or set UPSTAGE_HTTP_ADDR to match.
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - upstage-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3000 && printf \"GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && head -n 1 <&3 | grep -q \" 200 \""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  upstage-data:
