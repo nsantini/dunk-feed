@@ -4,6 +4,22 @@
 - **PRD story**: Viewers without a valid login
 - **Size**: large
 - **Design**: docs/02-TECH-DESIGN-network-feed.md §5, §9.4, §10, §4
+- **Flag**: `UPSTAGE_PERSONALISE` (default `false`)
+
+## Release
+
+This story merges and deploys with `UPSTAGE_PERSONALISE=false`, the
+default. The served feed does not change. The flag hides the JWT check,
+the empty pages, the `private, no-store` header and the resolver task.
+
+To turn the feature on in one environment, set `UPSTAGE_PERSONALISE=true`
+in the `.env` of that environment. Then restart with `docker compose -f
+<file> up -d`. The flag applies to the whole process. There is no flag for
+one user.
+
+Rollback is `UPSTAGE_PERSONALISE=false` and a restart. No deploy is
+necessary. A revert of the pull request is also safe, because the story
+adds no table.
 
 ## Outcome
 
@@ -93,7 +109,7 @@ keys generated in the test and use DID document fixtures.
 - [ ] AC8 — With the switch `true`, every empty page and every success sends `private, no-store`. Checked by: `cargo test http::skeleton::tests::personalised_headers`
 - [ ] AC9 — With the switch `false`, output and headers equal story 01 output. Checked by: `cargo test http::skeleton::tests::switch_off_unchanged`
 - [ ] AC10 — `AGENTS.md` names `auth/` as the only DID resolver caller. Checked by: manual review.
-- [ ] AC11 — All four gates pass.
+- [ ] AC11 — All four gates pass. Checked by: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` and `cargo build --release`.
 
 ## Defaults taken
 
@@ -115,3 +131,124 @@ keys generated in the test and use DID document fixtures.
   AC6 pass.
 - 3.0 Config, handler branch, headers, resolver start in `run`. Done when
   AC7 to AC9 pass and all four gates pass.
+
+## Testing steps
+
+1. Prepare the shell. Copy `.env.example` to `.env` and fill in the
+   required values. Put a copy of a database with feed rows at
+   `./upstage.db`, for example a production backup. Then run:
+
+   ```
+   export $(grep -v '^#' .env | xargs)
+   export UPSTAGE_DB_PATH=./upstage.db
+   FEED="at://$UPSTAGE_PUBLISHER_DID/app.bsky.feed.generator/$UPSTAGE_FEED_RKEY"
+   SKEL="http://localhost:3000/xrpc/app.bsky.feed.getFeedSkeleton?feed=$FEED"
+   ```
+
+   Expected: The commands exit 0. `echo $SKEL` prints the feed URL.
+
+2. Log in as a test viewer. Use an account on `bsky.social` that follows
+   some authors in the feed.
+
+   ```
+   VIEWER_HANDLE=<test viewer handle>
+   VIEWER_DID=$(curl -s "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=$VIEWER_HANDLE" | jq -r .did)
+   ACCESS=$(curl -s -X POST https://bsky.social/xrpc/com.atproto.server.createSession \
+     -H 'Content-Type: application/json' \
+     -d "{\"identifier\":\"$VIEWER_HANDLE\",\"password\":\"<viewer app password>\"}" | jq -r .accessJwt)
+   token() { curl -s -H "Authorization: Bearer $ACCESS" \
+     "https://bsky.social/xrpc/com.atproto.server.getServiceAuth?aud=${1:-did:web:$UPSTAGE_HOSTNAME}&lxm=app.bsky.feed.getFeedSkeleton&exp=$(( $(date +%s) + ${2:-1800} ))" | jq -r .token; }
+   TOKEN=$(token)
+   ```
+
+   Expected: `echo $VIEWER_DID` prints a DID. `echo $TOKEN` prints three
+   parts with a dot between each part.
+
+3. Start the service with the flag at its default. Send a request with a
+   bearer value that is not a token.
+
+   ```
+   cargo run --release -- run 2>&1 | tee run-off.log
+   # in a second shell, after one scorer pass:
+   curl -si -H "Authorization: Bearer abc" "$SKEL&limit=30"
+   ```
+
+   Expected: Status 200. The `feed` array holds global items. The header
+   `Cache-Control: public, max-age=30` is present.
+
+4. Stop the service. Start it again with the flag on.
+
+   ```
+   UPSTAGE_PERSONALISE=true cargo run --release -- run 2>&1 | tee run.log
+   ```
+
+   Expected: The service starts.
+
+5. Send a request with no `Authorization` header.
+
+   ```
+   curl -si "$SKEL&limit=30"
+   ```
+
+   Expected: Status 200. The body is `{"feed":[]}` with no `cursor`. The
+   header `Cache-Control: private, no-store` is present.
+
+6. Send a request with a bearer value that is not a token.
+
+   ```
+   curl -si -H "Authorization: Bearer abc" "$SKEL&limit=30"
+   ```
+
+   Expected: The same empty page as in step 5.
+
+7. Send the first request with the valid token.
+
+   ```
+   curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"
+   ```
+
+   Expected: The same empty page. The response comes back at once, because
+   the key is not in the cache yet.
+
+8. Wait 5 seconds. Send the same request again.
+
+   ```
+   sleep 5; curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"
+   ```
+
+   Expected: Status 200. The `feed` array holds the global items. The
+   header `Cache-Control: private, no-store` is present.
+
+9. Send a token with a wrong audience.
+
+   ```
+   curl -si -H "Authorization: Bearer $(token did:web:wrong.example)" "$SKEL&limit=30"
+   ```
+
+   Expected: The empty page from step 5.
+
+10. Send a token that expired more than 30 seconds ago.
+
+    ```
+    SHORT=$(token "" 5); sleep 40
+    curl -si -H "Authorization: Bearer $SHORT" "$SKEL&limit=30"
+    ```
+
+    Expected: The empty page from step 5.
+
+11. Search the log for the viewer DID and the token.
+
+    ```
+    grep -c "$VIEWER_DID" run.log; grep -c "$TOKEN" run.log
+    ```
+
+    Expected: 0 and 0.
+
+12. Stop the service. Start it with a flag value that is not valid.
+
+    ```
+    UPSTAGE_PERSONALISE=yes cargo run --release -- run
+    ```
+
+    Expected: The service does not start. The error names
+    `UPSTAGE_PERSONALISE`.

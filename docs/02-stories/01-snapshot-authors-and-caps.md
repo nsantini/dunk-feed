@@ -4,6 +4,15 @@
 - **PRD story**: none (prefactor)
 - **Size**: standard
 - **Design**: docs/02-TECH-DESIGN-network-feed.md §9.1
+- **Flag**: none, because this prefactor changes internal data only. The served feed bytes do not change
+
+## Release
+
+This story ships in the next normal deploy. It has no flag, because
+viewers see no change. The response bytes stay the same for the same rows.
+
+Rollback is a revert of the pull request and a new deploy. The story adds
+no table and no stored data. A revert is safe at any time.
 
 ## Outcome
 
@@ -65,7 +74,7 @@ regression test.
 - [ ] AC2 — `caps::apply` on a subset ignores items outside the subset. Checked by: `cargo test scorer::snapshot::caps::tests::subset_frees_slots`
 - [ ] AC3 — The existing cap tests pass against `caps::apply`. Checked by: `cargo test scorer::snapshot::caps`
 - [ ] AC4 — A full page and a cursor page are byte-for-byte equal to the `01` output for the same rows. Checked by: `cargo test http::skeleton::tests::global_output_unchanged`
-- [ ] AC5 — All four gates pass.
+- [ ] AC5 — All four gates pass. Checked by: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` and `cargo build --release`.
 
 ## Defaults taken
 
@@ -85,3 +94,60 @@ regression test.
   oracle. Done when `global_matches_v1` passes.
 - 3.0 Skeleton and health read `global`. Done when
   `global_output_unchanged` passes and all four gates pass.
+
+## Testing steps
+
+1. Prepare the shell. Copy `.env.example` to `.env` and fill in the
+   required values. Put a copy of a database with feed rows at
+   `./upstage.db`, for example a production backup. Then run:
+
+   ```
+   export $(grep -v '^#' .env | xargs)
+   export UPSTAGE_DB_PATH=./upstage.db
+   FEED="at://$UPSTAGE_PUBLISHER_DID/app.bsky.feed.generator/$UPSTAGE_FEED_RKEY"
+   SKEL="http://localhost:3000/xrpc/app.bsky.feed.getFeedSkeleton?feed=$FEED"
+   ```
+
+   Expected: The commands exit 0. `echo $SKEL` prints the feed URL.
+
+2. Start the service. Wait for one scorer pass (60 s by default).
+
+   ```
+   cargo run --release -- run 2>&1 | tee run.log
+   ```
+
+   Expected: The service starts and stays up.
+
+3. Read the served list length.
+
+   ```
+   curl -s localhost:3000/healthz | jq .snapshot_len
+   ```
+
+   Expected: A number above 0. Write it down as N.
+
+4. Read the first page.
+
+   ```
+   curl -si "$SKEL&limit=30"
+   ```
+
+   Expected: Status 200. The header `Cache-Control: public, max-age=30` is
+   present. The `feed` array has 30 items. The body has a `cursor` when N
+   is more than 30.
+
+5. Page through the whole feed. Do this inside one scorer interval. If a
+   scorer pass starts during the loop, do the step again.
+
+   ```
+   c=""; : > posts.txt
+   while :; do
+     r=$(curl -s "$SKEL&limit=100${c:+&cursor=$c}")
+     echo "$r" | jq -r '.feed[].post' >> posts.txt
+     c=$(echo "$r" | jq -r '.cursor // empty'); [ -z "$c" ] && break
+   done
+   wc -l < posts.txt; sort posts.txt | uniq -d | wc -l
+   ```
+
+   Expected: The first number is N. The second number is 0, so no post
+   repeats.

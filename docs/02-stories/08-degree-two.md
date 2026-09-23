@@ -4,6 +4,22 @@
 - **PRD story**: Discover people one step out; First open builds my circle
 - **Size**: standard
 - **Design**: docs/02-TECH-DESIGN-network-feed.md §6.2 step 3, §6.4, §8, §9.2
+- **Flag**: `UPSTAGE_PERSONALISE` (default `false`)
+
+## Release
+
+This story merges and deploys with `UPSTAGE_PERSONALISE=false`, the
+default. The served feed does not change, and the graph worker does not
+start. The flag hides the degree-2 step and the pairs it adds.
+
+To turn the feature on in one environment, set `UPSTAGE_PERSONALISE=true`
+in the `.env` of that environment. Then restart with `docker compose -f
+<file> up -d`. The flag applies to the whole process. There is no flag for
+one user.
+
+Rollback is `UPSTAGE_PERSONALISE=false` and a restart. A revert of the
+pull request is also possible, because the story adds no migration. The
+`follows_cache` rows stay in SQLite.
 
 ## Outcome
 
@@ -72,7 +88,7 @@ passes it to `connected_indices`, and drops it after the list is built.
 - [ ] AC4 — Degree-2 pairs are kept at every depth, with no rank change. Checked by: `cargo test http::viewer::tests::degree2_kept_same_rank`
 - [ ] AC5 — Followers of followers are not kept. Checked by: `cargo test http::viewer::tests::no_followers_of_followers`
 - [ ] AC6 — Items from earlier steps stay after step 3. Checked by: `cargo test http::viewer::tests::step3_keeps_earlier_items`
-- [ ] AC7 — All four gates pass.
+- [ ] AC7 — All four gates pass. Checked by: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` and `cargo build --release`.
 
 ## Defaults taken
 
@@ -90,3 +106,128 @@ passes it to `connected_indices`, and drops it after the list is built.
 - 2.0 Step 3 in the worker. Done when AC1 passes.
 - 3.0 Degree-2 set in the viewer list. Done when AC4 to AC6 pass and all
   four gates pass.
+
+## Testing steps
+
+1. Prepare the shell. Copy `.env.example` to `.env` and fill in the
+   required values. Put a copy of a database with feed rows at
+   `./upstage.db`, for example a production backup. Then run:
+
+   ```
+   export $(grep -v '^#' .env | xargs)
+   export UPSTAGE_DB_PATH=./upstage.db
+   FEED="at://$UPSTAGE_PUBLISHER_DID/app.bsky.feed.generator/$UPSTAGE_FEED_RKEY"
+   SKEL="http://localhost:3000/xrpc/app.bsky.feed.getFeedSkeleton?feed=$FEED"
+   ```
+
+   Expected: The commands exit 0. `echo $SKEL` prints the feed URL.
+
+2. Log in as a test viewer. Use an account on `bsky.social` that follows
+   some authors in the feed.
+
+   ```
+   VIEWER_HANDLE=<test viewer handle>
+   VIEWER_DID=$(curl -s "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=$VIEWER_HANDLE" | jq -r .did)
+   ACCESS=$(curl -s -X POST https://bsky.social/xrpc/com.atproto.server.createSession \
+     -H 'Content-Type: application/json' \
+     -d "{\"identifier\":\"$VIEWER_HANDLE\",\"password\":\"<viewer app password>\"}" | jq -r .accessJwt)
+   token() { curl -s -H "Authorization: Bearer $ACCESS" \
+     "https://bsky.social/xrpc/com.atproto.server.getServiceAuth?aud=${1:-did:web:$UPSTAGE_HOSTNAME}&lxm=app.bsky.feed.getFeedSkeleton&exp=$(( $(date +%s) + ${2:-1800} ))" | jq -r .token; }
+   TOKEN=$(token)
+   ```
+
+   Expected: `echo $VIEWER_DID` prints a DID. `echo $TOKEN` prints three
+   parts with a dot between each part.
+
+3. Start the service with the flag on. `.env` must set `BSKY_HANDLE` and
+   `BSKY_APP_PASSWORD`. Wait for one scorer pass.
+
+   ```
+   UPSTAGE_PERSONALISE=true cargo run --release -- run 2>&1 | tee run.log
+   ```
+
+   Expected: The service starts. `curl -s localhost:3000/healthz | jq
+   .snapshot_len` prints a number above 0.
+
+4. Make sure that the viewer has no circle yet.
+
+   ```
+   sqlite3 "$UPSTAGE_DB_PATH" "SELECT count(*) FROM viewers WHERE viewer_did='$VIEWER_DID'"
+   ```
+
+   Expected: 0. If not, use another test viewer.
+
+5. Send the first request. Read the circle state each second. When the
+   state is `building_d2`, save the viewer's list.
+
+   ```
+   curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"
+   for i in $(seq 30); do sqlite3 "$UPSTAGE_DB_PATH" "SELECT state FROM viewers WHERE viewer_did='$VIEWER_DID'"; sleep 1; done
+   # when the state is building_d2:
+   c=""; : > before-d2.txt
+   while :; do
+     r=$(curl -s -H "Authorization: Bearer $TOKEN" "$SKEL&limit=100${c:+&cursor=$c}")
+     echo "$r" | jq -r '.feed[].post' >> before-d2.txt
+     c=$(echo "$r" | jq -r '.cursor // empty'); [ -z "$c" ] && break
+   done
+   wc -l < before-d2.txt; sort before-d2.txt | uniq -d | wc -l
+   ```
+
+   Expected: The state reaches `building_d2`, then `ready`.
+
+6. Save the viewer's list again after the state is `ready`. Do steps 5 and
+   6 inside one scorer interval.
+
+   ```
+   c=""; : > after-d2.txt
+   while :; do
+     r=$(curl -s -H "Authorization: Bearer $TOKEN" "$SKEL&limit=100${c:+&cursor=$c}")
+     echo "$r" | jq -r '.feed[].post' >> after-d2.txt
+     c=$(echo "$r" | jq -r '.cursor // empty'); [ -z "$c" ] && break
+   done
+   wc -l < after-d2.txt; sort after-d2.txt | uniq -d | wc -l
+   comm -23 <(sort before-d2.txt) <(sort after-d2.txt) | wc -l
+   ```
+
+   Expected: The last number is 0. Every item from before step 3 is still
+   in the list.
+
+7. Read the shared follows cache.
+
+   ```
+   sqlite3 -separator ' ' "$UPSTAGE_DB_PATH" \
+     "SELECT account_did, fetched_at FROM follows_cache ORDER BY account_did" > cache-1.txt
+   wc -l < cache-1.txt
+   ```
+
+   Expected: A number from 1 to `UPSTAGE_D2_FOLLOWS_SAMPLE` (100 by
+   default).
+
+8. Log in as a second test viewer B, as in step 2. B must follow some of
+   the same accounts as viewer A. Build B's circle. Then compare the
+   cache.
+
+   ```
+   curl -s -H "Authorization: Bearer $TOKEN_B" "$SKEL&limit=30" > /dev/null; sleep 30
+   sqlite3 -separator ' ' "$UPSTAGE_DB_PATH" \
+     "SELECT account_did, fetched_at FROM follows_cache ORDER BY account_did" > cache-2.txt
+   join cache-1.txt cache-2.txt | awk '$2 != $3' | wc -l
+   ```
+
+   Expected: 0. B's build made no new call for an account that A's build
+   fetched.
+
+9. Restart the service. Send two requests with A's token, 5 seconds apart.
+   Then compare the cache.
+
+   ```
+   UPSTAGE_PERSONALISE=true cargo run --release -- run 2>&1 | tee run-2.log
+   # in a second shell:
+   curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"; sleep 5; curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"
+   sqlite3 -separator ' ' "$UPSTAGE_DB_PATH" \
+     "SELECT account_did, fetched_at FROM follows_cache ORDER BY account_did" > cache-3.txt
+   diff cache-2.txt cache-3.txt && echo same
+   ```
+
+   Expected: The second response holds items. The command prints `same`.
+   The cache entries loaded from SQLite with no new fetch.

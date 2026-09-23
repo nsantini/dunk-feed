@@ -4,6 +4,21 @@
 - **PRD story**: Read feed health
 - **Size**: small
 - **Design**: docs/02-TECH-DESIGN-network-feed.md §11
+- **Flag**: `UPSTAGE_PERSONALISE` (default `false`)
+
+## Release
+
+This story merges and deploys with `UPSTAGE_PERSONALISE=false`, the
+default. The served feed does not change, and the metrics task does not
+start. The flag hides the `graph.health` line.
+
+To turn the feature on in one environment, set `UPSTAGE_PERSONALISE=true`
+in the `.env` of that environment. Then restart with `docker compose -f
+<file> up -d`. The flag applies to the whole process. There is no flag for
+one user.
+
+Rollback is `UPSTAGE_PERSONALISE=false` and a restart. A revert of the
+pull request is also possible, because the story adds no migration.
 
 ## Outcome
 
@@ -66,7 +81,7 @@ inputs, so tests do not need a clock or a log.
 - [ ] AC2 — The degree-2-only flag is right for items with mixed connections. Checked by: `cargo test graph::filter::tests::degree2_only_flag`
 - [ ] AC3 — Counters reset after each line. Checked by: `cargo test graph::metrics::tests::counters_reset`
 - [ ] AC4 — A run of first build, refresh, eviction and one health line at `trace` level writes no viewer DID in any line. Checked by: `cargo test graph::metrics::tests::no_viewer_did_in_logs`
-- [ ] AC5 — All four gates pass.
+- [ ] AC5 — All four gates pass. Checked by: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` and `cargo build --release`.
 
 ## Defaults taken
 
@@ -82,3 +97,100 @@ inputs, so tests do not need a clock or a log.
 - 2.0 `health_line`, the hourly task and the reset. Done when AC1 and AC3
   pass.
 - 3.0 Log privacy test. Done when AC4 passes and all four gates pass.
+
+## Testing steps
+
+1. Prepare the shell. Copy `.env.example` to `.env` and fill in the
+   required values. Put a copy of a database with feed rows at
+   `./upstage.db`, for example a production backup. Then run:
+
+   ```
+   export $(grep -v '^#' .env | xargs)
+   export UPSTAGE_DB_PATH=./upstage.db
+   FEED="at://$UPSTAGE_PUBLISHER_DID/app.bsky.feed.generator/$UPSTAGE_FEED_RKEY"
+   SKEL="http://localhost:3000/xrpc/app.bsky.feed.getFeedSkeleton?feed=$FEED"
+   ```
+
+   Expected: The commands exit 0. `echo $SKEL` prints the feed URL.
+
+2. Log in as a test viewer. Use an account on `bsky.social` that follows
+   some authors in the feed.
+
+   ```
+   VIEWER_HANDLE=<test viewer handle>
+   VIEWER_DID=$(curl -s "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=$VIEWER_HANDLE" | jq -r .did)
+   ACCESS=$(curl -s -X POST https://bsky.social/xrpc/com.atproto.server.createSession \
+     -H 'Content-Type: application/json' \
+     -d "{\"identifier\":\"$VIEWER_HANDLE\",\"password\":\"<viewer app password>\"}" | jq -r .accessJwt)
+   token() { curl -s -H "Authorization: Bearer $ACCESS" \
+     "https://bsky.social/xrpc/com.atproto.server.getServiceAuth?aud=${1:-did:web:$UPSTAGE_HOSTNAME}&lxm=app.bsky.feed.getFeedSkeleton&exp=$(( $(date +%s) + ${2:-1800} ))" | jq -r .token; }
+   TOKEN=$(token)
+   ```
+
+   Expected: `echo $VIEWER_DID` prints a DID. `echo $TOKEN` prints three
+   parts with a dot between each part.
+
+3. Start the service with the flag on and `trace` logs. `.env` must set
+   `BSKY_HANDLE` and `BSKY_APP_PASSWORD`.
+
+   ```
+   UPSTAGE_PERSONALISE=true UPSTAGE_LOG=trace cargo run --release -- run 2>&1 | tee run.log
+   ```
+
+   Expected: The service starts.
+
+4. Build the viewer's circle.
+
+   ```
+   curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"; sleep 30; curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"
+   ```
+
+   Expected: The second response holds items.
+
+5. Wait one hour after startup. Read the health line.
+
+   ```
+   sleep 3600; grep '"graph.health"' run.log | jq .
+   ```
+
+   Expected: One line. It has `active_viewers`, `median_new_pairs_24h`,
+   `zero_share`, `median_discovery_share`, `evicted_1h`, `graph_calls_1h`
+   and `queue_depth`.
+
+6. Check the values of the health line.
+
+   ```
+   grep '"graph.health"' run.log | head -1 | jq .
+   ```
+
+   Expected: `active_viewers` is 1. `zero_share` is from 0 to 1.
+   `evicted_1h` has the keys `idle` and `lru`. `queue_depth` has the keys
+   `first_build`, `refresh` and `refill`. `graph_calls_1h` counts calls by
+   method.
+
+7. Send no request. Wait one more hour. Read the second line.
+
+   ```
+   sleep 3600; grep '"graph.health"' run.log | tail -1 | jq .
+   ```
+
+   Expected: The counts cover only the second hour. They do not add the
+   counts of the first hour.
+
+8. Search the log for the viewer DID and handle.
+
+   ```
+   grep -c "$VIEWER_DID" run.log; grep -c "$VIEWER_HANDLE" run.log
+   ```
+
+   Expected: 0 and 0.
+
+9. Restart the service with the flag off. Wait one hour.
+
+   ```
+   UPSTAGE_PERSONALISE=false cargo run --release -- run 2>&1 | tee run-off.log
+   # one hour later:
+   grep -c '"graph.health"' run-off.log
+   ```
+
+   Expected: 0. The metrics task does not start.
