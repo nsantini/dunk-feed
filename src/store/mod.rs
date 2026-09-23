@@ -262,6 +262,28 @@ impl Store {
         })
     }
 
+    /// Opens a file database at `path` read-only (story 03 spec.md BC15):
+    /// `SQLITE_OPEN_READ_ONLY`, no `schema::migrate` call and no write
+    /// pragma (`apply_reader_pragmas` sets only `cache_size` and
+    /// `busy_timeout`, both per-connection properties, never
+    /// `journal_mode` or a schema write). `graph_probe` (story 03) opens
+    /// the store this way so a probe run can never insert, update, delete
+    /// or touch the schema version, even by accident. There is no separate
+    /// `read_conn`: `feed_rows` and every other read here already fall
+    /// back to `self.conn` through `read_lock` when `read_conn` is `None`
+    /// (BC74, BC75), so a single read-only connection is enough.
+    #[allow(dead_code)] // First caller is `graph_probe` (story 03, slice 4.0).
+    pub fn open_read_only(path: &str) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|source| StoreError::Open { path: path.to_string(), source })?;
+        apply_reader_pragmas(&conn)?;
+        Ok(Store {
+            conn: Arc::new(Mutex::new(conn)),
+            read_conn: None,
+            writer_started: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// Opens an in-memory database. Tests use this so the writer thread and
     /// every read share the same connection (BC75). No production caller:
     /// `upstage run` always opens a file through `open`/`open_path`.
@@ -705,6 +727,42 @@ mod tests {
         let write_guard = store.conn.lock().unwrap();
         assert_eq!(store.meta_get("zstd_dict_id").unwrap(), Some("abc123".to_string()));
         drop(write_guard);
+
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    }
+
+    // Story 03 spec.md BC15: `Store::open_read_only` opens with
+    // `SQLITE_OPEN_READ_ONLY`, runs no migration and sets no write pragma;
+    // `feed_rows` still works, a write through it fails, and opening or
+    // reading through it never changes the file's bytes.
+    #[test]
+    fn open_read_only() {
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("upstage-store-open-read-only-{nanos}.sqlite3"));
+        let path_str = path.to_str().unwrap().to_string();
+
+        // Seed a real, migrated schema, then drop the writable `Store` so
+        // its WAL is checkpointed back into the main file before the
+        // read-only open reads it.
+        {
+            let store = Store::open_path(&path_str).unwrap();
+            drop(store);
+        }
+        let bytes_before = std::fs::read(&path_str).unwrap();
+
+        let store = Store::open_read_only(&path_str).unwrap();
+        assert!(store.feed_rows().unwrap().is_empty());
+
+        let write_result =
+            store.lock().unwrap().execute("INSERT INTO meta (key, value) VALUES ('x', 'y')", []);
+        assert!(write_result.is_err(), "a write through the read-only connection fails");
+
+        let bytes_after = std::fs::read(&path_str).unwrap();
+        assert_eq!(bytes_before, bytes_after, "opening and reading never changes the file");
 
         let _ = std::fs::remove_file(&path_str);
         let _ = std::fs::remove_file(format!("{path_str}-wal"));

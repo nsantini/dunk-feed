@@ -7,6 +7,8 @@ mod cli;
 mod config;
 mod csv;
 mod dump;
+mod graph;
+mod graph_probe;
 mod health;
 mod http;
 mod ingest;

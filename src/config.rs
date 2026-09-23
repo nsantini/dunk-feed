@@ -98,6 +98,19 @@ pub struct Config {
     /// because a deactivation is often temporary. `0` is rejected, the same
     /// rule as `author_ttl_h`.
     pub author_inactive_ttl_h: u32,
+    /// Ranked items `graph::build::step_follows_me` checks are the first
+    /// this-many (`UPSTAGE_FOLLOWS_ME_DEPTH`, story 03 spec.md BC2). The
+    /// connection filter (`graph::filter::connected_indices`, BC6) keeps a
+    /// `follows_me`-only author only within this same depth.
+    pub follows_me_depth: u32,
+    /// DIDs `graph::build::step_follows` samples into `Circle::d2_sample`
+    /// for `step_degree2` to expand (`UPSTAGE_D2_FOLLOWS_SAMPLE`, story 03
+    /// spec.md BC1).
+    pub d2_follows_sample: u32,
+    /// The `getFollows` page limit `graph::build::step_degree2` requests
+    /// for each degree-2 account (`UPSTAGE_D2_FOLLOWS_DEPTH`, story 03
+    /// spec.md BC4).
+    pub d2_follows_depth: u32,
 }
 
 impl Config {
@@ -461,6 +474,9 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
             "UPSTAGE_AUTHOR_INACTIVE_TTL_H",
             1,
         )?,
+        follows_me_depth: positive_u32_or_default(&lookup, "UPSTAGE_FOLLOWS_ME_DEPTH", 1000)?,
+        d2_follows_sample: positive_u32_or_default(&lookup, "UPSTAGE_D2_FOLLOWS_SAMPLE", 100)?,
+        d2_follows_depth: positive_u32_or_default(&lookup, "UPSTAGE_D2_FOLLOWS_DEPTH", 100)?,
     })
 }
 
@@ -575,6 +591,9 @@ mod tests {
         assert_eq!(config.guard_histogram_h, 24);
         assert_eq!(config.author_ttl_h, 24);
         assert_eq!(config.author_inactive_ttl_h, 1);
+        assert_eq!(config.follows_me_depth, 1000);
+        assert_eq!(config.d2_follows_sample, 100);
+        assert_eq!(config.d2_follows_depth, 100);
     }
 
     #[test]
@@ -999,6 +1018,127 @@ mod tests {
         pairs.push(("UPSTAGE_AUTHOR_INACTIVE_TTL_H", "2"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.author_inactive_ttl_h, 2);
+    }
+
+    #[test]
+    fn graph_depth_defaults() {
+        // BC17: the three graph-probe depth variables default to 1000, 100
+        // and 100 when unset.
+        let config = load(env(&required_pair())).unwrap();
+        assert_eq!(config.follows_me_depth, 1000);
+        assert_eq!(config.d2_follows_sample, 100);
+        assert_eq!(config.d2_follows_depth, 100);
+    }
+
+    #[test]
+    fn custom_follows_me_depth_is_read() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_FOLLOWS_ME_DEPTH", "500"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.follows_me_depth, 500);
+    }
+
+    #[test]
+    fn zero_follows_me_depth_is_invalid() {
+        // BC17a.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_FOLLOWS_ME_DEPTH", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "UPSTAGE_FOLLOWS_ME_DEPTH");
+                assert_eq!(reason, "must be greater than zero");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_follows_me_depth_is_invalid() {
+        // BC17a: u32 cannot represent a negative value, so it fails to parse.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_FOLLOWS_ME_DEPTH", "-1"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_FOLLOWS_ME_DEPTH"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_follows_me_depth_is_invalid() {
+        // BC17a.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_FOLLOWS_ME_DEPTH", "soon"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_FOLLOWS_ME_DEPTH"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_d2_follows_sample_is_read() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_D2_FOLLOWS_SAMPLE", "50"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.d2_follows_sample, 50);
+    }
+
+    #[test]
+    fn zero_d2_follows_sample_is_invalid() {
+        // BC17a.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_D2_FOLLOWS_SAMPLE", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_D2_FOLLOWS_SAMPLE"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_d2_follows_sample_is_invalid() {
+        // BC17a.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_D2_FOLLOWS_SAMPLE", "soon"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_D2_FOLLOWS_SAMPLE"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_d2_follows_depth_is_read() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_D2_FOLLOWS_DEPTH", "20"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.d2_follows_depth, 20);
+    }
+
+    #[test]
+    fn zero_d2_follows_depth_is_invalid() {
+        // BC17a.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_D2_FOLLOWS_DEPTH", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_D2_FOLLOWS_DEPTH"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_d2_follows_depth_is_invalid() {
+        // BC17a.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_D2_FOLLOWS_DEPTH", "soon"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_D2_FOLLOWS_DEPTH"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]
