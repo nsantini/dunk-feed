@@ -24,6 +24,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::Utc;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -278,6 +279,51 @@ fn session_from_body(method: &'static str, body: &Value) -> Result<Session, PdsE
     Ok(Session { did, access_jwt: Secret::new(access), refresh_jwt: Secret::new(refresh), exp })
 }
 
+/// `get_relationships` refuses more than this many DIDs in one call before
+/// any network request (BC10). TECH-DESIGN-network-feed §6.2 sends
+/// `others` in groups of 30; this is the AT Protocol's own limit on
+/// `app.bsky.graph.getRelationships`, not a value from `Config`.
+const RELATIONSHIPS_MAX: usize = 30;
+
+/// `get_follows`'s only field of interest in each `follows` entry: the
+/// subject's own DID (BC9). Every other field of the profile view is
+/// ignored; `serde` drops fields not named here.
+#[derive(Debug, Clone, Deserialize)]
+struct FollowSubject {
+    did: String,
+}
+
+/// The decoded shape of `app.bsky.graph.getFollows` (BC9, BC9a). `cursor`
+/// is absent from the last page, which `serde`'s `default` turns into
+/// `None` rather than a decode failure.
+#[derive(Debug, Clone, Deserialize)]
+struct GetFollowsResponse {
+    follows: Vec<FollowSubject>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+/// One page of `get_follows`: the subject DIDs of that page, in response
+/// order, and the cursor for the next page, `None` on the last page
+/// (BC9, BC9a). The caller's own loop follows `cursor` until it is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowsPage {
+    pub dids: Vec<String>,
+    pub cursor: Option<String>,
+}
+
+/// The decoded shape of `app.bsky.graph.getRelationships`: each entry of
+/// `relationships` is left as a raw [`Value`] rather than a typed enum,
+/// because the only two shapes that matter here, `#relationship` (with
+/// `did` and, when present, `followedBy`) and `#notFoundActor` (with
+/// neither), are told apart by which fields are present, not by matching
+/// on `$type` (BC11).
+#[derive(Debug, Clone, Deserialize)]
+struct GetRelationshipsResponse {
+    #[serde(default)]
+    relationships: Vec<Value>,
+}
+
 /// The shared PDS session, TECH-DESIGN-network-feed §7: one login, a
 /// limiter at `graph_rps`, and the refresh/retry rules every call goes
 /// through. Generic over [`PdsTransport`] so tests use a fake that records
@@ -520,6 +566,70 @@ impl<T: PdsTransport> PdsClient<T> {
         }
         decode_attempted(nsid, attempted)
     }
+
+    /// `app.bsky.graph.getFollows`, one page (BC9). `sort=latest` is
+    /// always sent, matching TECH-DESIGN-network-feed §6.2's requirement
+    /// that a fresh follow reaches the front of the list. `cursor` is
+    /// omitted from the query when `None`, the first-page case. Returns
+    /// the subject DIDs in response order and the next cursor, `None` on
+    /// the last page (BC9a); a caller loops on that cursor to page to the
+    /// end, story 03's probe and story 06's graph worker.
+    pub async fn get_follows(
+        &self,
+        actor: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<FollowsPage, PdsError> {
+        let limit = limit.to_string();
+        let mut query: Vec<(&str, &str)> =
+            vec![("actor", actor), ("limit", &limit), ("sort", "latest")];
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor));
+        }
+        let response: GetFollowsResponse = self
+            .call(HttpMethod::Get, "app.bsky.graph.getFollows", &query, RequestBody::None)
+            .await?;
+        Ok(FollowsPage {
+            dids: response.follows.into_iter().map(|subject| subject.did).collect(),
+            cursor: response.cursor,
+        })
+    }
+
+    /// `app.bsky.graph.getRelationships` (BC10, BC10a, BC11). Refuses more
+    /// than [`RELATIONSHIPS_MAX`] DIDs before any network call
+    /// (`PdsError::TooMany`), and makes no call at all for an empty
+    /// `others`. Each `other` is sent as its own `others` query parameter,
+    /// the same repeated-parameter shape [`crate::appview::AppViewClient`]
+    /// uses for `uris` and `actors`. Returns the DIDs whose relationship
+    /// entry carries a `followedBy` field, in response order;
+    /// `notFoundActor` entries and entries without `followedBy` are
+    /// skipped, never an error.
+    pub async fn get_relationships(
+        &self,
+        actor: &str,
+        others: &[String],
+    ) -> Result<Vec<String>, PdsError> {
+        if others.len() > RELATIONSHIPS_MAX {
+            return Err(PdsError::TooMany { count: others.len() });
+        }
+        if others.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query: Vec<(&str, &str)> = vec![("actor", actor)];
+        query.extend(others.iter().map(|other| ("others", other.as_str())));
+        let response: GetRelationshipsResponse = self
+            .call(HttpMethod::Get, "app.bsky.graph.getRelationships", &query, RequestBody::None)
+            .await?;
+        Ok(response
+            .relationships
+            .into_iter()
+            .filter_map(|relationship| {
+                let did = relationship.get("did")?.as_str()?.to_string();
+                relationship.get("followedBy")?;
+                Some(did)
+            })
+            .collect())
+    }
 }
 
 impl PdsClient<HttpPdsTransport> {
@@ -571,6 +681,7 @@ mod tests {
         nsid: &'static str,
         bearer: Option<String>,
         proxy: bool,
+        query: Vec<(String, String)>,
     }
 
     /// A recording fake `PdsTransport`: `push_ok`/`push_transport_error`
@@ -612,13 +723,14 @@ mod tests {
             nsid: &'static str,
             bearer: Option<&str>,
             proxy: bool,
-            _query: &[(&str, &str)],
+            query: &[(&str, &str)],
             _body: RequestBody,
         ) -> Result<RawResponse, TransportError> {
             self.calls.lock().expect("lock").push(RecordedCall {
                 nsid,
                 bearer: bearer.map(str::to_string),
                 proxy,
+                query: query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             });
             match self.responses.lock().expect("lock").pop_front() {
                 Some(Ok(response)) => Ok(response),
@@ -924,6 +1036,126 @@ mod tests {
         let client =
             PdsClient::new(transport, creds(), 1000.0).expect("valid rate builds a client");
         assert!(!format!("{client:?}").contains("app-pass"));
+    }
+
+    #[tokio::test]
+    async fn get_follows_pages() {
+        // AC4, BC9, BC9a: a caller loop follows the cursor to the end,
+        // keeping the subject DIDs in response order across pages, and
+        // stops once a page carries no cursor.
+        let transport = FakeTransport::new();
+        transport.push_ok(
+            200,
+            session_body("did:plc:actor", &access_token(far_future_exp()), "refresh-1"),
+        );
+        transport.push_ok(
+            200,
+            json!({
+                "follows": [{"did": "did:plc:one"}, {"did": "did:plc:two"}],
+                "cursor": "page-2",
+            }),
+        );
+        transport.push_ok(200, json!({ "follows": [{"did": "did:plc:three"}] }));
+
+        let client =
+            PdsClient::new(transport.clone(), creds(), 1000.0).expect("valid rate builds a client");
+
+        let mut dids = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = client
+                .get_follows("did:plc:viewer", 100, cursor.as_deref())
+                .await
+                .expect("get_follows succeeds");
+            dids.extend(page.dids);
+            match page.cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            dids,
+            vec!["did:plc:one".to_string(), "did:plc:two".to_string(), "did:plc:three".to_string()]
+        );
+
+        let calls = transport.calls();
+        let first_page = calls
+            .iter()
+            .find(|call| {
+                call.nsid == "app.bsky.graph.getFollows"
+                    && call.query.iter().all(|(k, _)| k != "cursor")
+            })
+            .expect("first page has no cursor param");
+        assert!(first_page.proxy, "app.bsky.* carries the proxy header (BC5)");
+        assert!(first_page.query.contains(&("actor".to_string(), "did:plc:viewer".to_string())));
+        assert!(first_page.query.contains(&("limit".to_string(), "100".to_string())));
+        assert!(first_page.query.contains(&("sort".to_string(), "latest".to_string())));
+
+        let second_page = calls
+            .iter()
+            .find(|call| {
+                call.nsid == "app.bsky.graph.getFollows"
+                    && call.query.iter().any(|(k, _)| k == "cursor")
+            })
+            .expect("second page carries the cursor from the first page");
+        assert!(second_page.query.contains(&("cursor".to_string(), "page-2".to_string())));
+    }
+
+    #[tokio::test]
+    async fn get_relationships() {
+        // AC5, BC10, BC10a, BC11: more than 30 DIDs is refused before any
+        // network call, an empty list makes no call either, and the
+        // result keeps only the DIDs whose relationship has `followedBy`.
+        let transport = FakeTransport::new();
+        transport.push_ok(
+            200,
+            session_body("did:plc:actor", &access_token(far_future_exp()), "refresh-1"),
+        );
+        transport.push_ok(
+            200,
+            json!({
+                "relationships": [
+                    {"did": "did:plc:a", "followedBy": "at://did:plc:a/app.bsky.graph.follow/1"},
+                    {"did": "did:plc:b"},
+                    {"$type": "app.bsky.graph.defs#notFoundActor", "actor": "did:plc:c"},
+                ],
+            }),
+        );
+
+        let client =
+            PdsClient::new(transport.clone(), creds(), 1000.0).expect("valid rate builds a client");
+
+        let too_many: Vec<String> = (0..31).map(|i| format!("did:plc:{i}")).collect();
+        let err = client.get_relationships("did:plc:viewer", &too_many).await.unwrap_err();
+        assert!(matches!(err, PdsError::TooMany { count: 31 }));
+        assert!(transport.calls().is_empty(), "TooMany makes no network call");
+
+        let empty = client
+            .get_relationships("did:plc:viewer", &[])
+            .await
+            .expect("empty others succeeds with no call");
+        assert!(empty.is_empty());
+        assert!(transport.calls().is_empty(), "empty others makes no network call");
+
+        let others =
+            vec!["did:plc:a".to_string(), "did:plc:b".to_string(), "did:plc:c".to_string()];
+        let follows_me = client
+            .get_relationships("did:plc:viewer", &others)
+            .await
+            .expect("get_relationships succeeds");
+        assert_eq!(follows_me, vec!["did:plc:a".to_string()]);
+
+        let call = transport
+            .calls()
+            .into_iter()
+            .find(|call| call.nsid == "app.bsky.graph.getRelationships")
+            .expect("call recorded");
+        assert!(call.proxy, "app.bsky.* carries the proxy header (BC5)");
+        assert!(call.query.contains(&("actor".to_string(), "did:plc:viewer".to_string())));
+        for other in &others {
+            assert!(call.query.contains(&("others".to_string(), other.clone())));
+        }
     }
 }
 
