@@ -10,6 +10,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 pub mod build;
 pub mod circle;
+pub mod filter;
 
 /// A DID's `xxh3_64` hash, kept in place of the DID string wherever a
 /// `Circle` or the connection filter only needs to compare, not print, an
