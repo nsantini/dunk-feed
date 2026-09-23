@@ -32,6 +32,7 @@ use tokio::time::{self, MissedTickBehavior};
 
 use crate::appview::{http_client, retry_decision, RetryDecision};
 use crate::config::{Config, Secret};
+use crate::graph::build::{FollowsPage as GraphFollowsPage, GraphSource};
 
 /// `com.atproto.server.createSession`'s nsid, used both to build the URL
 /// and to label a login failure (BC1).
@@ -371,6 +372,46 @@ pub struct FollowsPage {
 struct GetRelationshipsResponse {
     #[serde(default)]
     relationships: Vec<Value>,
+}
+
+/// `com.atproto.identity.resolveHandle`'s only field of interest: the
+/// resolved DID (story 03 spec.md `Files in scope`).
+#[derive(Debug, Clone, Deserialize)]
+struct ResolveHandleResponse {
+    did: String,
+}
+
+/// One `app.bsky.graph.follow` record's field of interest: the DID it
+/// follows (story 03 spec.md BC14's order check).
+#[derive(Debug, Clone, Deserialize)]
+struct FollowRecordValue {
+    subject: String,
+}
+
+/// One entry of `com.atproto.repo.listRecords`'s `records` array, for the
+/// `app.bsky.graph.follow` collection (BC14). `uri` and `cid` are ignored;
+/// only the record's own value matters here.
+#[derive(Debug, Clone, Deserialize)]
+struct FollowRecordEntry {
+    value: FollowRecordValue,
+}
+
+/// The decoded shape of `com.atproto.repo.listRecords` (BC14). `cursor` is
+/// never followed: `graph_probe`'s order check (slice 4.0) only wants the
+/// first page.
+#[derive(Debug, Clone, Deserialize)]
+struct ListRecordsResponse {
+    #[serde(default)]
+    records: Vec<FollowRecordEntry>,
+}
+
+/// [`PdsClient::list_follow_records`]'s result: either the subject DIDs of
+/// the newest `app.bsky.graph.follow` records, or the non-2xx status a
+/// caller should skip past rather than fail the whole probe on (BC14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListFollowRecordsOutcome {
+    Ok(Vec<String>),
+    Failed(u16),
 }
 
 /// The shared PDS session, TECH-DESIGN-network-feed §7: one login, a
@@ -744,6 +785,92 @@ impl<T: PdsTransport> PdsClient<T> {
                 Some(did)
             })
             .collect())
+    }
+
+    /// `com.atproto.identity.resolveHandle`, never proxied ([`wants_proxy`]:
+    /// the nsid does not start with `app.bsky.`). Returns the DID that
+    /// `handle` resolves to; `graph_probe` (slice 4.0) resolves each
+    /// `--handle` argument to a DID this way before using it in any graph
+    /// call, so the DID is never printed (story 03 spec.md BC16).
+    pub async fn resolve_handle(&self, handle: &str) -> Result<String, PdsError> {
+        let response: ResolveHandleResponse = self
+            .call(
+                HttpMethod::Get,
+                "com.atproto.identity.resolveHandle",
+                &[("handle", handle)],
+                RequestBody::None,
+            )
+            .await?;
+        Ok(response.did)
+    }
+
+    /// `com.atproto.repo.listRecords` over the `app.bsky.graph.follow`
+    /// collection, `reverse=true` so the record with the highest (most
+    /// recent) `rkey` TID comes first — the newest follow, matching what a
+    /// fresh `getFollows` page shows at its own front. `graph_probe`'s
+    /// order check (slice 4.0, BC14) compares this page against
+    /// `get_follows`'s first page by subject DID and position. A non-2xx
+    /// status is returned as `Ok(ListFollowRecordsOutcome::Failed(status))`
+    /// rather than an error, so that check can print
+    /// `order check: skipped (<status>)` and move on instead of failing
+    /// the whole probe; any other failure (a transport error, a decode
+    /// failure, a session failure) still propagates as `Err`.
+    pub async fn list_follow_records(
+        &self,
+        repo: &str,
+        limit: u32,
+    ) -> Result<ListFollowRecordsOutcome, PdsError> {
+        let limit = limit.to_string();
+        let query: [(&str, &str); 4] = [
+            ("repo", repo),
+            ("collection", "app.bsky.graph.follow"),
+            ("limit", &limit),
+            ("reverse", "true"),
+        ];
+        match self
+            .call::<ListRecordsResponse>(
+                HttpMethod::Get,
+                "com.atproto.repo.listRecords",
+                &query,
+                RequestBody::None,
+            )
+            .await
+        {
+            Ok(response) => Ok(ListFollowRecordsOutcome::Ok(
+                response.records.into_iter().map(|record| record.value.subject).collect(),
+            )),
+            Err(PdsError::Http { status: Some(status), .. }) => {
+                Ok(ListFollowRecordsOutcome::Failed(status))
+            }
+            Err(other) => Err(other),
+        }
+    }
+}
+
+/// `graph::build::step_follows`, `step_follows_me` and `step_degree2`
+/// (slice 1.0) are generic over [`GraphSource`] so the probe and the later
+/// worker share one implementation; this is the production one, over
+/// [`Self::get_follows`] and [`Self::get_relationships`] (story 03 spec.md
+/// `## Approach`). Both inherent methods take priority over this trait's
+/// same-named ones in method-call syntax, so calling `self.get_follows(...)`
+/// here dispatches to the inherent method above, not back into this trait.
+impl<T: PdsTransport> GraphSource for PdsClient<T> {
+    async fn get_follows(
+        &self,
+        actor: &str,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<GraphFollowsPage, PdsError> {
+        let page = self.get_follows(actor, limit, cursor.as_deref()).await?;
+        Ok(GraphFollowsPage { dids: page.dids, cursor: page.cursor })
+    }
+
+    async fn get_relationships(
+        &self,
+        actor: &str,
+        others: &[String],
+    ) -> Result<Vec<String>, PdsError> {
+        self.get_relationships(actor, others).await
     }
 }
 
@@ -1310,6 +1437,138 @@ mod tests {
         for other in &others {
             assert!(call.query.contains(&("others".to_string(), other.clone())));
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_returns_the_did() {
+        let transport = FakeTransport::new();
+        transport.push_ok(
+            200,
+            session_body("did:plc:actor", &access_token(far_future_exp()), "refresh-1"),
+        );
+        transport.push_ok(200, json!({ "did": "did:plc:target" }));
+
+        let client =
+            PdsClient::new(transport.clone(), creds(), 1000.0).expect("valid rate builds a client");
+        let did =
+            client.resolve_handle("someone.bsky.social").await.expect("resolve_handle succeeds");
+        assert_eq!(did, "did:plc:target");
+
+        let call = transport
+            .calls()
+            .into_iter()
+            .find(|call| call.nsid == "com.atproto.identity.resolveHandle")
+            .expect("call recorded");
+        assert!(!call.proxy, "com.atproto.* is never proxied (BC6)");
+        assert!(call.query.contains(&("handle".to_string(), "someone.bsky.social".to_string())));
+    }
+
+    #[tokio::test]
+    async fn list_follow_records_returns_subjects_newest_first() {
+        // BC14: `reverse=true` puts the newest record's subject first.
+        let transport = FakeTransport::new();
+        transport.push_ok(
+            200,
+            session_body("did:plc:actor", &access_token(far_future_exp()), "refresh-1"),
+        );
+        transport.push_ok(
+            200,
+            json!({
+                "records": [
+                    {
+                        "uri": "at://did:plc:actor/app.bsky.graph.follow/2",
+                        "cid": "c2",
+                        "value": {"subject": "did:plc:new", "createdAt": "2026-09-24T00:00:00Z"},
+                    },
+                    {
+                        "uri": "at://did:plc:actor/app.bsky.graph.follow/1",
+                        "cid": "c1",
+                        "value": {"subject": "did:plc:old", "createdAt": "2026-09-01T00:00:00Z"},
+                    },
+                ],
+            }),
+        );
+
+        let client =
+            PdsClient::new(transport.clone(), creds(), 1000.0).expect("valid rate builds a client");
+        let outcome = client
+            .list_follow_records("did:plc:actor", 100)
+            .await
+            .expect("list_follow_records succeeds");
+        assert_eq!(
+            outcome,
+            ListFollowRecordsOutcome::Ok(vec![
+                "did:plc:new".to_string(),
+                "did:plc:old".to_string()
+            ])
+        );
+
+        let call = transport
+            .calls()
+            .into_iter()
+            .find(|call| call.nsid == "com.atproto.repo.listRecords")
+            .expect("call recorded");
+        assert!(!call.proxy, "com.atproto.* is never proxied (BC6)");
+        assert!(call
+            .query
+            .contains(&("collection".to_string(), "app.bsky.graph.follow".to_string())));
+        assert!(call.query.contains(&("reverse".to_string(), "true".to_string())));
+        assert!(call.query.contains(&("repo".to_string(), "did:plc:actor".to_string())));
+    }
+
+    #[tokio::test]
+    async fn list_follow_records_skips_on_a_non_2xx_status() {
+        // BC14: a non-2xx status is returned for the caller to skip past,
+        // not an error.
+        let transport = FakeTransport::new();
+        transport.push_ok(
+            200,
+            session_body("did:plc:actor", &access_token(far_future_exp()), "refresh-1"),
+        );
+        transport.push_ok(404, json!({ "error": "RepoNotFound" }));
+
+        let client =
+            PdsClient::new(transport.clone(), creds(), 1000.0).expect("valid rate builds a client");
+        let outcome = client
+            .list_follow_records("did:plc:actor", 100)
+            .await
+            .expect("a non-2xx status is not an Err");
+        assert_eq!(outcome, ListFollowRecordsOutcome::Failed(404));
+    }
+
+    #[tokio::test]
+    async fn pds_client_implements_graph_source() {
+        // 3.5: `PdsClient` satisfies `graph::build::GraphSource` by
+        // delegating to its own `get_follows` and `get_relationships`.
+        let transport = FakeTransport::new();
+        transport.push_ok(
+            200,
+            session_body("did:plc:actor", &access_token(far_future_exp()), "refresh-1"),
+        );
+        transport.push_ok(200, json!({ "follows": [{"did": "did:plc:one"}] }));
+        transport.push_ok(
+            200,
+            json!({
+                "relationships": [
+                    {"did": "did:plc:one", "followedBy": "at://did:plc:one/app.bsky.graph.follow/1"},
+                ],
+            }),
+        );
+
+        let client =
+            PdsClient::new(transport.clone(), creds(), 1000.0).expect("valid rate builds a client");
+
+        let page = GraphSource::get_follows(&client, "did:plc:viewer", 100, None)
+            .await
+            .expect("GraphSource::get_follows succeeds");
+        assert_eq!(page.dids, vec!["did:plc:one".to_string()]);
+        assert_eq!(page.cursor, None);
+
+        let followed_back =
+            GraphSource::get_relationships(&client, "did:plc:viewer", &["did:plc:one".to_string()])
+                .await
+                .expect("GraphSource::get_relationships succeeds");
+        assert_eq!(followed_back, vec!["did:plc:one".to_string()]);
     }
 }
 
