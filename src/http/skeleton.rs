@@ -314,7 +314,16 @@ mod tests {
     const FEED_URI: &str = "at://did:plc:abc/app.bsky.feed.generator/upstaged";
 
     fn item(quote_uri: &str, quote_cid: &str, rank: f64, ratio: f64) -> FeedItem {
-        FeedItem { quote_uri: quote_uri.to_string(), quote_cid: quote_cid.to_string(), rank, ratio }
+        FeedItem {
+            quote_uri: quote_uri.to_string(),
+            quote_cid: quote_cid.to_string(),
+            rank,
+            ratio,
+            quote_did: 1,
+            original_did: 2,
+            quoted_at: 1_700_000_000,
+            promoted_at: 1_700_000_000,
+        }
     }
 
     fn state_with_items(items: Vec<FeedItem>) -> Arc<AppState> {

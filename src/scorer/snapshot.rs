@@ -12,10 +12,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
+use crate::graph;
 use crate::score::{self, Counts, Weights};
 use crate::store::feed::FeedRow;
 
-/// One item of the ranked, capped feed. Pagination (story 08) reads this
+pub mod caps;
+
+/// One item of the ranked feed, uncapped. Pagination (story 08) reads this
 /// list only, never SQLite directly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedItem {
@@ -27,6 +30,21 @@ pub struct FeedItem {
     /// untouched). `getFeedSkeleton`'s `feedContext` (story 08, BC24) reads
     /// this field.
     pub ratio: f64,
+    /// `graph::hash_did` of the quoting DID (BC1). `caps::apply`'s cap 2
+    /// groups on this field; a later per-viewer filter (story 05, 06) reads
+    /// it too, so a viewer DID never has to round-trip through the store
+    /// again to re-derive it.
+    pub quote_did: u64,
+    /// `graph::hash_did` of the original post's author DID (BC1).
+    /// `caps::apply`'s cap 1 groups on this field.
+    pub original_did: u64,
+    /// Copied from `FeedRow.quoted_at` (BC1). `caps::apply`'s cap 1 buckets
+    /// this into a UTC day with `div_euclid(86_400)`.
+    pub quoted_at: i64,
+    /// Copied from `FeedRow.promoted_at` (BC1), for a later viewer filter
+    /// (story 05, 06) that needs to know how long ago a pair promoted,
+    /// without a second lookup into `feed`.
+    pub promoted_at: i64,
 }
 
 /// One generation of the feed list: the items a single scorer pass produced
@@ -221,11 +239,20 @@ fn push_kept(
     // row reaching `push_kept` always has an entry; `unwrap_or(0.0)` is
     // defence in depth only, never expected to fire.
     let ratio = ratios.get(&row.quote_cid).copied().unwrap_or(0.0);
+    // BC1: the author hashes are `graph::hash_did` of the DID strings, not
+    // the strings themselves — `caps::apply` and a later viewer filter
+    // compare `u64`, never a string.
+    let quote_did = graph::hash_did(&row.quote_did);
+    let original_did = graph::hash_did(&row.original_did);
     output.push(FeedItem {
         quote_uri: row.quote_uri,
         quote_cid: row.quote_cid,
         rank: row.rank,
         ratio,
+        quote_did,
+        original_did,
+        quoted_at: row.quoted_at,
+        promoted_at: row.promoted_at,
     });
 }
 
@@ -366,6 +393,10 @@ mod tests {
             quote_cid: "cid-q".to_string(),
             rank: 1.0,
             ratio: 4.0,
+            quote_did: 1,
+            original_did: 2,
+            quoted_at: 1_700_000_000,
+            promoted_at: 1_700_000_000,
         }];
         handle.swap(Arc::new(items.clone()));
         assert_eq!(*handle.current(), items);
@@ -393,6 +424,10 @@ mod tests {
             quote_cid: "cid-1".to_string(),
             rank: 1.0,
             ratio: 1.0,
+            quote_did: 1,
+            original_did: 2,
+            quoted_at: 1_700_000_000,
+            promoted_at: 1_700_000_000,
         }];
         handle.swap(Arc::new(gen1_items.clone()));
         let (current, previous) = handle.generations();
@@ -407,6 +442,10 @@ mod tests {
             quote_cid: "cid-2".to_string(),
             rank: 2.0,
             ratio: 2.0,
+            quote_did: 1,
+            original_did: 2,
+            quoted_at: 1_700_000_000,
+            promoted_at: 1_700_000_000,
         }];
         handle.swap(Arc::new(gen2_items.clone()));
         let (current, previous) = handle.generations();
@@ -429,6 +468,10 @@ mod tests {
             quote_cid: "cid-only".to_string(),
             rank: 5.0,
             ratio: 5.0,
+            quote_did: 1,
+            original_did: 2,
+            quoted_at: 1_700_000_000,
+            promoted_at: 1_700_000_000,
         }]));
         let (current, previous) = handle.generations();
         assert_eq!(current.generation, 2);
