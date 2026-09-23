@@ -11,15 +11,18 @@ the serving contract. The feed now personalises.
 ## Overview
 
 The Upstaged feed shows each logged-in viewer only the pairs where the
-viewer and the original author or the upstager follow each other in one
-or both directions. See the [Brief](02-BRIEF-network-feed.md).
+original author or the upstager is connected to the viewer. See the
+[Brief](02-BRIEF-network-feed.md).
 
 ## Terms
 
 - **Pair**: a quote post and the post it quotes, as defined in
   [01-PRD.md](01-PRD.md).
-- **Connected author**: an author that the viewer follows, or an author
-  that follows the viewer.
+- **Connected author**: an author that follows the viewer, an author
+  that the viewer follows, or an author that is followed by an account
+  that the viewer follows.
+- **Degree-2 pair**: a circle pair that passes only through the third
+  kind of connection.
 - **Circle pair**: a pair where the original author, the upstager, or
   both are connected authors.
 - **Active viewer**: a viewer who sent one or more feed requests in the
@@ -30,25 +33,28 @@ or both directions. See the [Brief](02-BRIEF-network-feed.md).
 ### See only pairs from my circle
 **As a** logged-in subscriber
 **I want to** see only circle pairs in the Upstaged feed
-**So that** every item involves someone I know
+**So that** every item involves someone in or near my network
 
 **Acceptance criteria**:
 - [ ] Each item in the feed is a circle pair for the viewer who asked
       for it.
-- [ ] A pair is in the feed when the viewer follows the original
-      author, follows the upstager, or one of them follows the viewer.
+- [ ] A pair is in the feed when the original author or the upstager
+      follows the viewer, is followed by the viewer, or is followed by an
+      account that the viewer follows.
+- [ ] A pair is not in the feed when its only link to the viewer is an
+      author who follows one of the viewer's followers.
 - [ ] Two viewers with different follows get different feeds for the
       same request at the same time.
 - [ ] Circle pairs keep the global rank order from
-      [01-PRD.md](01-PRD.md).
+      [01-PRD.md](01-PRD.md). Degree-2 pairs get no bonus and no
+      penalty.
 - [ ] The diversity caps (one pair for each original author each day,
       one pair for each quoter in each 50 items) apply to the viewer's
       circle pairs, not to the global list. A circle pair is never
       dropped because a pair outside the circle used its slot.
 - [ ] A circle pair that qualifies only because the author follows the
       viewer is included when it is in the 1,000 highest-ranked pairs.
-      Deeper in the list, only pairs with an author that the viewer
-      follows are included.
+      Deeper in the list, this connection is not checked.
 - [ ] When the viewer has fewer circle pairs than a full page, the feed
       shows only those pairs. It never adds pairs from outside the
       circle.
@@ -56,6 +62,27 @@ or both directions. See the [Brief](02-BRIEF-network-feed.md).
 **Notes**: Regression risk. This removes the global feed for every
 current subscriber. The depth of 1,000 for "follows me" is set with
 `UPSTAGE_FOLLOWS_ME_DEPTH`.
+
+---
+
+### Discover people one step out
+**As a** logged-in subscriber
+**I want to** see pairs from accounts that the people I follow follow
+**So that** I find new people and content close to my taste
+
+**Acceptance criteria**:
+- [ ] The feed includes degree-2 pairs, at every depth of the ranked
+      list.
+- [ ] Degree 2 uses the viewer's 100 most recent follows, and the 100
+      most recent follows of each of those accounts.
+- [ ] Each degree-2 pair in the feed is correct: the viewer follows an
+      account that follows one of the pair's authors. Some degree-2
+      pairs can be missing. None is shown in error.
+- [ ] When two viewers follow the same account, that account's follows
+      list is fetched once for both of them in each 24 hours.
+
+**Notes**: The sample sizes are set with `UPSTAGE_D2_FOLLOWS_SAMPLE` and
+`UPSTAGE_D2_FOLLOWS_DEPTH`.
 
 ---
 
@@ -71,8 +98,8 @@ current subscriber. The depth of 1,000 for "follows me" is set with
       within 15 seconds of the first request, when the viewer follows
       1,000 accounts or fewer.
 - [ ] Pairs that qualify only because an author follows the viewer are
-      added after that, as the checks complete. Items that are already
-      in the feed stay in the feed.
+      added after that, then degree-2 pairs, as the checks complete.
+      Items that are already in the feed stay in the feed.
 - [ ] A new viewer's first build starts before any re-verification work
       that is waiting.
 
@@ -94,6 +121,9 @@ first open is empty.
       only through that account leave the feed within 6 hours.
 - [ ] When a new author enters the ranked list and that author follows
       the viewer, the pair is in the feed within 6 hours.
+- [ ] When an account that the viewer follows starts to follow an
+      author, degree-2 pairs with that author are in the feed within 30
+      hours (one shared cache age plus one refresh age).
 - [ ] A viewer with no requests for 7 days has no stored circle. Their
       next request is handled as a first open.
 
@@ -141,7 +171,7 @@ first open is empty.
 **As an** operator
 **I want to** set how many circles the service keeps and how long they
 last
-**So that** App View traffic stays within the rate limit
+**So that** graph traffic stays within the authenticated rate limit
 
 **Acceptance criteria**:
 - [ ] `UPSTAGE_MAX_VIEWERS` sets the maximum number of stored circles.
@@ -152,6 +182,12 @@ last
       requests. The default is 7 days.
 - [ ] `UPSTAGE_FOLLOWS_ME_DEPTH` sets how many of the highest-ranked
       pairs get the "follows me" check. The default is 1000.
+- [ ] `UPSTAGE_D2_FOLLOWS_SAMPLE` sets how many of the viewer's most
+      recent follows degree 2 uses. The default is 100.
+- [ ] `UPSTAGE_D2_FOLLOWS_DEPTH` sets how many of each sampled account's
+      most recent follows degree 2 uses. The default is 100.
+- [ ] `UPSTAGE_D2_REFRESH_AGE` sets how long a shared follows list is
+      kept. The default is 24 hours.
 - [ ] When the store is full, the service removes the circle that was
       used least recently and writes one log line for each removal.
 - [ ] A viewer whose circle was removed gets the first-open behaviour on
@@ -164,14 +200,15 @@ last
 ### Read feed health
 **As an** operator
 **I want to** see how full the viewers' feeds are
-**So that** I know if degree 1 is too narrow
+**So that** I know if the circle is too narrow or too wide
 
 **Acceptance criteria**:
 - [ ] Each hour, the service writes one JSON log line with these
       values: the number of active viewers, the median number of circle
       pairs that entered an active viewer's list in the last 24 hours,
-      the share of active viewers with 0 such pairs, and the number of
-      removed circles in that hour.
+      the share of active viewers with 0 such pairs, the median
+      discovery share (the part of a viewer's circle pairs that are
+      degree-2 pairs), and the number of removed circles in that hour.
 - [ ] No log line, at any level, contains a viewer DID in plain text.
 
 ---
