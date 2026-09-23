@@ -1,6 +1,6 @@
 # Upstaged — Network feed tech design
 
-2026-09-24 · @Nico Santini · Status: Draft
+2026-09-24 · @Nico Santini · Status: Final
 
 Companion to [02-PRD-network-feed.md](02-PRD-network-feed.md) and
 [02-BRIEF-network-feed.md](02-BRIEF-network-feed.md). The PRD owns the
@@ -22,10 +22,10 @@ the probe first for this reason.
 | Rate limits | Separate limiters: public client for the scorer, PDS client for the graph | A graph backlog can never slow down promotion |
 | Graph priority | Three levels: first build, degree-1 refresh, degree-2 cache fill | A new viewer gets pairs within seconds |
 | Graph storage | SQLite through `src/store/`, loaded into memory when needed | A restart does not turn every viewer into a first open |
-| DIDs in memory | xxhash64 values | 8 bytes for each DID, and `xxhash-rust` is already a dependency |
+| DIDs in memory | `xxh3_64` values | 8 bytes for each DID, and `xxhash-rust` is already a dependency |
 | Degree-2 memory | Keep the sampled follows for each viewer. Build the degree-2 set only while a viewer list is built | Memory grows with distinct accounts, not with viewers × 10,000 |
 | Viewer list | Built on request, one list for each (viewer, generation), as `u32` indices into the snapshot | The list is cheap, and it is removed with the viewer |
-| Cursor | Keep the generation pin. Resume by `(rank, cid)` in the viewer's current list | A circle refresh during a scroll cannot repeat items or end the feed early |
+| Cursor | Pin the snapshot generation and the circle version. Resume at the exact index in that list | A circle refresh during a scroll cannot repeat items or end the feed early |
 | Rollback | `UPSTAGE_PERSONALISE=false` brings back the global feed after a restart | This is the cheapest rollback if JWT checks or the crawler fail |
 | Measure first | `upstage graph-probe` CLI before the graph and serving work | The cost numbers in this document are estimates |
 
@@ -315,14 +315,24 @@ measures it. Requests for viewers in `building_d1` get an empty page.
 
 ### 9.3 Cursor
 
-The cursor format from `01` §11.1 stays the same:
-`base64url("{generation}:{index}:{rank_bits}:{cid}")`.
+Personalised cursors add the circle version to the `01` §11.1 format:
+`base64url("{generation}:{circle_version}:{index}:{rank_bits}:{cid}")`.
+The global mode keeps the `01` format.
 
-- `index` is only a hint into the viewer's list.
-- To resume, the handler takes the viewer's list for the cursor's
-  generation. It finds the first item that sorts after `(rank, cid)`.
-  The list is in rank order, so a circle refresh during a scroll only
-  adds or removes items. It cannot repeat an item or end the feed early.
+- Each circle has a `circle_version`. It goes up by one each time a build
+  step or a refresh replaces the circle.
+- The viewer list cache is keyed by `(viewer, generation,
+  circle_version)`. It keeps the current and the previous entry for each
+  viewer.
+- To resume, the handler takes the cached list for the cursor's
+  generation and circle version. When `items[index].cid` matches, the
+  page starts at `index + 1`. The list does not change while it is held,
+  so a circle refresh during a scroll cannot repeat an item or end the
+  feed early.
+- A pure `(rank, cid)` search is not safe. The quoter cap defers items,
+  so a capped list is not in strict rank order.
+- When that list is no longer held, the handler uses the `01` resume
+  paths on the viewer's current list. See D1.
 - A cursor holds no viewer data. A cursor from another viewer resumes in
   the requester's own list, so it shows nothing of the other viewer.
 - When the cursor's generation is no longer held (a scroll of more than
@@ -413,8 +423,8 @@ If the probe shows more than 450 MB, reduce `UPSTAGE_MAX_VIEWERS` or
 
 ## 15. Changes to other documents
 
-- `AGENTS.md`: the `appview/` rule adds `graph/` and `graph_probe` as
-  callers. It also adds `auth/` as the only module that calls the DID
+- `AGENTS.md`: story 03 adds `graph/` and `graph_probe` as `appview/`
+  callers. Story 05 adds `auth/` as the only module that calls the DID
   resolvers.
 - `01-TECH-DESIGN.md` §11.1 and §8: add a line that points to this
   document.
@@ -434,19 +444,27 @@ If the probe shows more than 450 MB, reduce `UPSTAGE_MAX_VIEWERS` or
 
 ## 17. Build order
 
-The stories go in `docs/02-stories/`.
+The stories are in [02-stories/](02-stories/). Each story is a vertical
+slice that can be shown working on its own.
 
-| # | Story | Needs |
+**Rollout rule.** `UPSTAGE_PERSONALISE` defaults to `false` until story
+11. Each story merges with the global feed unchanged. Story 11 changes
+the default to `true` (the value in section 4).
+
+| # | Story | Follows |
 |---|---|---|
-| 01 | `appview/pds.rs` (session, refresh, limiter, `getFollows`, `getRelationships`) and `upstage graph-probe` | none |
-| 02 | Run the probe, and write the measured defaults into this document | 01 |
-| 03 | `auth/`: JWT checks, DID resolver and key cache | none |
-| 04 | Snapshot carries author hashes. Caps move to `caps::apply`. Global output does not change | none |
-| 05 | Schema version 2 and `store/viewers.rs`, `store/follows_cache.rs` | none |
-| 06 | `graph/`: circles, queue, builder, shared cache, scheduler, eviction | 01, 05 |
-| 07 | Serving: viewer lists, cursor, empty pages, `Cache-Control`, kill switch | 03, 04, 06 |
-| 08 | `graph.health` metrics, and the document and `AGENTS.md` changes | 07 |
+| 01 | Snapshot carries authors, and the caps become reusable (prefactor) | none |
+| 02 | Shared PDS session with refresh (prefactor) | none |
+| 03 | Graph probe | 02 |
+| 04 | Probe gate (operator) | 03 |
+| 05 | Viewer identity behind the switch | none |
+| 06 | "I follow" circle, end to end | 01, 04, 05 |
+| 07 | "Follows me" connections | 06 |
+| 08 | Degree 2 with the shared follows cache | 06 |
+| 09 | Circles stay current and bounded | 07, 08 |
+| 10 | Feed health metrics | 09 |
+| 11 | Launch | 04, 10 |
 
-Story 02 is a gate. If the measured cost for each viewer does not fit
+Story 04 is a gate. If the measured cost for each viewer does not fit
 the budget in section 7 or the memory in section 13, stop and revise
 this document before story 06.
