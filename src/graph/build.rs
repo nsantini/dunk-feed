@@ -80,7 +80,11 @@ pub trait GraphSource {
 
 /// Step 1: pages `get_follows` for `viewer` to the end, filling
 /// `circle.follows` with every hash and `circle.d2_sample` with the first
-/// `d2_sample_size` DIDs in response order (BC1).
+/// `d2_sample_size` DIDs in response order (BC1). Stops as soon as a page
+/// comes back with no DIDs, or with a cursor equal to the one just sent,
+/// besides the ordinary end-of-list case of a `None` cursor (review round
+/// 2, defect J): a source that cannot make progress is never paged
+/// forever.
 pub async fn step_follows<S: GraphSource>(
     source: &S,
     viewer: &str,
@@ -91,6 +95,7 @@ pub async fn step_follows<S: GraphSource>(
     let mut calls: u32 = 0;
     let mut cursor: Option<String> = None;
     loop {
+        let sent_cursor = cursor.clone();
         let page = source.get_follows(viewer, 100, cursor.take()).await?;
         calls += 1;
         for did in &page.dids {
@@ -99,10 +104,10 @@ pub async fn step_follows<S: GraphSource>(
                 circle.d2_sample.push(did.clone());
             }
         }
-        cursor = page.cursor;
-        if cursor.is_none() {
+        if page.dids.is_empty() || page.cursor.is_none() || page.cursor == sent_cursor {
             break;
         }
+        cursor = page.cursor;
     }
     Ok(StepStats { calls, pages: calls, elapsed: start.elapsed() })
 }
@@ -164,7 +169,10 @@ pub async fn step_follows_me<S: GraphSource>(
 /// (review round 1, defect B): a depth of 150 therefore makes one page of
 /// 100 and one of 50, and the stored list holds exactly 150 hashes, not the
 /// 200 the account may actually follow. An account already in `shared`
-/// costs no call.
+/// costs no call. Paging for one account stops as soon as a page comes
+/// back with no DIDs, or with a cursor equal to the one just sent, besides
+/// the ordinary end-of-list case of a `None` cursor (review round 2, defect
+/// J), so a source that cannot make progress is never paged forever.
 pub async fn step_degree2<S: GraphSource>(
     source: &S,
     d2_sample: &[String],
@@ -184,13 +192,16 @@ pub async fn step_degree2<S: GraphSource>(
         while collected.len() < depth {
             let remaining = depth - collected.len();
             let page_limit = remaining.min(100) as u32;
+            let sent_cursor = cursor.clone();
             let page = source.get_follows(account, page_limit, cursor.take()).await?;
             calls += 1;
+            let page_was_empty = page.dids.is_empty();
+            let next_cursor = page.cursor;
             collected.extend(page.dids);
-            cursor = page.cursor;
-            if cursor.is_none() {
+            if page_was_empty || next_cursor.is_none() || next_cursor == sent_cursor {
                 break;
             }
+            cursor = next_cursor;
         }
         collected.truncate(depth);
         let mut hashed: Vec<DidHash> = collected.iter().map(|did| hash_did(did)).collect();
@@ -402,6 +413,85 @@ mod tests {
 
         assert_eq!(stats.calls, 2);
         assert_eq!(shared.get("acct-a").unwrap().len(), 150);
+    }
+
+    /// A `GraphSource` that ignores its `cursor` argument and always
+    /// returns the same fixed page, for the stuck-source tests below
+    /// (review round 2, defect J).
+    struct StuckSource {
+        page: FollowsPage,
+    }
+
+    impl GraphSource for StuckSource {
+        async fn get_follows(
+            &self,
+            _actor: &str,
+            _limit: u32,
+            _cursor: Option<String>,
+        ) -> Result<FollowsPage, PdsError> {
+            Ok(self.page.clone())
+        }
+
+        async fn get_relationships(
+            &self,
+            _actor: &str,
+            _others: &[String],
+        ) -> Result<Vec<String>, PdsError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn step_follows_stops_on_an_empty_page_with_a_cursor() {
+        // Review round 2, defect J: a page with no DIDs ends the step even
+        // though it carries a cursor asking for more.
+        let source =
+            StuckSource { page: FollowsPage { dids: Vec::new(), cursor: Some("x".to_string()) } };
+        let mut circle = Circle::new();
+
+        let stats = step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+
+        assert_eq!(stats.calls, 1);
+        assert!(circle.follows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn step_follows_stops_on_a_repeated_non_empty_cursor() {
+        // Review round 2, defect J: a non-empty page whose cursor never
+        // changes stops after the cursor repeats, instead of paging
+        // forever.
+        let source =
+            StuckSource { page: FollowsPage { dids: vec![did(1)], cursor: Some("x".to_string()) } };
+        let mut circle = Circle::new();
+
+        let stats = step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+
+        assert_eq!(stats.calls, 2);
+        assert_eq!(circle.follows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn step_degree2_stops_on_an_empty_page_with_a_cursor() {
+        let source =
+            StuckSource { page: FollowsPage { dids: Vec::new(), cursor: Some("x".to_string()) } };
+        let mut shared: HashMap<String, Vec<DidHash>> = HashMap::new();
+
+        let stats = step_degree2(&source, &["acct-a".to_string()], 100, &mut shared).await.unwrap();
+
+        assert_eq!(stats.calls, 1);
+        assert_eq!(shared.get("acct-a").unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn step_degree2_stops_on_a_repeated_non_empty_cursor() {
+        let source =
+            StuckSource { page: FollowsPage { dids: vec![did(1)], cursor: Some("x".to_string()) } };
+        let mut shared: HashMap<String, Vec<DidHash>> = HashMap::new();
+
+        let stats = step_degree2(&source, &["acct-a".to_string()], 100, &mut shared).await.unwrap();
+
+        assert_eq!(stats.calls, 2);
+        assert_eq!(shared.get("acct-a").unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -40,6 +40,14 @@ pub enum GraphProbeError {
     MissingCredentials { var: &'static str },
     #[error("--handle is required: pass at least one --handle <handle>")]
     NoHandles,
+    #[error(
+        "invalid --handle value \"{value}\": must not be empty, and must not contain '@' or \
+         whitespace once a single leading '@' is stripped and the result is trimmed"
+    )]
+    // Review round 2, defect I: an empty or malformed `--handle` value is
+    // its own error, distinct from `NoHandles`, which now means only "zero
+    // `--handle` flags were given at all".
+    InvalidHandle { value: String },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error("every handle failed; see the failure lines above")]
@@ -65,31 +73,50 @@ pub fn dedup_first_seen(handles: &[String]) -> Vec<String> {
     out
 }
 
-/// Trims `raw` and strips one leading `@`, so `@alice.bsky.social` and
-/// ` alice.bsky.social` both normalize to `alice.bsky.social` before
+/// Trims `raw`, strips one leading `@`, then trims again, so
+/// `@ alice.bsky.social` normalizes to `alice.bsky.social` before
 /// `dedup_first_seen` or any network call sees them (BC9; review round 1,
-/// defect G).
-fn normalize_handle(raw: &str) -> String {
+/// defect G; review round 2, defect H). The result is `Err` when it is
+/// empty, or still holds an `@` or any whitespace: only one leading `@` is
+/// stripped, so `@@alice.bsky.social` (a second `@` left over) and `" "`
+/// (nothing left after trimming) are both invalid rather than silently
+/// mangled further.
+fn normalize_handle(raw: &str) -> Result<String, ()> {
     let trimmed = raw.trim();
-    trimmed.strip_prefix('@').unwrap_or(trimmed).to_string()
+    let without_at = trimmed.strip_prefix('@').unwrap_or(trimmed).trim();
+    if without_at.is_empty()
+        || without_at.contains('@')
+        || without_at.chars().any(char::is_whitespace)
+    {
+        Err(())
+    } else {
+        Ok(without_at.to_string())
+    }
 }
 
 /// Checks `--handle` (BC9, BC9a) before credentials (BC8), and both before
 /// any network call or store open: `--handle` is not `required` in clap, so
 /// an empty list reaches here rather than clap exiting 2 on its own
-/// (spec.md "Defaults taken"). Each handle is trimmed and stripped of one
-/// leading `@` first (review round 1, defect G); a handle that normalizes to
-/// an empty string is treated the same as no `--handle` at all, since
-/// neither names an account to probe. Reuses `publish::preflight`'s
+/// (spec.md "Defaults taken"). Zero `--handle` flags is [`GraphProbeError::NoHandles`];
+/// a `--handle` value that [`normalize_handle`] rejects is
+/// [`GraphProbeError::InvalidHandle`] naming that raw value, checked before
+/// credentials (review round 2, defect I — `NoHandles` no longer covers a
+/// single blank or malformed handle). Reuses `publish::preflight`'s
 /// credential check (`avatar_path: None`, so its avatar branch never runs)
 /// instead of re-implementing the same blank/trim rule a second time.
 pub fn preflight(
     cfg: &Config,
     handles: &[String],
 ) -> Result<(Vec<String>, Credentials), GraphProbeError> {
-    let normalized: Vec<String> = handles.iter().map(|handle| normalize_handle(handle)).collect();
-    if normalized.is_empty() || normalized.iter().any(|handle| handle.is_empty()) {
+    if handles.is_empty() {
         return Err(GraphProbeError::NoHandles);
+    }
+    let mut normalized: Vec<String> = Vec::with_capacity(handles.len());
+    for raw in handles {
+        match normalize_handle(raw) {
+            Ok(handle) => normalized.push(handle),
+            Err(()) => return Err(GraphProbeError::InvalidHandle { value: raw.clone() }),
+        }
     }
     let handles = dedup_first_seen(&normalized);
     let credentials = match publish::preflight(cfg, None) {
@@ -243,44 +270,73 @@ pub fn time_filter_and_caps(
 }
 
 /// Why the order check (BC14) was skipped: either the `getFollows` or the
-/// `listRecords` call it needs failed. `Status` carries the failing call's
-/// own HTTP status (BC14's "skipped (`<status>`)"); the other three name the
-/// kind of failure a status-less `PdsError` was, so the printed reason is
-/// never `0` standing in for "no status" (review round 1, defect C).
+/// `listRecords` call it needs failed, or the session that either call
+/// depends on could not be established or refreshed. `Status` carries a
+/// failing `listRecords` or `getFollows` call's own HTTP status (BC14's
+/// "skipped (`<status>`)"); `Session` carries `createSession` or
+/// `refreshSession`'s status when there is one (`Some`), or `None` when the
+/// session failure never reached the wire (`PdsError::Session`) — either
+/// way it prints as `session` or `session (<status>)`, never bare, so a
+/// session failure is never mistaken for the `listRecords`/`getFollows`
+/// call itself failing (review round 2, defect K). `Transport` and
+/// `Decode` name the kind of a status-less, non-session `PdsError`, so the
+/// printed reason is never `0` standing in for "no status" (review round 1,
+/// defect C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     Status(u16),
+    Session(Option<u16>),
     Transport,
     Decode,
-    Session,
 }
 
 impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SkipReason::Status(status) => write!(f, "{status}"),
+            SkipReason::Session(Some(status)) => write!(f, "session ({status})"),
+            SkipReason::Session(None) => write!(f, "session"),
             SkipReason::Transport => write!(f, "transport"),
             SkipReason::Decode => write!(f, "decode"),
-            SkipReason::Session => write!(f, "session"),
         }
     }
 }
 
+/// `com.atproto.server.createSession`'s nsid, matching the private constant
+/// of the same name in `src/appview/pds.rs`: that module is out of scope
+/// for this slice (`## Files in scope` names only `graph_probe.rs` and
+/// `graph/build.rs`), so [`skip_reason`] compares against this copy rather
+/// than widening the slice to export the original.
+const LOGIN_NSID: &str = "com.atproto.server.createSession";
+
+/// `com.atproto.server.refreshSession`'s nsid, for the same reason as
+/// [`LOGIN_NSID`].
+const REFRESH_NSID: &str = "com.atproto.server.refreshSession";
+
 /// Maps a [`PdsError`] from the order check's `getFollows` or
 /// `list_follow_records` call to the [`SkipReason`] it prints (review round
-/// 1, defect C). `PdsError::Http` with a status carries that status;
-/// `PdsError::Http` with none (a transport error that outlasted the retry
+/// 1, defect C; review round 2, defect K). An `Http` failure whose `method`
+/// is [`LOGIN_NSID`] or [`REFRESH_NSID`] is a session failure, not a
+/// `listRecords`/`getFollows` one, so it maps to `Session` carrying that
+/// call's own status — distinct from a `listRecords` or `getFollows` `Http`
+/// failure, which carries its status as a bare `Status` instead. Any other
+/// `Http` with no status (a transport error that outlasted the retry
 /// schedule) and `PdsError::TooMany` (never actually reachable here, since
 /// neither call sends `others`) both read as `Transport`; `InvalidRate` is
 /// unreachable too (rejected at config load and at `PdsClient::new`, never
 /// returned by a call), and maps to `Transport` as the least misleading
-/// fallback rather than a fifth variant nothing can construct.
+/// fallback rather than a sixth variant nothing can construct.
 fn skip_reason(err: &PdsError) -> SkipReason {
     match err {
+        PdsError::Http { method, status, .. }
+            if *method == LOGIN_NSID || *method == REFRESH_NSID =>
+        {
+            SkipReason::Session(*status)
+        }
         PdsError::Http { status: Some(status), .. } => SkipReason::Status(*status),
         PdsError::Http { status: None, .. } => SkipReason::Transport,
         PdsError::Decode { .. } => SkipReason::Decode,
-        PdsError::Session => SkipReason::Session,
+        PdsError::Session => SkipReason::Session(None),
         PdsError::InvalidRate | PdsError::TooMany { .. } => SkipReason::Transport,
     }
 }
@@ -811,7 +867,35 @@ mod tests {
             skip_reason(&PdsError::Decode { method: "op", reason: "bad json".to_string() }),
             SkipReason::Decode
         );
-        assert_eq!(skip_reason(&PdsError::Session), SkipReason::Session);
+        assert_eq!(skip_reason(&PdsError::Session), SkipReason::Session(None));
+    }
+
+    // --- skip_reason session mapping (BC14; review round 2, defect K) ------
+
+    #[test]
+    fn skip_reason_distinguishes_session_status_from_a_bare_status() {
+        // The same 401 prints differently depending on which call failed:
+        // `refreshSession` is a session failure, `listRecords` is not.
+        let refresh_failure =
+            skip_reason(&PdsError::Http { method: REFRESH_NSID, status: Some(401), attempts: 1 });
+        let list_records_failure = skip_reason(&PdsError::Http {
+            method: "com.atproto.repo.listRecords",
+            status: Some(401),
+            attempts: 1,
+        });
+
+        assert_eq!(refresh_failure, SkipReason::Session(Some(401)));
+        assert_eq!(list_records_failure, SkipReason::Status(401));
+        assert_ne!(format!("{refresh_failure}"), format!("{list_records_failure}"));
+        assert_eq!(format!("{refresh_failure}"), "session (401)");
+        assert_eq!(format!("{list_records_failure}"), "401");
+    }
+
+    #[test]
+    fn skip_reason_maps_login_status_to_session_too() {
+        let failure =
+            skip_reason(&PdsError::Http { method: LOGIN_NSID, status: Some(500), attempts: 1 });
+        assert_eq!(failure, SkipReason::Session(Some(500)));
     }
 
     #[test]
@@ -856,10 +940,56 @@ mod tests {
 
     #[test]
     fn preflight_rejects_an_empty_handle_before_credentials() {
-        // BC9: an empty handle is the usage error, checked before the
-        // missing-credentials check even though this config has neither.
+        // Review round 2, defect I: a single blank `--handle` is
+        // `InvalidHandle`, not `NoHandles` — that variant now covers only
+        // zero `--handle` flags. Still checked before the
+        // missing-credentials check, even though this config has neither.
         let cfg = base_config();
         let err = preflight(&cfg, &["".to_string()]).unwrap_err();
+        match err {
+            GraphProbeError::InvalidHandle { value } => assert_eq!(value, ""),
+            other => panic!("expected InvalidHandle, got {other:?}"),
+        }
+    }
+
+    // --- normalize_handle (BC9; review round 2, defect H) -------------------
+
+    #[test]
+    fn normalize_handle_strips_at_then_trims_again() {
+        assert_eq!(normalize_handle("@ alice.bsky.social"), Ok("alice.bsky.social".to_string()));
+    }
+
+    #[test]
+    fn normalize_handle_rejects_a_second_leading_at() {
+        // Only one leading `@` is stripped, so a second one left over marks
+        // the handle invalid rather than being stripped too.
+        assert_eq!(normalize_handle("@@alice.bsky.social"), Err(()));
+    }
+
+    #[test]
+    fn normalize_handle_rejects_whitespace_only() {
+        assert_eq!(normalize_handle(" "), Err(()));
+    }
+
+    // --- preflight InvalidHandle vs NoHandles (BC9; review round 2, defect I)
+
+    #[test]
+    fn preflight_flags_one_bad_handle_as_invalid_not_no_handles() {
+        let cfg = base_config();
+        let handles = vec!["alice.bsky.social".to_string(), " ".to_string()];
+
+        let err = preflight(&cfg, &handles).unwrap_err();
+
+        match err {
+            GraphProbeError::InvalidHandle { value } => assert_eq!(value, " "),
+            other => panic!("expected InvalidHandle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_with_zero_handle_flags_is_still_no_handles() {
+        let cfg = base_config();
+        let err = preflight(&cfg, &[]).unwrap_err();
         assert!(matches!(err, GraphProbeError::NoHandles));
     }
 
