@@ -1,7 +1,7 @@
 # PRD: Network feed
 
 **Date**: 2026-09-24
-**Status**: Draft
+**Status**: Final
 **Brief**: [02-BRIEF-network-feed.md](02-BRIEF-network-feed.md)
 **Replaces in [01-PRD.md](01-PRD.md)**: the "Auth is optional here" rule in
 the serving contract. The feed now personalises.
