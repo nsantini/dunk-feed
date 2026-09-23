@@ -15,6 +15,7 @@ use thiserror::Error;
 use crate::appview::AppViewClient;
 use crate::config::Config;
 use crate::dump::{self, DumpError};
+use crate::graph_probe::{self, GraphProbeError};
 use crate::ingest::{self, IngestError};
 use crate::publish::{self, PublishError};
 use crate::score::{Thresholds, Weights};
@@ -76,6 +77,17 @@ pub enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Read-only, no-write: logs in with `BSKY_HANDLE`, reads the current
+    /// `feed` rows, and runs a first graph build for each `--handle` in
+    /// memory, printing the numbers story 04 needs to accept or reject the
+    /// design (story 03 spec.md). Never run from `upstage run`.
+    GraphProbe {
+        /// A viewer to probe. Repeatable; not `required`, so an empty list
+        /// reaches `graph_probe::preflight`'s own check and exits 1 there
+        /// (story 03 spec.md BC9).
+        #[arg(long = "handle")]
+        handle: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -89,6 +101,7 @@ impl Command {
             Command::Validate { .. } => "validate",
             Command::Publish { .. } => "publish",
             Command::Dump { .. } => "dump",
+            Command::GraphProbe { .. } => "graph-probe",
         }
     }
 }
@@ -105,6 +118,8 @@ pub enum CliError {
     Publish(#[from] PublishError),
     #[error(transparent)]
     Dump(#[from] DumpError),
+    #[error(transparent)]
+    GraphProbe(#[from] GraphProbeError),
 }
 
 /// Dispatches `command`, built from `config`. `Run` calls `ingest::run`
@@ -135,6 +150,10 @@ pub async fn dispatch(command: &Command, config: &Config) -> Result<(), CliError
         Command::Dump { since, out } => {
             let summary = dump::run(config, since, out.clone())?;
             println!("wrote {} rows to {}", summary.rows, summary.path.display());
+        }
+        Command::GraphProbe { handle } => {
+            let report = graph_probe::run(config, handle).await?;
+            graph_probe::print_run_report(&report);
         }
     }
     Ok(())
