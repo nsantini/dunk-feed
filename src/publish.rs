@@ -62,6 +62,8 @@ pub enum PublishError {
     PutRecord { status: u16, body: String },
     #[error("transport error: {0}")]
     Transport(String),
+    #[error("could not build the PDS client: {0}")]
+    Config(String),
 }
 
 /// Maps a [`PdsError`] from one of `publish_with`'s three `PdsClient` calls
@@ -263,14 +265,15 @@ pub async fn publish_with<T: PdsTransport>(
 /// `upstage publish`'s entry point. `preflight` runs first, so a missing
 /// credential or a missing/unsupported avatar file stops the run before a
 /// [`PdsClient`] is even built (BC1, BC2) and before any network is
-/// reachable. `PdsClient::from_config` only fails on a non-positive or
-/// non-finite `graph_rps`, which config load already refuses (BC14); the
-/// `expect` documents that this can only happen if `Config` itself is built
-/// some other way.
+/// reachable. `PdsClient::from_config` only fails on a `graph_rps` outside
+/// the range `config::graph_rps_or_default` already enforces at config load
+/// (BC14), so this cannot fail for a `Config` `config::load` built; it is
+/// mapped to `PublishError::Config` rather than `.expect()` (review round 2,
+/// defect D) for a `Config` built some other way.
 pub async fn run(cfg: &Config, avatar_path: Option<&Path>) -> Result<String, PublishError> {
     let (credentials, avatar) = preflight(cfg, avatar_path)?;
     let client = PdsClient::from_config(cfg, credentials)
-        .expect("config load already validates UPSTAGE_GRAPH_RPS is positive and finite");
+        .map_err(|err| PublishError::Config(err.to_string()))?;
     publish_with(&client, cfg, avatar.as_ref()).await
 }
 

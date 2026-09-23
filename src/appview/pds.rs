@@ -55,6 +55,32 @@ const APPVIEW_PROXY: &str = "did:web:api.bsky.app#bsky_appview";
 /// otherwise have to be trusted to catch unaided.
 const MAX_LIMITER_PERIOD_SECS: f64 = 86_400.0;
 
+/// The shortest limiter period [`PdsClient::new`] accepts, one nanosecond:
+/// `tokio::time::Interval` panics on a zero-duration period, and a `rate`
+/// above roughly 1e9 rounds `1.0 / rate` down to 0 ns once it reaches
+/// [`Duration::try_from_secs_f64`] (review round 2, defect A). A rate that
+/// ticks faster than once a nanosecond is not a working rate limit either
+/// way, so it is rejected here alongside the slow end.
+const MIN_LIMITER_PERIOD_SECS: f64 = 1e-9;
+
+/// Computes the limiter period for `rate` calls each second: `1.0 / rate`,
+/// rejecting a non-finite or non-positive rate, and a period outside
+/// [`MIN_LIMITER_PERIOD_SECS`] to [`MAX_LIMITER_PERIOD_SECS`] (review round
+/// 1 finding 2, review round 2 defects A and D). `config::graph_rps_or_default`
+/// calls this so `UPSTAGE_GRAPH_RPS` is rejected at config load with exactly
+/// the range [`PdsClient::new`] enforces; `PdsClient::new` calls it again as
+/// defence in depth for a caller that built the rate some other way.
+pub(crate) fn limiter_period_for_rate(rate: f64) -> Result<Duration, ()> {
+    if !rate.is_finite() || rate <= 0.0 {
+        return Err(());
+    }
+    let period_secs = 1.0 / rate;
+    if period_secs < MIN_LIMITER_PERIOD_SECS || period_secs > MAX_LIMITER_PERIOD_SECS {
+        return Err(());
+    }
+    Duration::try_from_secs_f64(period_secs).map_err(|_| ())
+}
+
 /// Every way a `PdsClient` call can fail. No variant carries `accessJwt`,
 /// `refreshJwt` or the app password (BC12): a session failure is
 /// `PdsError::Session` with no detail from the failed attempt, and
@@ -371,27 +397,20 @@ impl<T: PdsTransport> fmt::Debug for PdsClient<T> {
 
 impl<T: PdsTransport> PdsClient<T> {
     /// Builds a client over `transport` at `graph_rps` calls each second.
-    /// Rejects a non-positive or non-finite rate with
-    /// [`PdsError::InvalidRate`] (BC14 is enforced earlier, at config load;
-    /// this is defence in depth for a caller that built the rate some
-    /// other way, the same reason `AppViewClient::new` re-checks its own).
-    /// The period is built with [`Duration::try_from_secs_f64`] rather than
-    /// the panicking `Duration::from_secs_f64` (review round 1, finding 2),
-    /// so a pathological reciprocal can never panic here. A rate whose
-    /// period would exceed [`MAX_LIMITER_PERIOD_SECS`] — such as `1e-15`,
-    /// whose reciprocal is a period of roughly 31.7 million years — is also
-    /// [`PdsError::InvalidRate`]: a "rate limiter" whose next tick is that
-    /// far away limits nothing, so it is rejected up front rather than
-    /// built and silently never ticking.
+    /// Rejects a non-positive, non-finite, or out-of-range rate with
+    /// [`PdsError::InvalidRate`] via [`limiter_period_for_rate`] (BC14 is
+    /// enforced earlier, at config load with the same range, through
+    /// `config::graph_rps_or_default`; this is defence in depth for a
+    /// caller that built the rate some other way, the same reason
+    /// `AppViewClient::new` re-checks its own). A rate whose period would
+    /// fall outside [`MIN_LIMITER_PERIOD_SECS`] to [`MAX_LIMITER_PERIOD_SECS`]
+    /// — too fast to mean anything, such as `1e10` (review round 2, defect
+    /// A), or so slow it would never limit anything, such as `1e-15`
+    /// (review round 1, finding 2, roughly a 31.7-million-year period) — is
+    /// also [`PdsError::InvalidRate`], rejected up front rather than built
+    /// and left to panic or never tick.
     pub fn new(transport: T, credentials: Credentials, graph_rps: f64) -> Result<Self, PdsError> {
-        if !graph_rps.is_finite() || graph_rps <= 0.0 {
-            return Err(PdsError::InvalidRate);
-        }
-        let period_secs = 1.0 / graph_rps;
-        if !period_secs.is_finite() || period_secs > MAX_LIMITER_PERIOD_SECS {
-            return Err(PdsError::InvalidRate);
-        }
-        let period = Duration::try_from_secs_f64(period_secs).map_err(|_| PdsError::InvalidRate)?;
+        let period = limiter_period_for_rate(graph_rps).map_err(|()| PdsError::InvalidRate)?;
         let mut interval = time::interval(period);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Ok(Self {
@@ -885,6 +904,15 @@ mod tests {
         // wildly impractical (here, roughly 31.7 million years) is
         // `PdsError::InvalidRate`, not a panic in `Duration` construction.
         let err = PdsClient::new(FakeTransport::new(), creds(), 1e-15).unwrap_err();
+        assert!(matches!(err, PdsError::InvalidRate));
+    }
+
+    #[test]
+    fn huge_rate_is_rejected_without_panic() {
+        // Review round 2, defect A: a rate whose reciprocal rounds down to
+        // a 0 ns period is `PdsError::InvalidRate`, not a panic in
+        // `tokio::time::interval`.
+        let err = PdsClient::new(FakeTransport::new(), creds(), 1e10).unwrap_err();
         assert!(matches!(err, PdsError::InvalidRate));
     }
 

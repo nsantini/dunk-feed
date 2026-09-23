@@ -235,31 +235,81 @@ fn positive_u32_or_default(
     Ok(value)
 }
 
-/// Reads an optional string variable, falling back to `default` when unset,
-/// like [`string_or_default`], but rejects an explicit empty (or
-/// whitespace-only) value instead of silently accepting it as a blank base
-/// URL, and rejects a value that does not start with `https://` (review
-/// round 1, finding 4): a PDS session, and every App View call proxied
-/// through it, carries the bearer token and the app password, so a scheme
-/// downgrade to plain `http://` would send both in the clear.
-/// `UPSTAGE_PDS_URL` is the only caller today.
-fn non_empty_string_or_default(
+/// Parses `UPSTAGE_PDS_URL`, falling back to `default` when unset (BC15).
+/// Trims the value, then parses it with `reqwest::Url`: it must be `https`
+/// (review round 1, finding 4 — a PDS session, and every App View call
+/// proxied through it, carries the bearer token and the app password, so a
+/// scheme downgrade to plain `http://` would send both in the clear), carry
+/// a host (review round 2, defect B — a bare `https://` passed the old
+/// prefix check and then broke the path once the trailing slash was
+/// trimmed), and carry no userinfo, query or fragment (review round 2,
+/// defects E and F — any of the three would swallow or leak past the
+/// `/xrpc/<nsid>` path `HttpPdsTransport` builds, and userinfo can hold the
+/// very credentials this check exists to protect). `reqwest::Url` lowercases
+/// the scheme and the stored value drops a trailing `/`, so `HTTPS://` and a
+/// trailing-slash input both normalise to the same base (review round 2,
+/// defect C). `ConfigError::Invalid.value` is `[redacted]` for this
+/// variable, never the raw input, so a rejected userinfo case never echoes
+/// its password into the error's `Display` or `Debug` (review round 2,
+/// finding 13).
+fn pds_url_or_default(
     lookup: &impl Fn(&str) -> Option<String>,
     name: &'static str,
     default: &str,
 ) -> Result<String, ConfigError> {
-    match lookup(name) {
-        None => Ok(default.to_string()),
-        Some(value) if value.trim().is_empty() => {
-            Err(ConfigError::Invalid { name, value, reason: "empty value".to_string() })
-        }
-        Some(value) if !value.starts_with("https://") => Err(ConfigError::Invalid {
-            name,
-            value,
-            reason: "must start with https://".to_string(),
-        }),
-        Some(value) => Ok(value),
+    let raw = match lookup(name) {
+        None => return Ok(default.to_string()),
+        Some(value) => value,
+    };
+    let invalid = || ConfigError::Invalid {
+        name,
+        value: "[redacted]".to_string(),
+        reason: "must be an https URL with a host and no userinfo, query or fragment".to_string(),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid());
     }
+    let url = reqwest::Url::parse(trimmed).map_err(|_| invalid())?;
+    if url.scheme() != "https" {
+        return Err(invalid());
+    }
+    if url.host_str().is_none() {
+        return Err(invalid());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid());
+    }
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+/// Parses `UPSTAGE_GRAPH_RPS`, falling back to `default` when unset, on top
+/// of [`positive_float_or_default`]'s zero/negative/non-finite rejection,
+/// then rejects a rate outside the range
+/// `appview::pds::limiter_period_for_rate` accepts (review round 2, defect
+/// D): a period longer than a day, like `0.00001`'s roughly 27.8-hour
+/// period, or shorter than a nanosecond, like `1e10`'s (defect A). Config
+/// load and `PdsClient::new` share that one range check, so a `Config` built
+/// by `load` can never fail `PdsClient::new` on its rate; `publish::run`
+/// still maps a `PdsClient::from_config` failure to a `PublishError` rather
+/// than `.expect()`, for a `Config` built some other way.
+fn graph_rps_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: f64,
+) -> Result<f64, ConfigError> {
+    let value = positive_float_or_default(lookup, name, default)?;
+    if crate::appview::pds::limiter_period_for_rate(value).is_err() {
+        return Err(ConfigError::Invalid {
+            name,
+            value: value.to_string(),
+            reason: "period must be between 1ns and 1 day".to_string(),
+        });
+    }
+    Ok(value)
 }
 
 /// Parses `UPSTAGE_APPVIEW_RPS`, rejecting zero, negative and non-finite values
@@ -389,8 +439,8 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         log: log_filter_or_default(&lookup, "UPSTAGE_LOG", "info")?,
         bsky_handle: optional(&lookup, "BSKY_HANDLE"),
         bsky_app_password: optional(&lookup, "BSKY_APP_PASSWORD").map(Secret),
-        pds_url: non_empty_string_or_default(&lookup, "UPSTAGE_PDS_URL", "https://bsky.social")?,
-        graph_rps: positive_float_or_default(&lookup, "UPSTAGE_GRAPH_RPS", 8.0)?,
+        pds_url: pds_url_or_default(&lookup, "UPSTAGE_PDS_URL", "https://bsky.social")?,
+        graph_rps: graph_rps_or_default(&lookup, "UPSTAGE_GRAPH_RPS", 8.0)?,
         health_max_lag_s: positive_u32_or_default(&lookup, "UPSTAGE_HEALTH_MAX_LAG_S", 300)?,
         guard_histogram_h: number_or_default(&lookup, "UPSTAGE_GUARD_HISTOGRAM_H", 24)?,
         author_ttl_h: positive_u32_or_default(&lookup, "UPSTAGE_AUTHOR_TTL_H", 24)?,
@@ -962,15 +1012,15 @@ mod tests {
 
     #[test]
     fn pds_url_rejects_non_https() {
-        // Review round 1, finding 4, BC15: UPSTAGE_PDS_URL must start with
-        // https://, and the default still loads unaffected.
+        // Review round 1, finding 4, BC15: UPSTAGE_PDS_URL must be https,
+        // and the default still loads unaffected.
         let mut pairs = required_pair().to_vec();
         pairs.push(("UPSTAGE_PDS_URL", "http://bsky.social"));
         let err = load(env(&pairs)).unwrap_err();
         match err {
-            ConfigError::Invalid { name, reason, .. } => {
+            ConfigError::Invalid { name, value, .. } => {
                 assert_eq!(name, "UPSTAGE_PDS_URL");
-                assert_eq!(reason, "must start with https://");
+                assert_eq!(value, "[redacted]");
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
@@ -990,6 +1040,72 @@ mod tests {
         match err {
             ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_PDS_URL"),
             other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pds_url_rejects_bare_scheme_query_fragment_or_userinfo() {
+        // Review round 2, defects B, E and F: a bare `https://` has no
+        // host; a query or a fragment would swallow the `/xrpc/<nsid>`
+        // path `HttpPdsTransport` builds; userinfo can hold the very
+        // credentials this check exists to protect, so the userinfo case's
+        // error never echoes the raw value, in `Display` or `Debug`.
+        for bad in [
+            "https://",
+            "https://bsky.social#x",
+            "https://bsky.social?x=1",
+            "https://u:p@bsky.social",
+        ] {
+            let mut pairs = required_pair().to_vec();
+            pairs.push(("UPSTAGE_PDS_URL", bad));
+            let err = load(env(&pairs)).unwrap_err();
+            match err {
+                ConfigError::Invalid { name, value, .. } => {
+                    assert_eq!(name, "UPSTAGE_PDS_URL");
+                    assert_eq!(value, "[redacted]");
+                }
+                other => panic!("expected Invalid for {bad}, got {other:?}"),
+            }
+        }
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PDS_URL", "https://u:p@bsky.social"));
+        let err = load(env(&pairs)).unwrap_err();
+        let displayed = err.to_string();
+        let debugged = format!("{err:?}");
+        assert!(!displayed.contains("p@"), "Display leaked userinfo: {displayed}");
+        assert!(!debugged.contains("p@"), "Debug leaked userinfo: {debugged}");
+    }
+
+    #[test]
+    fn pds_url_normalises_case_and_trailing_slash() {
+        // Review round 2, defect C: the scheme check is case-insensitive
+        // (the parser lowercases it) and the value is trimmed; both forms
+        // normalise to the same base with no trailing slash.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PDS_URL", "HTTPS://bsky.social"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.pds_url, "https://bsky.social");
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PDS_URL", " https://bsky.social/ "));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.pds_url, "https://bsky.social");
+    }
+
+    #[test]
+    fn graph_rps_rejects_a_period_outside_a_nanosecond_to_a_day() {
+        // Review round 2, defect D: UPSTAGE_GRAPH_RPS is bounded to the same
+        // range PdsClient::new enforces, so a Config built by load can never
+        // fail PdsClient::new on its rate.
+        for bad in ["1e10", "0.00001"] {
+            let mut pairs = required_pair().to_vec();
+            pairs.push(("UPSTAGE_GRAPH_RPS", bad));
+            let err = load(env(&pairs)).unwrap_err();
+            match err {
+                ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_GRAPH_RPS"),
+                other => panic!("expected Invalid for {bad}, got {other:?}"),
+            }
         }
     }
 
