@@ -551,8 +551,14 @@ mod tests {
     fn cycling_pages() -> HashMap<Option<String>, FollowsPage> {
         HashMap::from([
             (None, FollowsPage { dids: vec![did(1)], cursor: Some("a".to_string()) }),
-            (Some("a".to_string()), FollowsPage { dids: vec![did(2)], cursor: Some("b".to_string()) }),
-            (Some("b".to_string()), FollowsPage { dids: vec![did(3)], cursor: Some("a".to_string()) }),
+            (
+                Some("a".to_string()),
+                FollowsPage { dids: vec![did(2)], cursor: Some("b".to_string()) },
+            ),
+            (
+                Some("b".to_string()),
+                FollowsPage { dids: vec![did(3)], cursor: Some("a".to_string()) },
+            ),
         ])
     }
 
@@ -575,8 +581,7 @@ mod tests {
         let source = CyclingSource { pages: Mutex::new(cycling_pages()) };
         let mut shared: HashMap<String, Vec<DidHash>> = HashMap::new();
 
-        let stats =
-            step_degree2(&source, &["acct-a".to_string()], 100, &mut shared).await.unwrap();
+        let stats = step_degree2(&source, &["acct-a".to_string()], 100, &mut shared).await.unwrap();
 
         assert_eq!(stats.calls, 3);
         assert_eq!(shared.get("acct-a").unwrap().len(), 2);
