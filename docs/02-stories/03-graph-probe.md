@@ -4,15 +4,26 @@
 - **PRD story**: Limit the number of stored circles (measures the inputs for its defaults)
 - **Size**: standard
 - **Design**: docs/02-TECH-DESIGN-network-feed.md §12, §6.1, §6.2, §9.2
+- **Flag**: none, because this is an operator CLI. It writes nothing and does not change the served feed
+
+## Release
+
+This story ships a new CLI subcommand in the next deploy. It has no flag,
+because viewers see no change. No process starts the probe. An operator
+runs it by hand.
+
+Rollback is a revert of the pull request and a new deploy. The probe
+writes nothing, so there is no data to clean up.
 
 ## Outcome
 
-After this ships, an operator runs
-`upstage graph-probe --handle <h> [--handle <h> ...]`. The command logs in
-with `BSKY_HANDLE`, reads the current feed rows from SQLite, and runs a
-first build for each handle in memory. It writes nothing. It prints the
-cost, size, overlap and speed numbers that story 04 needs to accept or
-reject the design.
+After this ships, an operator runs a graph probe command for one or more
+handles. The command logs in with `BSKY_HANDLE`, reads the current feed
+rows from SQLite, and runs a first build for each handle in memory. It
+writes nothing. It prints the cost, size, overlap and speed numbers that
+story 04 needs to accept or reject the design.
+
+The command is `upstage graph-probe --handle <h> [--handle <h> ...]`.
 
 ## Non-goals
 
@@ -82,7 +93,7 @@ check the numbers, not the text.
 - [ ] AC5 — The new config variables load with their defaults. Checked by: `cargo test config::tests::graph_depth_defaults`
 - [ ] AC6 — A real run against two handles prints every field. Checked by: run by hand: `cargo test -- --ignored graph_probe_live`
 - [ ] AC7 — `AGENTS.md` names `graph/` and `graph_probe` as `appview/` callers. Checked by: manual review.
-- [ ] AC8 — All four gates pass.
+- [ ] AC8 — All four gates pass. Checked by: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` and `cargo build --release`.
 
 ## Defaults taken
 
@@ -105,3 +116,80 @@ check the numbers, not the text.
   passes.
 - 3.0 `graph_probe.rs`, CLI wiring, config, `PdsClient` impl. Done when
   `cargo test graph_probe` passes and all four gates pass.
+
+## Testing steps
+
+1. Prepare the shell. Copy `.env.example` to `.env`. Fill in the required
+   values, `BSKY_HANDLE` and `BSKY_APP_PASSWORD`. Put a copy of a database
+   with feed rows at `./upstage.db`. Then run:
+
+   ```
+   export $(grep -v '^#' .env | xargs)
+   export UPSTAGE_DB_PATH=./upstage.db
+   ```
+
+   Expected: The commands exit 0.
+
+2. Run the probe without credentials.
+
+   ```
+   env -u BSKY_HANDLE cargo run --release -- graph-probe --handle bsky.app
+   ```
+
+   Expected: The command exits 1 before any network call.
+
+3. Run the probe with no handle.
+
+   ```
+   cargo run --release -- graph-probe
+   ```
+
+   Expected: The command exits 1 with a usage message.
+
+4. Record a checksum of the database. Do not run `upstage run` during this
+   step or the next one.
+
+   ```
+   shasum -a 256 "$UPSTAGE_DB_PATH"
+   ```
+
+   Expected: A checksum. Write it down.
+
+5. Run the probe on two handles. Use one handle with fewer than 200
+   follows and one with more than 1,000.
+
+   ```
+   cargo run --release -- graph-probe --handle <h1> --handle <h2> | tee probe.txt
+   ```
+
+   Expected: For each handle: calls, pages and time for each step. Sizes
+   of `follows`, `follows_me` and the degree-2 set. Circle bytes and
+   shared-entry bytes. For the run: the shared degree-2 share and the
+   bytes saved. The time of `connected_indices` plus `caps::apply` on
+   100,000 items. The circle pairs in 24 hours and the degree-2-only
+   share. One order check line: `match`, the first difference, or `order
+   check: skipped` with the status.
+
+6. Check the database again.
+
+   ```
+   shasum -a 256 "$UPSTAGE_DB_PATH"
+   ```
+
+   Expected: The same checksum as in step 4. The probe wrote nothing.
+
+7. Search the output for the viewer DID of each handle.
+
+   ```
+   grep -c "$(curl -s "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=<h1>" | jq -r .did)" probe.txt
+   ```
+
+   Expected: 0. Do the same for `<h2>`. The handles appear in the output.
+
+8. Run the live probe test.
+
+   ```
+   cargo test -- --ignored graph_probe_live
+   ```
+
+   Expected: The test passes.

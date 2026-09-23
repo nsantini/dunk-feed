@@ -4,6 +4,17 @@
 - **PRD story**: Limit the number of stored circles (sets the measured defaults)
 - **Size**: small
 - **Design**: docs/02-TECH-DESIGN-network-feed.md §12, §7, §13, §17
+- **Flag**: none, because it is an operator story with no code
+
+## Release
+
+Nothing ships to production in this story. The output is a change to
+`docs/02-TECH-DESIGN-network-feed.md`. No code changes, and
+`UPSTAGE_PERSONALISE` stays `false`. Story 06 writes the measured defaults
+into `src/config.rs`.
+
+Rollback is a revert of the documentation commit. A revert has no effect
+on the running service.
 
 ## Outcome
 
@@ -74,7 +85,7 @@ these is true:
 - [ ] AC2 — Subsection 12.1 holds every field in BC2. Checked by: manual review.
 - [ ] AC3 — §4 gives the measured defaults for `UPSTAGE_MAX_VIEWERS` and `UPSTAGE_GRAPH_RPS`, with the calculation. Checked by: manual review.
 - [ ] AC4 — The stop rule result is written as "pass" or "stop", with the reason. Checked by: manual review.
-- [ ] AC5 — All four gates pass. (No code changes, so the gates stay green.)
+- [ ] AC5 — All four gates pass. (No code changes, so the gates stay green.) Checked by: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` and `cargo build --release`.
 
 ## Defaults taken
 
@@ -89,3 +100,93 @@ these is true:
   pass.
 - 2.0 Compute and write the defaults and the stop rule result. Done when
   AC3 and AC4 pass.
+
+## Testing steps
+
+1. Choose about 10 handles. Read the follow count of each handle.
+
+   ```
+   curl -s "https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=<h>" | jq .followsCount
+   ```
+
+   Expected: 3 or more handles follow fewer than 200 accounts. 3 or more
+   follow 200 to 1,000. 3 or more follow more than 1,000.
+
+2. On the production host, run the probe in one command against the
+   production SQLite file. The deployed commit must include story 03.
+
+   ```
+   docker compose -f <file> run --rm upstage graph-probe \
+     --handle <h1> ... --handle <h10> | tee probe-$(date +%F).txt
+   ```
+
+   Expected: The command exits 0. The output has one report for each
+   handle and one overlap report for the run.
+
+3. Record the commit and the number of feed rows. Confirm the volume name
+   first with `docker volume ls`.
+
+   ```
+   git rev-parse --short HEAD
+   docker run --rm -v <volume>:/data alpine/sqlite /data/upstage.db "SELECT count(*) FROM feed"
+   ```
+
+   Expected: A commit and a row count. Write both, and the date, at the
+   top of subsection 12.1.
+
+4. Copy the probe numbers into subsection 12.1. Write one row for each
+   handle, with its follow count band. Then check that no DID is in the
+   subsection.
+
+   ```
+   sed -n '/^### 12.1/,/^## 13/p' docs/02-TECH-DESIGN-network-feed.md | grep -c 'did:'
+   ```
+
+   Expected: 0. The subsection holds every field in BC2.
+
+5. Read the order check result for each handle.
+
+   ```
+   grep -i "order check" probe-*.txt
+   ```
+
+   Expected: `match` for each handle, or `skipped` with the status. A
+   difference means the stop rule is true.
+
+6. Compute the calls for each viewer each day. Use 4 degree-1 refreshes
+   plus the degree-2 refill after the measured overlap.
+
+   ```
+   echo "4 * <degree-1 calls> + <degree-2 calls> * (1 - <overlap share>)" | bc -l
+   ```
+
+   Expected: One number. Write it and the calculation in subsection 12.1.
+
+7. Compute `UPSTAGE_MAX_VIEWERS`, so that the total fits in 80 % of
+   `UPSTAGE_GRAPH_RPS`. Use a rate of 8 or lower.
+
+   ```
+   echo "0.8 * <rps> * 86400 / <calls for each viewer each day>" | bc
+   ```
+
+   Expected: One number. Write it and the rate as the defaults in §4, with
+   the calculation.
+
+8. Estimate the process memory at that viewer count. Use the measured
+   bytes for each circle and each shared entry, and 250 MB for the base
+   process (§13).
+
+   ```
+   echo "250 + <viewers> * <circle bytes> / 1000000 + <shared entry bytes> / 1000000" | bc -l
+   ```
+
+   Expected: One number in MB. Replace the §13 estimate with it.
+
+9. Apply the stop rule. Write the result at the end of subsection 12.1.
+
+   ```
+   grep -n '^Result: ' docs/02-TECH-DESIGN-network-feed.md
+   ```
+
+   Expected: One line, `Result: pass` or `Result: stop`, with the reason.
+   On `stop`, do not start story 06.

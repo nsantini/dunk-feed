@@ -4,6 +4,22 @@
 - **PRD story**: My circle stays current; Limit the number of stored circles; First open builds my circle
 - **Size**: standard
 - **Design**: docs/02-TECH-DESIGN-network-feed.md §6.3, §6.4, §7, §8, §10
+- **Flag**: `UPSTAGE_PERSONALISE` (default `false`)
+
+## Release
+
+This story merges and deploys with `UPSTAGE_PERSONALISE=false`, the
+default. The served feed does not change, and the scheduler does not
+start. The flag hides the refresh, the refill, the cache clean-up and the
+eviction.
+
+To turn the feature on in one environment, set `UPSTAGE_PERSONALISE=true`
+in the `.env` of that environment. Then restart with `docker compose -f
+<file> up -d`. The flag applies to the whole process. There is no flag for
+one user.
+
+Rollback is `UPSTAGE_PERSONALISE=false` and a restart. A revert of the
+pull request is also possible, because the story adds no migration.
 
 ## Outcome
 
@@ -78,7 +94,7 @@ circle.
 - [ ] AC7 — Idle and LRU eviction remove the circle and write one line with the reason and no DID. Checked by: `cargo test graph::tests::eviction`
 - [ ] AC8 — An evicted viewer gets an empty page and a new first build. Checked by: `cargo test http::skeleton::tests::evicted_viewer_first_open`
 - [ ] AC9 — New config variables load with their defaults. Checked by: `cargo test config::tests::graph_refresh_defaults`
-- [ ] AC10 — All four gates pass.
+- [ ] AC10 — All four gates pass. Checked by: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` and `cargo build --release`.
 
 ## Defaults taken
 
@@ -95,3 +111,173 @@ circle.
 - 3.0 Refill and cache clean-up. Done when AC6 passes.
 - 4.0 Idle and LRU eviction. Done when AC7 to AC9 pass and all four gates
   pass.
+
+## Testing steps
+
+1. Prepare the shell. Copy `.env.example` to `.env` and fill in the
+   required values. Put a copy of a database with feed rows at
+   `./upstage.db`, for example a production backup. Then run:
+
+   ```
+   export $(grep -v '^#' .env | xargs)
+   export UPSTAGE_DB_PATH=./upstage.db
+   FEED="at://$UPSTAGE_PUBLISHER_DID/app.bsky.feed.generator/$UPSTAGE_FEED_RKEY"
+   SKEL="http://localhost:3000/xrpc/app.bsky.feed.getFeedSkeleton?feed=$FEED"
+   ```
+
+   Expected: The commands exit 0. `echo $SKEL` prints the feed URL.
+
+2. Log in as a test viewer. Use an account on `bsky.social` that follows
+   some authors in the feed.
+
+   ```
+   VIEWER_HANDLE=<test viewer handle>
+   VIEWER_DID=$(curl -s "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=$VIEWER_HANDLE" | jq -r .did)
+   ACCESS=$(curl -s -X POST https://bsky.social/xrpc/com.atproto.server.createSession \
+     -H 'Content-Type: application/json' \
+     -d "{\"identifier\":\"$VIEWER_HANDLE\",\"password\":\"<viewer app password>\"}" | jq -r .accessJwt)
+   token() { curl -s -H "Authorization: Bearer $ACCESS" \
+     "https://bsky.social/xrpc/com.atproto.server.getServiceAuth?aud=${1:-did:web:$UPSTAGE_HOSTNAME}&lxm=app.bsky.feed.getFeedSkeleton&exp=$(( $(date +%s) + ${2:-1800} ))" | jq -r .token; }
+   TOKEN=$(token)
+   ```
+
+   Expected: `echo $VIEWER_DID` prints a DID. `echo $TOKEN` prints three
+   parts with a dot between each part.
+
+3. Start the service with the flag on and short refresh ages. `.env` must
+   set `BSKY_HANDLE` and `BSKY_APP_PASSWORD`.
+
+   ```
+   UPSTAGE_PERSONALISE=true UPSTAGE_GRAPH_REFRESH_AGE_H=1 UPSTAGE_D2_REFRESH_AGE_H=1 \
+     cargo run --release -- run 2>&1 | tee run.log
+   ```
+
+   Expected: The service starts.
+
+4. Build the viewer's circle. Record the refresh time and the cache.
+
+   ```
+   curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"; sleep 30; curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"
+   sqlite3 "$UPSTAGE_DB_PATH" "SELECT state, d1_refreshed_at FROM viewers WHERE viewer_did='$VIEWER_DID'"
+   sqlite3 -separator ' ' "$UPSTAGE_DB_PATH" \
+     "SELECT account_did, fetched_at FROM follows_cache ORDER BY account_did" > cache-1.txt
+   ```
+
+   Expected: `ready` and a refresh time. Write the time down.
+
+5. Open the production feed in the Bluesky app. Pick a quote author X that
+   the viewer does not follow. Follow X with the viewer account. Keep the
+   DID of X in `X_DID`.
+
+   ```
+   X_DID=$(curl -s "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=<x handle>" | jq -r .did)
+   ```
+
+   Expected: `echo $X_DID` prints a DID.
+
+6. Wait more than one hour. Send one request. Wait two scheduler passes.
+   Read the refresh time.
+
+   ```
+   sleep 3660; TOKEN=$(token); curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30" > /dev/null; sleep 120
+   sqlite3 "$UPSTAGE_DB_PATH" "SELECT d1_refreshed_at FROM viewers WHERE viewer_did='$VIEWER_DID'"
+   ```
+
+   Expected: A time later than the time from step 4.
+
+7. Page through the viewer's list. Search it for posts by X.
+
+   ```
+   c=""; : > posts.txt
+   while :; do
+     r=$(curl -s -H "Authorization: Bearer $TOKEN" "$SKEL&limit=100${c:+&cursor=$c}")
+     echo "$r" | jq -r '.feed[].post' >> posts.txt
+     c=$(echo "$r" | jq -r '.cursor // empty'); [ -z "$c" ] && break
+   done
+   wc -l < posts.txt; sort posts.txt | uniq -d | wc -l
+   grep -c "at://$X_DID/" posts.txt
+   ```
+
+   Expected: A number above 0, when X has a pair in the ranked list.
+
+8. Compare the shared follows cache with step 4.
+
+   ```
+   sqlite3 -separator ' ' "$UPSTAGE_DB_PATH" \
+     "SELECT account_did, fetched_at FROM follows_cache ORDER BY account_did" > cache-2.txt
+   join cache-1.txt cache-2.txt | awk '$2 != $3' | wc -l
+   ```
+
+   Expected: A number above 0. The entries that the circle names were
+   fetched again.
+
+9. Unfollow X with the viewer account. Wait more than one hour. Send one
+   request, wait two scheduler passes, and page through the list.
+
+   ```
+   sleep 3660; TOKEN=$(token); curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30" > /dev/null; sleep 120
+   c=""; : > posts.txt
+   while :; do
+     r=$(curl -s -H "Authorization: Bearer $TOKEN" "$SKEL&limit=100${c:+&cursor=$c}")
+     echo "$r" | jq -r '.feed[].post' >> posts.txt
+     c=$(echo "$r" | jq -r '.cursor // empty'); [ -z "$c" ] && break
+   done
+   wc -l < posts.txt; sort posts.txt | uniq -d | wc -l
+   grep -c "at://$X_DID/" posts.txt
+   ```
+
+   Expected: 0, unless X is still connected through "follows me" or degree
+   2.
+
+10. Send no request for more than one hour. Read the refresh time before
+    and after.
+
+    ```
+    sqlite3 "$UPSTAGE_DB_PATH" "SELECT d1_refreshed_at FROM viewers WHERE viewer_did='$VIEWER_DID'"; sleep 3720; sqlite3 "$UPSTAGE_DB_PATH" "SELECT d1_refreshed_at FROM viewers WHERE viewer_did='$VIEWER_DID'"
+    ```
+
+    Expected: The same time twice. A viewer with no request gets no
+    refresh.
+
+11. Restart the service with room for one circle. Log in as a second test
+    viewer B, as in step 2. Send B's first request.
+
+    ```
+    UPSTAGE_PERSONALISE=true UPSTAGE_MAX_VIEWERS=1 cargo run --release -- run 2>&1 | tee run-lru.log
+    # in a second shell:
+    curl -s -H "Authorization: Bearer $TOKEN_B" "$SKEL&limit=30"; sleep 5
+    curl -s -H "Authorization: Bearer $TOKEN_B" "$SKEL&limit=30"; sleep 5
+    grep '"graph.evicted"' run-lru.log
+    sqlite3 "$UPSTAGE_DB_PATH" "SELECT count(*) FROM viewers WHERE viewer_did='$VIEWER_DID'"
+    ```
+
+    Expected: One `graph.evicted` line with `"reason":"lru"` and no DID.
+    Then `0`: viewer A's circle is gone.
+
+12. Send a request as viewer A.
+
+    ```
+    TOKEN=$(token); curl -si -H "Authorization: Bearer $TOKEN" "$SKEL&limit=30"; sleep 2; sqlite3 "$UPSTAGE_DB_PATH" "SELECT state FROM viewers WHERE viewer_did='$VIEWER_DID'"
+    ```
+
+    Expected: The body is `{"feed":[]}`. A new first build starts for A. A
+    second `graph.evicted` line with `"reason":"lru"` removes B.
+
+13. Optional, because it takes one day. Restart with
+    `UPSTAGE_GRAPH_IDLE_EVICT_D=1`. Send no request for 24 hours.
+
+    ```
+    UPSTAGE_PERSONALISE=true UPSTAGE_GRAPH_IDLE_EVICT_D=1 cargo run --release -- run 2>&1 | tee run-idle.log
+    # 24 hours later:
+    grep '"graph.evicted"' run-idle.log
+    ```
+
+    Expected: One `graph.evicted` line with `"reason":"idle"` and no DID.
+
+14. Search all logs for the viewer DIDs.
+
+    ```
+    grep -c "$VIEWER_DID" run*.log
+    ```
+
+    Expected: 0 for each file. Do the same for viewer B.
