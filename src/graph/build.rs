@@ -80,17 +80,20 @@ pub trait GraphSource {
 
 /// Step 1: pages `get_follows` for `viewer` to the end, filling
 /// `circle.follows` with every hash and `circle.d2_sample` with the first
-/// `d2_sample_size` DIDs in response order (BC1). A page's DIDs are added
-/// only after its next cursor is checked against the one just sent and
-/// against every cursor sent before it in this call (review round 3, defect
-/// L): a page that repeats the cursor it was fetched with, or cycles back to
-/// one already used, carries data this step has already accounted for, so it
-/// is discarded rather than pushed into `circle.d2_sample` a second time.
-/// Paging also stops on the ordinary end-of-list case of a `None` cursor, or
-/// on an empty page (review round 2, defect J; review round 3, defect O
-/// widens the repeated-cursor check from "the last cursor sent" to "any
-/// cursor sent so far", so a source whose cursor cycles through more than
-/// one earlier value is still bounded).
+/// `d2_sample_size` *distinct* DIDs in response order (BC1). Each fetched
+/// page's DIDs are added to `circle.follows` and, when new, appended to
+/// `circle.d2_sample` before the page's next cursor is checked (review round
+/// 4, defect Q): a page is only ever fetched once, because each cursor is
+/// sent at most once, so a page that happens to repeat an earlier cursor is
+/// still the one fresh page for that cursor and its DIDs belong in the
+/// result. A DID already present in `circle.follows` — whether from an
+/// earlier page or repeated within the same page — is not pushed into
+/// `circle.d2_sample` again (review round 4, defect R). Paging stops when
+/// the page carries no DIDs, when its next cursor is `None`, or when that
+/// next cursor was already sent for this call (review round 2, defect J;
+/// review round 3, defect O widens the check from "the last cursor sent" to
+/// "any cursor sent so far", so a source whose cursor cycles through more
+/// than one earlier value is still bounded).
 pub async fn step_follows<S: GraphSource>(
     source: &S,
     viewer: &str,
@@ -105,28 +108,23 @@ pub async fn step_follows<S: GraphSource>(
         let sent_cursor = cursor.clone();
         let page = source.get_follows(viewer, 100, cursor.take()).await?;
         calls += 1;
-        if page.dids.is_empty() {
-            break;
-        }
-        let next_cursor = page.cursor;
-        let repeats_a_cursor = match &next_cursor {
-            None => false,
-            Some(c) => Some(c) == sent_cursor.as_ref() || sent_cursors.contains(c),
-        };
-        if repeats_a_cursor {
-            break;
-        }
         for did in &page.dids {
-            circle.follows.insert(hash_did(did));
-            if circle.d2_sample.len() < d2_sample_size {
+            let is_new = circle.follows.insert(hash_did(did));
+            if is_new && circle.d2_sample.len() < d2_sample_size {
                 circle.d2_sample.push(did.clone());
             }
         }
         if let Some(c) = sent_cursor {
             sent_cursors.insert(c);
         }
-        if next_cursor.is_none() {
+        if page.dids.is_empty() {
             break;
+        }
+        let next_cursor = page.cursor;
+        match &next_cursor {
+            None => break,
+            Some(c) if sent_cursors.contains(c) => break,
+            Some(_) => {}
         }
         cursor = next_cursor;
     }
@@ -189,10 +187,15 @@ pub async fn step_follows_me<S: GraphSource>(
 /// needed to reach the depth, never a full page of 100 when fewer remain
 /// (review round 1, defect B): a depth of 150 therefore makes one page of
 /// 100 and one of 50, and the stored list holds exactly 150 hashes, not the
-/// 200 the account may actually follow. An account already in `shared`
-/// costs no call. Paging for one account stops on an empty page, on the
-/// ordinary end-of-list case of a `None` cursor, or when the next cursor
-/// repeats the one just sent or any cursor already sent for this account
+/// 200 the account may actually follow. An account already in `shared` costs
+/// no call. Each fetched page's DIDs are appended to `collected` before its
+/// next cursor is checked (review round 4, defect Q): a page is only ever
+/// fetched once, because each cursor is sent at most once, so a page that
+/// happens to repeat an earlier cursor is still the one fresh page for that
+/// cursor and its DIDs count toward the depth (subject to the truncation
+/// below, so this never lets an account exceed `d2_follows_depth`). Paging
+/// for one account stops when the page carries no DIDs, when its next cursor
+/// is `None`, or when that next cursor was already sent for this account
 /// (review round 2, defect J; review round 3, defect O widens the check from
 /// "the last cursor sent" to "any cursor sent so far", so a source whose
 /// cursor cycles through more than one earlier value is still bounded).
@@ -219,23 +222,19 @@ pub async fn step_degree2<S: GraphSource>(
             let sent_cursor = cursor.clone();
             let page = source.get_follows(account, page_limit, cursor.take()).await?;
             calls += 1;
-            if page.dids.is_empty() {
-                break;
-            }
-            let next_cursor = page.cursor;
-            let repeats_a_cursor = match &next_cursor {
-                None => false,
-                Some(c) => Some(c) == sent_cursor.as_ref() || sent_cursors.contains(c),
-            };
-            if repeats_a_cursor {
-                break;
-            }
+            let page_was_empty = page.dids.is_empty();
             collected.extend(page.dids);
             if let Some(c) = sent_cursor {
                 sent_cursors.insert(c);
             }
-            if next_cursor.is_none() {
+            if page_was_empty {
                 break;
+            }
+            let next_cursor = page.cursor;
+            match &next_cursor {
+                None => break,
+                Some(c) if sent_cursors.contains(c) => break,
+                Some(_) => {}
             }
             cursor = next_cursor;
         }
@@ -508,10 +507,11 @@ mod tests {
 
     #[tokio::test]
     async fn step_follows_never_pushes_a_repeated_page_into_d2_sample_twice() {
-        // Review round 3, defect L: the same DID coming back on a page that
-        // repeats its own cursor must not be pushed into `d2_sample` a
-        // second time — the cursor check happens before the page's DIDs are
-        // added, not after.
+        // Review round 3, defect L; review round 4, defect Q widens the fix:
+        // the same DID coming back on a page that repeats its own cursor is
+        // still added to `circle.follows` (the page is real data, counted
+        // once), but it is already there by the second call, so it is not
+        // pushed into `d2_sample` again.
         let source =
             StuckSource { page: FollowsPage { dids: vec![did(1)], cursor: Some("x".to_string()) } };
         let mut circle = Circle::new();
@@ -519,6 +519,22 @@ mod tests {
         step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
 
         assert_eq!(circle.d2_sample, vec![did(1)]);
+    }
+
+    #[tokio::test]
+    async fn step_follows_d2_sample_holds_distinct_dids_only() {
+        // Review round 4, defect R: a single page carrying the same DID
+        // twice must not push it into `d2_sample` twice either; the sample
+        // is the first `d2_sample_size` *distinct* DIDs in response order.
+        let source = FakeSource {
+            follows: HashMap::from([("viewer".to_string(), vec![did(1), did(1), did(2)])]),
+            ..Default::default()
+        };
+        let mut circle = Circle::new();
+
+        step_follows(&source, "viewer", 2, &mut circle).await.unwrap();
+
+        assert_eq!(circle.d2_sample, vec![did(1), did(2)]);
     }
 
     /// A `GraphSource` whose cursor cycles through more than one earlier
@@ -567,24 +583,30 @@ mod tests {
         // Review round 3, defect O: cursor cycles None -> a -> b -> a. The
         // repeat only shows up two hops after "a" was first sent, so a check
         // against only the immediately preceding cursor would page forever.
+        // Review round 4, defect Q: the third page (cursor "a" again) is
+        // still a fresh fetch — its cursor was only ever sent once before —
+        // so its DID is kept too, and all three pages' DIDs are counted.
         let source = CyclingSource { pages: Mutex::new(cycling_pages()) };
         let mut circle = Circle::new();
 
         let stats = step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
 
         assert_eq!(stats.calls, 3);
-        assert_eq!(circle.follows.len(), 2);
+        assert_eq!(circle.follows.len(), 3);
     }
 
     #[tokio::test]
     async fn step_degree2_stops_on_a_cursor_cycle_across_more_than_one_hop() {
+        // Review round 4, defect Q: as with `step_follows` above, the page
+        // fetched with the repeated cursor is still counted before the loop
+        // stops, so all three pages' DIDs are collected.
         let source = CyclingSource { pages: Mutex::new(cycling_pages()) };
         let mut shared: HashMap<String, Vec<DidHash>> = HashMap::new();
 
         let stats = step_degree2(&source, &["acct-a".to_string()], 100, &mut shared).await.unwrap();
 
         assert_eq!(stats.calls, 3);
-        assert_eq!(shared.get("acct-a").unwrap().len(), 2);
+        assert_eq!(shared.get("acct-a").unwrap().len(), 3);
     }
 
     #[tokio::test]
