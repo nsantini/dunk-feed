@@ -248,10 +248,13 @@ fn positive_u32_or_default(
 /// very credentials this check exists to protect). `reqwest::Url` lowercases
 /// the scheme and the stored value drops a trailing `/`, so `HTTPS://` and a
 /// trailing-slash input both normalise to the same base (review round 2,
-/// defect C). `ConfigError::Invalid.value` is `[redacted]` for this
-/// variable, never the raw input, so a rejected userinfo case never echoes
-/// its password into the error's `Display` or `Debug` (review round 2,
-/// finding 13).
+/// defect C). The value is an https origin only: a path other than a bare
+/// `/` is rejected too (review round 3, finding 1, and the engineer's
+/// Step 7.5 answer — `HttpPdsTransport` appends `/xrpc/<nsid>` itself, so a
+/// path here, like `/xrpc`, would double up). `ConfigError::Invalid.value`
+/// is `[redacted]` for this variable, never the raw input, so a rejected
+/// userinfo case never echoes its password into the error's `Display` or
+/// `Debug` (review round 2, finding 13).
 fn pds_url_or_default(
     lookup: &impl Fn(&str) -> Option<String>,
     name: &'static str,
@@ -281,6 +284,9 @@ fn pds_url_or_default(
         return Err(invalid());
     }
     if url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid());
+    }
+    if !matches!(url.path(), "" | "/") {
         return Err(invalid());
     }
     Ok(url.to_string().trim_end_matches('/').to_string())
@@ -1091,6 +1097,36 @@ mod tests {
         pairs.push(("UPSTAGE_PDS_URL", " https://bsky.social/ "));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.pds_url, "https://bsky.social");
+    }
+
+    #[test]
+    fn pds_url_rejects_a_path_other_than_a_bare_slash() {
+        // Review round 3, finding 1, and the engineer's Step 7.5 answer:
+        // UPSTAGE_PDS_URL is an https origin only. HttpPdsTransport appends
+        // `/xrpc/<nsid>` itself, so any other path is rejected here.
+        for bad in ["https://bsky.social/xrpc", "https://bsky.social/foo/"] {
+            let mut pairs = required_pair().to_vec();
+            pairs.push(("UPSTAGE_PDS_URL", bad));
+            let err = load(env(&pairs)).unwrap_err();
+            match err {
+                ConfigError::Invalid { name, value, .. } => {
+                    assert_eq!(name, "UPSTAGE_PDS_URL");
+                    assert_eq!(value, "[redacted]");
+                }
+                other => panic!("expected Invalid for {bad}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pds_url_accepts_bare_slash_and_a_port() {
+        for good in ["https://bsky.social", "https://bsky.social/", "https://pds.example.com:8443"]
+        {
+            let mut pairs = required_pair().to_vec();
+            pairs.push(("UPSTAGE_PDS_URL", good));
+            let config = load(env(&pairs)).unwrap();
+            assert_eq!(config.pds_url, good.trim_end_matches('/'));
+        }
     }
 
     #[test]
