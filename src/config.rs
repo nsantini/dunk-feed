@@ -69,6 +69,15 @@ pub struct Config {
     pub log: String,
     pub bsky_handle: Option<String>,
     pub bsky_app_password: Option<Secret>,
+    /// PDS every session, refresh and graph call goes through
+    /// (`UPSTAGE_PDS_URL`, network-feed story 02). Defaults to the host
+    /// `publish` used as its own fixed `BSKY_PDS_URL` before this story.
+    pub pds_url: String,
+    /// Calls each second `appview::pds::PdsClient`'s limiter lets through
+    /// (`UPSTAGE_GRAPH_RPS`, network-feed story 02, TECH-DESIGN-network-feed
+    /// §4). The PDS allows 10 each second for each IP; the default of 8
+    /// leaves headroom.
+    pub graph_rps: f64,
     /// `/healthz`'s lag threshold, in seconds (story 08, BC27): past this
     /// age on either `HealthState` atomic, `/healthz` returns 503.
     pub health_max_lag_s: u32,
@@ -226,6 +235,24 @@ fn positive_u32_or_default(
     Ok(value)
 }
 
+/// Reads an optional string variable, falling back to `default` when unset,
+/// like [`string_or_default`], but rejects an explicit empty (or
+/// whitespace-only) value instead of silently accepting it as a blank base
+/// URL. `UPSTAGE_PDS_URL` is the only caller today.
+fn non_empty_string_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: &str,
+) -> Result<String, ConfigError> {
+    match lookup(name) {
+        None => Ok(default.to_string()),
+        Some(value) if value.trim().is_empty() => {
+            Err(ConfigError::Invalid { name, value, reason: "empty value".to_string() })
+        }
+        Some(value) => Ok(value),
+    }
+}
+
 /// Parses `UPSTAGE_APPVIEW_RPS`, rejecting zero, negative and non-finite values
 /// (BC24) with the same reason string as the strictly-positive integers,
 /// rather than [`nonneg_float_or_default`]'s separate "not a finite number"
@@ -353,6 +380,8 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         log: log_filter_or_default(&lookup, "UPSTAGE_LOG", "info")?,
         bsky_handle: optional(&lookup, "BSKY_HANDLE"),
         bsky_app_password: optional(&lookup, "BSKY_APP_PASSWORD").map(Secret),
+        pds_url: non_empty_string_or_default(&lookup, "UPSTAGE_PDS_URL", "https://bsky.social")?,
+        graph_rps: positive_float_or_default(&lookup, "UPSTAGE_GRAPH_RPS", 8.0)?,
         health_max_lag_s: positive_u32_or_default(&lookup, "UPSTAGE_HEALTH_MAX_LAG_S", 300)?,
         guard_histogram_h: number_or_default(&lookup, "UPSTAGE_GUARD_HISTOGRAM_H", 24)?,
         author_ttl_h: positive_u32_or_default(&lookup, "UPSTAGE_AUTHOR_TTL_H", 24)?,
@@ -464,6 +493,8 @@ mod tests {
         assert_eq!(config.follower_floor, 2000);
         assert_eq!(config.prefilter_fraction, 0.5);
         assert_eq!(config.appview_rps, 1.0);
+        assert_eq!(config.pds_url, "https://bsky.social");
+        assert_eq!(config.graph_rps, 8.0);
         assert_eq!(config.log, "info");
         assert_eq!(config.health_max_lag_s, 300);
         assert_eq!(
@@ -897,6 +928,44 @@ mod tests {
         pairs.push(("UPSTAGE_AUTHOR_INACTIVE_TTL_H", "2"));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.author_inactive_ttl_h, 2);
+    }
+
+    #[test]
+    fn pds_defaults() {
+        // AC7 (story 02): UPSTAGE_PDS_URL and UPSTAGE_GRAPH_RPS load with
+        // their defaults, and UPSTAGE_GRAPH_RPS=0 is rejected the same way
+        // as UPSTAGE_APPVIEW_RPS (BC14).
+        let config = load(env(&required_pair())).unwrap();
+        assert_eq!(config.pds_url, "https://bsky.social");
+        assert_eq!(config.graph_rps, 8.0);
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_GRAPH_RPS", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "UPSTAGE_GRAPH_RPS");
+                assert_eq!(reason, "must be greater than zero");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pds_url_can_be_overridden_but_not_emptied() {
+        // BC15: an explicit empty value is invalid, unlike a bare unset.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PDS_URL", "https://pds.example.com"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.pds_url, "https://pds.example.com");
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PDS_URL", "  "));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_PDS_URL"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

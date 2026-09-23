@@ -7,6 +7,7 @@
 
 #![allow(dead_code)] // First caller is `upstage validate`, story 03.
 
+pub mod pds;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
