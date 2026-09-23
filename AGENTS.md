@@ -1,8 +1,8 @@
 # AGENTS.md
 
 Upstaged is one Rust binary. It consumes Jetstream, scores quote posts, and
-serves an AT Protocol feed generator over HTTP. Read `docs/TECH-DESIGN.md`
-before you change code. Read `docs/PRD.md` for the product rules.
+serves an AT Protocol feed generator over HTTP. Read `docs/01-TECH-DESIGN.md`
+before you change code. Read `docs/01-PRD.md` for the product rules.
 
 ## Prerequisites
 

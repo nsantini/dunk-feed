@@ -3,7 +3,7 @@
 - **Follows**: 08
 - **PRD phase**: 2
 - **Size**: small
-- **Design**: docs/TECH-DESIGN.md §11.2
+- **Design**: docs/01-TECH-DESIGN.md §11.2
 
 ## Outcome
 

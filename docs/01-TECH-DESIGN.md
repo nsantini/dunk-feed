@@ -2,7 +2,7 @@
 
 2026-09-18 · Nico Santini. Status: draft for implementation.
 
-Companion to [PRD.md](PRD.md). The PRD owns the product rules and the score.
+Companion to [01-PRD.md](01-PRD.md). The PRD owns the product rules and the score.
 This document owns how the code is shaped. Where the two disagree, section 12
 lists the deviation and the reason. Numbers come from
 [traffic-analysis.md](traffic-analysis.md).
@@ -119,7 +119,7 @@ src/
 tests/
   fixtures/                  real Jetstream frames, real getPosts bodies
 Dockerfile  compose.yaml  .env.example
-docs/  stories/  AGENTS.md
+docs/  AGENTS.md
 ```
 
 Dependencies, all common and maintained: `tokio`, `tokio-tungstenite` (rustls),
@@ -568,7 +568,7 @@ Gates are in `AGENTS.md`: `cargo fmt --check`, `cargo clippy -D warnings`,
 
 ## 15. Build order
 
-Each line is one story under `stories/`. Each story is sized for one
+Each line is one story under `docs/01-stories/`. Each story is sized for one
 `workflow-plan` → `workflow-slice` → `workflow-execute` run. The order is the
 PRD's phases with phase 0 first, as the PRD insists.
 

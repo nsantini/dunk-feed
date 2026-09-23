@@ -2,7 +2,7 @@
 
 This runbook is for an operator. It does not assume you have read the Rust
 source. It covers deploy, logs, backup, upgrade, tuning, and every failure
-mode in `docs/TECH-DESIGN.md` section 13.
+mode in `docs/01-TECH-DESIGN.md` section 13.
 
 ## Prerequisites
 

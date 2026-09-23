@@ -2,7 +2,7 @@
 
 Each file is one implementation story for the `workflow-plan` →
 `workflow-slice` → `workflow-execute` plugin. The order matches
-[docs/TECH-DESIGN.md](../docs/TECH-DESIGN.md) §15, the PRD's phases with
+[docs/01-TECH-DESIGN.md](../01-TECH-DESIGN.md) §15, the PRD's phases with
 phase 0 first.
 
 ## Order and dependencies
@@ -38,10 +38,10 @@ Feed each story file to the workflow plugin, one at a time, as a free-text
 task description:
 
 ```
-/workflow "Implement stories/01-scaffold.md"
+/workflow "Implement docs/01-stories/01-scaffold.md"
 ```
 
-Repeat for `stories/02-score-and-appview.md`, and so on in order.
+Repeat for `docs/01-stories/02-score-and-appview.md`, and so on in order.
 
 A few things to know before you run the first one:
 

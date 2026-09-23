@@ -1,5 +1,5 @@
 //! Configuration loaded from environment variables. Every variable is
-//! documented in `docs/TECH-DESIGN.md` section 4 and mirrored in
+//! documented in `docs/01-TECH-DESIGN.md` section 4 and mirrored in
 //! `.env.example`. `load` fails fast on a missing required variable or a
 //! malformed value; it never panics.
 

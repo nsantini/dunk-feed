@@ -3,7 +3,7 @@
 - **Follows**: 02, 05, 06
 - **PRD phase**: 1
 - **Size**: standard
-- **Design**: docs/TECH-DESIGN.md §7.1, §7.2, §7.3, §8, §12 (D9)
+- **Design**: docs/01-TECH-DESIGN.md §7.1, §7.2, §7.3, §8, §12 (D9)
 
 ## Outcome
 
