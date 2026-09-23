@@ -251,8 +251,12 @@ fn positive_u32_or_default(
 /// defect C). The value is an https origin only: a path other than a bare
 /// `/` is rejected too (review round 3, finding 1, and the engineer's
 /// Step 7.5 answer — `HttpPdsTransport` appends `/xrpc/<nsid>` itself, so a
-/// path here, like `/xrpc`, would double up). `ConfigError::Invalid.value`
-/// is `[redacted]` for this variable, never the raw input, so a rejected
+/// path here, like `/xrpc`, would double up), and that rejection carries its
+/// own reason naming the path rule rather than the generic scheme/host/
+/// userinfo/query/fragment reason above (review round 4, findings 1 to 3, and
+/// the engineer's option (a) answer — the generic reason did not tell a
+/// caller which rule a path violated). `ConfigError::Invalid.value` is
+/// `[redacted]` for this variable, never the raw input, so a rejected
 /// userinfo case never echoes its password into the error's `Display` or
 /// `Debug` (review round 2, finding 13).
 fn pds_url_or_default(
@@ -264,11 +268,13 @@ fn pds_url_or_default(
         None => return Ok(default.to_string()),
         Some(value) => value,
     };
-    let invalid = || ConfigError::Invalid {
+    let invalid_with = |reason: &str| ConfigError::Invalid {
         name,
         value: "[redacted]".to_string(),
-        reason: "must be an https URL with a host and no userinfo, query or fragment".to_string(),
+        reason: reason.to_string(),
     };
+    let invalid =
+        || invalid_with("must be an https URL with a host and no userinfo, query or fragment");
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(invalid());
@@ -287,7 +293,7 @@ fn pds_url_or_default(
         return Err(invalid());
     }
     if !matches!(url.path(), "" | "/") {
-        return Err(invalid());
+        return Err(invalid_with("must be an https origin with no path"));
     }
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
@@ -1103,15 +1109,22 @@ mod tests {
     fn pds_url_rejects_a_path_other_than_a_bare_slash() {
         // Review round 3, finding 1, and the engineer's Step 7.5 answer:
         // UPSTAGE_PDS_URL is an https origin only. HttpPdsTransport appends
-        // `/xrpc/<nsid>` itself, so any other path is rejected here.
+        // `/xrpc/<nsid>` itself, so any other path is rejected here. Review
+        // round 4, findings 1 to 3: this rejection carries its own reason
+        // naming the path rule, distinct from the generic scheme/host/
+        // userinfo/query/fragment reason (correction slice 7.0).
         for bad in ["https://bsky.social/xrpc", "https://bsky.social/foo/"] {
             let mut pairs = required_pair().to_vec();
             pairs.push(("UPSTAGE_PDS_URL", bad));
             let err = load(env(&pairs)).unwrap_err();
             match err {
-                ConfigError::Invalid { name, value, .. } => {
+                ConfigError::Invalid { name, value, reason } => {
                     assert_eq!(name, "UPSTAGE_PDS_URL");
                     assert_eq!(value, "[redacted]");
+                    assert!(
+                        reason.contains("path"),
+                        "expected reason to name the path rule, got {reason:?}"
+                    );
                 }
                 other => panic!("expected Invalid for {bad}, got {other:?}"),
             }
