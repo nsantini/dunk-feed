@@ -238,7 +238,11 @@ fn positive_u32_or_default(
 /// Reads an optional string variable, falling back to `default` when unset,
 /// like [`string_or_default`], but rejects an explicit empty (or
 /// whitespace-only) value instead of silently accepting it as a blank base
-/// URL. `UPSTAGE_PDS_URL` is the only caller today.
+/// URL, and rejects a value that does not start with `https://` (review
+/// round 1, finding 4): a PDS session, and every App View call proxied
+/// through it, carries the bearer token and the app password, so a scheme
+/// downgrade to plain `http://` would send both in the clear.
+/// `UPSTAGE_PDS_URL` is the only caller today.
 fn non_empty_string_or_default(
     lookup: &impl Fn(&str) -> Option<String>,
     name: &'static str,
@@ -249,6 +253,11 @@ fn non_empty_string_or_default(
         Some(value) if value.trim().is_empty() => {
             Err(ConfigError::Invalid { name, value, reason: "empty value".to_string() })
         }
+        Some(value) if !value.starts_with("https://") => Err(ConfigError::Invalid {
+            name,
+            value,
+            reason: "must start with https://".to_string(),
+        }),
         Some(value) => Ok(value),
     }
 }
@@ -946,6 +955,22 @@ mod tests {
             ConfigError::Invalid { name, reason, .. } => {
                 assert_eq!(name, "UPSTAGE_GRAPH_RPS");
                 assert_eq!(reason, "must be greater than zero");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pds_url_rejects_non_https() {
+        // Review round 1, finding 4, BC15: UPSTAGE_PDS_URL must start with
+        // https://, and the default still loads unaffected.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PDS_URL", "http://bsky.social"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "UPSTAGE_PDS_URL");
+                assert_eq!(reason, "must start with https://");
             }
             other => panic!("expected Invalid, got {other:?}"),
         }

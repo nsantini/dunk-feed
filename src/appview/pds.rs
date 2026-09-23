@@ -47,6 +47,14 @@ const REFRESH_MARGIN_SECS: i64 = 5 * 60;
 /// The `atproto-proxy` header value every `app.bsky.*` call carries (BC5).
 const APPVIEW_PROXY: &str = "did:web:api.bsky.app#bsky_appview";
 
+/// The longest limiter period [`PdsClient::new`] accepts, one day. A
+/// `graph_rps` whose reciprocal exceeds this is rejected as
+/// [`PdsError::InvalidRate`] (review round 1, finding 2): a rate that ticks
+/// less than once a day is not a working rate limit, and reciprocals near
+/// zero risk overflowing to a value `Duration::try_from_secs_f64` would
+/// otherwise have to be trusted to catch unaided.
+const MAX_LIMITER_PERIOD_SECS: f64 = 86_400.0;
+
 /// Every way a `PdsClient` call can fail. No variant carries `accessJwt`,
 /// `refreshJwt` or the app password (BC12): a session failure is
 /// `PdsError::Session` with no detail from the failed attempt, and
@@ -155,8 +163,12 @@ pub struct HttpPdsTransport {
 }
 
 impl HttpPdsTransport {
+    /// Trims any trailing `/` from `base_url` once, here, so
+    /// [`PdsTransport::request`]'s `format!("{}/xrpc/{}", ...)` never
+    /// builds a URL with a doubled slash when `UPSTAGE_PDS_URL` is
+    /// configured with a trailing slash (review round 1, finding 3).
     pub fn new(base_url: String) -> Self {
-        Self { base_url, http: http_client() }
+        Self { base_url: base_url.trim_end_matches('/').to_string(), http: http_client() }
     }
 }
 
@@ -363,11 +375,23 @@ impl<T: PdsTransport> PdsClient<T> {
     /// [`PdsError::InvalidRate`] (BC14 is enforced earlier, at config load;
     /// this is defence in depth for a caller that built the rate some
     /// other way, the same reason `AppViewClient::new` re-checks its own).
+    /// The period is built with [`Duration::try_from_secs_f64`] rather than
+    /// the panicking `Duration::from_secs_f64` (review round 1, finding 2),
+    /// so a pathological reciprocal can never panic here. A rate whose
+    /// period would exceed [`MAX_LIMITER_PERIOD_SECS`] — such as `1e-15`,
+    /// whose reciprocal is a period of roughly 31.7 million years — is also
+    /// [`PdsError::InvalidRate`]: a "rate limiter" whose next tick is that
+    /// far away limits nothing, so it is rejected up front rather than
+    /// built and silently never ticking.
     pub fn new(transport: T, credentials: Credentials, graph_rps: f64) -> Result<Self, PdsError> {
         if !graph_rps.is_finite() || graph_rps <= 0.0 {
             return Err(PdsError::InvalidRate);
         }
-        let period = Duration::from_secs_f64(1.0 / graph_rps);
+        let period_secs = 1.0 / graph_rps;
+        if !period_secs.is_finite() || period_secs > MAX_LIMITER_PERIOD_SECS {
+            return Err(PdsError::InvalidRate);
+        }
+        let period = Duration::try_from_secs_f64(period_secs).map_err(|_| PdsError::InvalidRate)?;
         let mut interval = time::interval(period);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Ok(Self {
@@ -670,9 +694,12 @@ impl<T: PdsTransport> PdsClient<T> {
     /// `others`. Each `other` is sent as its own `others` query parameter,
     /// the same repeated-parameter shape [`crate::appview::AppViewClient`]
     /// uses for `uris` and `actors`. Returns the DIDs whose relationship
-    /// entry carries a `followedBy` field, in response order;
-    /// `notFoundActor` entries and entries without `followedBy` are
-    /// skipped, never an error.
+    /// entry carries a non-null string `followedBy` field, in response
+    /// order (review round 1, finding 1: a `followedBy` key present with a
+    /// JSON `null` value, the shape the AT Protocol sends for a
+    /// relationship it does not follow, no longer counts as followed).
+    /// `notFoundActor` entries and entries without a string `followedBy`
+    /// are skipped, never an error.
     pub async fn get_relationships(
         &self,
         actor: &str,
@@ -694,7 +721,7 @@ impl<T: PdsTransport> PdsClient<T> {
             .into_iter()
             .filter_map(|relationship| {
                 let did = relationship.get("did")?.as_str()?.to_string();
-                relationship.get("followedBy")?;
+                relationship.get("followedBy")?.as_str()?;
                 Some(did)
             })
             .collect())
@@ -812,6 +839,20 @@ mod tests {
     }
 
     #[test]
+    fn http_transport_trims_trailing_slash() {
+        // Review round 1, finding 3: a base URL with a trailing slash
+        // builds `<base>/xrpc/<nsid>` with exactly one slash.
+        let transport = HttpPdsTransport::new("https://bsky.social/".to_string());
+        assert_eq!(transport.base_url, "https://bsky.social");
+
+        let transport = HttpPdsTransport::new("https://bsky.social///".to_string());
+        assert_eq!(transport.base_url, "https://bsky.social");
+
+        let transport = HttpPdsTransport::new("https://bsky.social".to_string());
+        assert_eq!(transport.base_url, "https://bsky.social");
+    }
+
+    #[test]
     fn wants_proxy_by_nsid_prefix() {
         // BC5, BC6.
         assert!(wants_proxy("app.bsky.graph.getFollows"));
@@ -835,6 +876,15 @@ mod tests {
     #[test]
     fn nonfinite_rate_is_rejected() {
         let err = PdsClient::new(FakeTransport::new(), creds(), f64::NAN).unwrap_err();
+        assert!(matches!(err, PdsError::InvalidRate));
+    }
+
+    #[test]
+    fn vanishingly_small_rate_is_rejected_without_panic() {
+        // Review round 1, finding 2: a rate whose reciprocal period is
+        // wildly impractical (here, roughly 31.7 million years) is
+        // `PdsError::InvalidRate`, not a panic in `Duration` construction.
+        let err = PdsClient::new(FakeTransport::new(), creds(), 1e-15).unwrap_err();
         assert!(matches!(err, PdsError::InvalidRate));
     }
 
@@ -1175,7 +1225,9 @@ mod tests {
     async fn get_relationships() {
         // AC5, BC10, BC10a, BC11: more than 30 DIDs is refused before any
         // network call, an empty list makes no call either, and the
-        // result keeps only the DIDs whose relationship has `followedBy`.
+        // result keeps only the DIDs whose relationship has a non-null
+        // string `followedBy` (review round 1, finding 1: a `null` value
+        // is not followed).
         let transport = FakeTransport::new();
         transport.push_ok(
             200,
@@ -1187,6 +1239,7 @@ mod tests {
                 "relationships": [
                     {"did": "did:plc:a", "followedBy": "at://did:plc:a/app.bsky.graph.follow/1"},
                     {"did": "did:plc:b"},
+                    {"did": "did:plc:d", "followedBy": null},
                     {"$type": "app.bsky.graph.defs#notFoundActor", "actor": "did:plc:c"},
                 ],
             }),
@@ -1207,8 +1260,12 @@ mod tests {
         assert!(empty.is_empty());
         assert!(transport.calls().is_empty(), "empty others makes no network call");
 
-        let others =
-            vec!["did:plc:a".to_string(), "did:plc:b".to_string(), "did:plc:c".to_string()];
+        let others = vec![
+            "did:plc:a".to_string(),
+            "did:plc:b".to_string(),
+            "did:plc:c".to_string(),
+            "did:plc:d".to_string(),
+        ];
         let follows_me = client
             .get_relationships("did:plc:viewer", &others)
             .await
