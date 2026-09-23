@@ -225,13 +225,13 @@ fn is_expired_token(attempted: &Attempted) -> bool {
         && attempted.body.get("error").and_then(Value::as_str) == Some("ExpiredToken")
 }
 
-/// Turns a completed round trip into a decoded value, or a [`PdsError`]
-/// naming the nsid, the status and the number of attempts (a non-2xx), or
-/// the decode failure's own message (a 2xx whose body is not `R`).
-fn decode_attempted<R: DeserializeOwned>(
-    nsid: &'static str,
-    attempted: Attempted,
-) -> Result<R, PdsError> {
+/// Turns a completed round trip into a checked one: `Ok` only for a 2xx,
+/// else [`PdsError::Http`] naming the nsid, the status and the number of
+/// attempts. The shared status check behind both [`PdsClient::call_raw`]
+/// (slice 3.0's `upload_blob` and `put_record` read the body themselves)
+/// and [`decode_attempted`] (the graph methods, which decode straight into
+/// a type).
+fn check_status(nsid: &'static str, attempted: Attempted) -> Result<Attempted, PdsError> {
     if attempted.status >= 300 {
         return Err(PdsError::Http {
             method: nsid,
@@ -239,6 +239,17 @@ fn decode_attempted<R: DeserializeOwned>(
             attempts: attempted.attempts,
         });
     }
+    Ok(attempted)
+}
+
+/// Turns a completed round trip into a decoded value, or a [`PdsError`]
+/// naming the nsid, the status and the number of attempts (a non-2xx), or
+/// the decode failure's own message (a 2xx whose body is not `R`).
+fn decode_attempted<R: DeserializeOwned>(
+    nsid: &'static str,
+    attempted: Attempted,
+) -> Result<R, PdsError> {
+    let attempted = check_status(nsid, attempted)?;
     serde_json::from_value(attempted.body)
         .map_err(|err| PdsError::Decode { method: nsid, reason: err.to_string() })
 }
@@ -524,14 +535,17 @@ impl<T: PdsTransport> PdsClient<T> {
     /// [`REFRESH_MARGIN_SECS`], and retries an `ExpiredToken` response once
     /// with a fresh session (BC3). `nsid` decides the `atproto-proxy`
     /// header through [`wants_proxy`] (BC5, BC6). A second `ExpiredToken`
-    /// after the retry is [`PdsError::Session`] (BC3).
-    async fn call<R: DeserializeOwned>(
+    /// after the retry is [`PdsError::Session`] (BC3). Status-checked
+    /// (`Ok` only for a 2xx) but not decoded: [`Self::call`] decodes the
+    /// body into a type; [`Self::upload_blob`] and [`Self::put_record`]
+    /// (slice 3.0) read the raw body or ignore it.
+    async fn call_raw(
         &self,
         http_method: HttpMethod,
         nsid: &'static str,
         query: &[(&str, &str)],
         body: RequestBody,
-    ) -> Result<R, PdsError> {
+    ) -> Result<Attempted, PdsError> {
         let proxy = wants_proxy(nsid);
         self.ensure_fresh_session().await?;
         let bearer = {
@@ -547,7 +561,7 @@ impl<T: PdsTransport> PdsClient<T> {
             .send_with_retry(http_method, nsid, Some(&bearer), proxy, query, body.clone())
             .await?;
         if !is_expired_token(&attempted) {
-            return decode_attempted(nsid, attempted);
+            return check_status(nsid, attempted);
         }
 
         let mut guard = self.session.lock().await;
@@ -564,7 +578,62 @@ impl<T: PdsTransport> PdsClient<T> {
         if is_expired_token(&attempted) {
             return Err(PdsError::Session);
         }
-        decode_attempted(nsid, attempted)
+        check_status(nsid, attempted)
+    }
+
+    /// [`Self::call_raw`], decoded into `R` (BC2, BC3, BC7, BC8).
+    async fn call<R: DeserializeOwned>(
+        &self,
+        http_method: HttpMethod,
+        nsid: &'static str,
+        query: &[(&str, &str)],
+        body: RequestBody,
+    ) -> Result<R, PdsError> {
+        let attempted = self.call_raw(http_method, nsid, query, body).await?;
+        serde_json::from_value(attempted.body)
+            .map_err(|err| PdsError::Decode { method: nsid, reason: err.to_string() })
+    }
+
+    /// `com.atproto.server.createSession`'s DID, for `publish`'s DID
+    /// mismatch check (slice 3.0's `map_pds_error` maps a failure here to
+    /// `PublishError::Auth`). Ensures a fresh session, which performs the
+    /// first login for a client that has not called anything yet, and
+    /// returns its `did`.
+    pub async fn session_did(&self) -> Result<String, PdsError> {
+        self.ensure_fresh_session().await?;
+        let guard = self.session.lock().await;
+        Ok(guard.as_ref().expect("ensure_fresh_session always leaves a session").did.clone())
+    }
+
+    /// `com.atproto.repo.uploadBlob`, for `publish`'s optional avatar
+    /// upload (slice 3.0). Never proxied ([`wants_proxy`]: the nsid does
+    /// not start with `app.bsky.`). Returns the HTTP status and the decoded
+    /// JSON body rather than a typed blob, so the caller's own shape check
+    /// (`publish::validate_blob`) sees the same two values the old direct
+    /// `reqwest` call gave it.
+    pub async fn upload_blob(
+        &self,
+        bytes: Vec<u8>,
+        content_type: &'static str,
+    ) -> Result<(u16, Value), PdsError> {
+        let attempted = self
+            .call_raw(
+                HttpMethod::Post,
+                "com.atproto.repo.uploadBlob",
+                &[],
+                RequestBody::Bytes { bytes, content_type },
+            )
+            .await?;
+        Ok((attempted.status, attempted.body))
+    }
+
+    /// `com.atproto.repo.putRecord`, for `publish`'s record write (slice
+    /// 3.0). The response body is discarded; only success or failure
+    /// matters to a caller writing a record it never reads back.
+    pub async fn put_record(&self, body: Value) -> Result<(), PdsError> {
+        self.call_raw(HttpMethod::Post, "com.atproto.repo.putRecord", &[], RequestBody::Json(body))
+            .await?;
+        Ok(())
     }
 
     /// `app.bsky.graph.getFollows`, one page (BC9). `sort=latest` is

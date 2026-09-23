@@ -3,31 +3,26 @@
 //! `BSKY_APP_PASSWORD` and an optional avatar file before any network call
 //! (BC1, BC2, BC3, BC4, BC5), `record_body` builds the record as a pure
 //! function of `Config` and an optional uploaded blob (BC12), and
-//! `publish_with` runs the three calls against [`BSKY_PDS_URL`]:
-//! `createSession`, an optional `uploadBlob`, then an unconditional
-//! `putRecord` (BC6 to BC10, BC13, BC14). The PDS is reached through
-//! [`PdsClient`], a trait with one real `reqwest` implementation, the same
-//! shape `src/scorer/mod.rs`'s `PostSource` uses over `AppViewClient`,
-//! rather than an injectable base URL plus a test HTTP server: the crate has
-//! no `axum`-based test-server dependency for unit tests, and the trait lets
-//! a fake assert `put_record` was never called. Never run from `upstage run`
-//! (TECH-DESIGN section 11.2); a separate manual step.
+//! `publish_with` runs the three calls through [`PdsClient`]:
+//! `createSession` (read back as [`PdsClient::session_did`]), an optional
+//! `uploadBlob`, then an unconditional `putRecord` (BC6 to BC10, BC13,
+//! BC14). `PdsClient` is `appview::pds`'s shared session client
+//! (`UPSTAGE_PDS_URL`, this story's Approach): the session, refresh and
+//! retry code that used to live in this module's own trait and
+//! `HttpPdsClient` moved there, so this binary has exactly one PDS login
+//! path. `map_pds_error` turns a `PdsError` from one of those three calls
+//! into the matching [`PublishError`] variant this module already exposed
+//! (BC13a), so a caller of `run` sees no shape change. Never run from
+//! `upstage run` (TECH-DESIGN section 11.2); a separate manual step.
 
-use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::appview::http_client;
-use crate::config::{Config, Secret};
-
-/// The PDS every session, upload and record write goes against. A constant,
-/// not `cfg.appview_url`, matching TECH-DESIGN section 11.2: publishing is a
-/// write against the operator's own PDS, not a read against the App View
-/// (BC16).
-pub const BSKY_PDS_URL: &str = "https://bsky.social";
+use crate::appview::pds::{Credentials, PdsClient, PdsError, PdsTransport};
+use crate::config::Config;
 
 /// The feed's own `displayName`, fixed per the engineer's answer (BC15): no
 /// tone, sentiment or keyword wording (TECH-DESIGN D10).
@@ -66,18 +61,27 @@ pub enum PublishError {
     #[error("putRecord failed, status {status}: {body}")]
     PutRecord { status: u16, body: String },
     #[error("transport error: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(String),
 }
 
-/// The two credentials `preflight` reads: nothing downstream of `preflight`
-/// reads `BSKY_HANDLE` or `BSKY_APP_PASSWORD` from `Config` again. The
-/// password stays inside a [`Secret`], so the derived `Debug` on this struct
-/// prints `[redacted]` for it; it is exposed at one place only, the
-/// `createSession` request body (BC11).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Credentials {
-    pub handle: String,
-    pub app_password: Secret,
+/// Maps a [`PdsError`] from one of `publish_with`'s three `PdsClient` calls
+/// to the matching [`PublishError`] variant (BC13a). A transport
+/// failure — [`PdsError::Http`] with no status, meaning every retry hit a
+/// connection error or a timeout rather than an HTTP response — is always
+/// `PublishError::Transport`, regardless of which call raised it. Every
+/// other failure becomes `on_http`'s variant, carrying the status (`0` for
+/// [`PdsError::Session`], which carries none of its own) and the error's
+/// own message: enough for the user to see one line naming the call and
+/// the status, without a `PdsError` variant for every `PublishError` one.
+fn map_pds_error(err: PdsError, on_http: impl FnOnce(u16, String) -> PublishError) -> PublishError {
+    if let PdsError::Http { status: None, .. } = &err {
+        return PublishError::Transport(err.to_string());
+    }
+    let status = match &err {
+        PdsError::Http { status: Some(status), .. } => *status,
+        _ => 0,
+    };
+    on_http(status, err.to_string())
 }
 
 /// An avatar file read off disk during preflight, with the `Content-Type`
@@ -173,17 +177,6 @@ pub fn record_body(
     })
 }
 
-/// One `createSession` response, the fields `publish_with` needs. The
-/// `accessJwt` stays inside a [`Secret`], so the derived `Debug` prints
-/// `[redacted]` for it and no log or panic message can carry a live token
-/// (BC11). It is exposed at two places only: the `Authorization` header on
-/// `uploadBlob` and the one on `putRecord`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Session {
-    pub did: String,
-    pub access_jwt: Secret,
-}
-
 /// One `uploadBlob` response, before [`validate_blob`] has looked at it: the
 /// HTTP status the PDS answered with, and the decoded JSON body. The trait
 /// hands both back rather than the blob itself, so the shape check is a pure
@@ -224,154 +217,26 @@ pub fn validate_blob(response: &UploadResponse) -> Result<Value, PublishError> {
     Ok(blob.clone())
 }
 
-/// The PDS surface `upstage publish` needs: session creation, blob upload and
-/// record write. A trait rather than an injectable base URL plus a test HTTP
-/// server, per `## Approach` in `spec.md`: the crate has no HTTP test server
-/// dependency, and `HttpPdsClient` is the one real implementation;
-/// `publish_with`'s tests use an in-memory fake that can assert `put_record`
-/// was never called.
-pub trait PdsClient {
-    fn create_session(
-        &self,
-        handle: &str,
-        app_password: &Secret,
-    ) -> impl Future<Output = Result<Session, PublishError>> + Send;
-
-    /// Returns the status and the decoded body, not the blob. The shape
-    /// check is [`validate_blob`], which `publish_with` runs, so a fake can
-    /// return a 2xx body with no `blob` and the test still exercises the
-    /// real check (BC17).
-    fn upload_blob(
-        &self,
-        access_jwt: &Secret,
-        avatar: &Avatar,
-    ) -> impl Future<Output = Result<UploadResponse, PublishError>> + Send;
-
-    fn put_record(
-        &self,
-        access_jwt: &Secret,
-        body: &Value,
-    ) -> impl Future<Output = Result<(), PublishError>> + Send;
-}
-
-/// The real [`PdsClient`], one `reqwest::Client` against [`BSKY_PDS_URL`].
-/// Built exactly as `AppViewClient::with_base_url` builds its own: rustls by
-/// Cargo feature, a 10 s timeout, so timeout behaviour matches the rest of
-/// the binary. No retry (BC10): a connection error or the timeout becomes
-/// `PublishError::Transport` straight from `?`.
-#[derive(Debug)]
-pub struct HttpPdsClient {
-    base_url: String,
-    http: reqwest::Client,
-}
-
-impl HttpPdsClient {
-    pub fn new() -> Self {
-        Self::with_base_url(BSKY_PDS_URL.to_string())
-    }
-
-    /// `new`'s body, taking the base URL directly so tests can point the
-    /// client at an unreachable address without touching [`BSKY_PDS_URL`].
-    fn with_base_url(base_url: String) -> Self {
-        Self { base_url, http: http_client() }
-    }
-}
-
-impl Default for HttpPdsClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PdsClient for HttpPdsClient {
-    async fn create_session(
-        &self,
-        handle: &str,
-        app_password: &Secret,
-    ) -> Result<Session, PublishError> {
-        let url = format!("{}/xrpc/com.atproto.server.createSession", self.base_url);
-        let response = self
-            .http
-            .post(&url)
-            .json(&json!({ "identifier": handle, "password": app_password.expose() }))
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(PublishError::Auth { status: status.as_u16(), body });
-        }
-        let body: Value = response.json().await?;
-        let did = body.get("did").and_then(Value::as_str).map(str::to_string).ok_or_else(|| {
-            PublishError::Auth {
-                status: status.as_u16(),
-                body: "createSession response carried no did".to_string(),
-            }
-        })?;
-        let access_jwt = body
-            .get("accessJwt")
-            .and_then(Value::as_str)
-            .map(|value| Secret::new(value.to_string()))
-            .ok_or_else(|| PublishError::Auth {
-                status: status.as_u16(),
-                body: "createSession response carried no accessJwt".to_string(),
-            })?;
-        Ok(Session { did, access_jwt })
-    }
-
-    async fn upload_blob(
-        &self,
-        access_jwt: &Secret,
-        avatar: &Avatar,
-    ) -> Result<UploadResponse, PublishError> {
-        let url = format!("{}/xrpc/com.atproto.repo.uploadBlob", self.base_url);
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(access_jwt.expose())
-            .header(reqwest::header::CONTENT_TYPE, avatar.content_type)
-            .body(avatar.bytes.clone())
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(PublishError::Upload { status: status.as_u16(), body });
-        }
-        let body: Value = response.json().await?;
-        Ok(UploadResponse { status: status.as_u16(), body })
-    }
-
-    async fn put_record(&self, access_jwt: &Secret, body: &Value) -> Result<(), PublishError> {
-        let url = format!("{}/xrpc/com.atproto.repo.putRecord", self.base_url);
-        let response =
-            self.http.post(&url).bearer_auth(access_jwt.expose()).json(body).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(PublishError::PutRecord { status: status.as_u16(), body });
-        }
-        Ok(())
-    }
-}
-
-/// The publish sequence, generic over [`PdsClient`] so tests can pass a fake
-/// (BC7, BC13, BC14): `createSession`, then a DID check against
-/// `cfg.publisher_did` (BC7, this catches publishing from the wrong
-/// account), then an optional `uploadBlob` when `avatar` is `Some` (BC3),
-/// then an unconditional `putRecord` (BC14: nothing reads the record first,
-/// so a second run overwrites the same one). Returns `cfg.feed_uri()` on
-/// success (BC13).
-pub async fn publish_with(
-    client: &impl PdsClient,
+/// The publish sequence, generic over [`PdsTransport`] so tests can pass a
+/// fake (BC7, BC13, BC14): `createSession` (`PdsClient::session_did`), then
+/// a DID check against `cfg.publisher_did` (BC7, this catches publishing
+/// from the wrong account), then an optional `uploadBlob` when `avatar` is
+/// `Some` (BC3), then an unconditional `putRecord` (BC14: nothing reads the
+/// record first, so a second run overwrites the same one). `client` already
+/// carries the credentials `preflight` read, so this takes no separate
+/// `Credentials` argument. Returns `cfg.feed_uri()` on success (BC13).
+pub async fn publish_with<T: PdsTransport>(
+    client: &PdsClient<T>,
     cfg: &Config,
-    credentials: &Credentials,
     avatar: Option<&Avatar>,
 ) -> Result<String, PublishError> {
-    let session = client.create_session(&credentials.handle, &credentials.app_password).await?;
-    if session.did != cfg.publisher_did {
+    let session_did = client
+        .session_did()
+        .await
+        .map_err(|err| map_pds_error(err, |status, body| PublishError::Auth { status, body }))?;
+    if session_did != cfg.publisher_did {
         return Err(PublishError::DidMismatch {
-            session_did: session.did,
+            session_did,
             configured_did: cfg.publisher_did.clone(),
         });
     }
@@ -379,25 +244,34 @@ pub async fn publish_with(
     let blob = match avatar {
         None => None,
         Some(avatar) => {
-            let response = client.upload_blob(&session.access_jwt, avatar).await?;
-            Some(validate_blob(&response)?)
+            let (status, body) =
+                client.upload_blob(avatar.bytes.clone(), avatar.content_type).await.map_err(
+                    |err| map_pds_error(err, |status, body| PublishError::Upload { status, body }),
+                )?;
+            Some(validate_blob(&UploadResponse { status, body })?)
         }
     };
 
-    let body = record_body(cfg, &session.did, blob, Utc::now());
-    client.put_record(&session.access_jwt, &body).await?;
+    let body = record_body(cfg, &session_did, blob, Utc::now());
+    client.put_record(body).await.map_err(|err| {
+        map_pds_error(err, |status, body| PublishError::PutRecord { status, body })
+    })?;
 
     Ok(cfg.feed_uri())
 }
 
 /// `upstage publish`'s entry point. `preflight` runs first, so a missing
-/// credential or a missing/unsupported avatar file stops the run before
-/// [`HttpPdsClient::new`] is even built (BC1, BC2) and before any network is
-/// reachable.
+/// credential or a missing/unsupported avatar file stops the run before a
+/// [`PdsClient`] is even built (BC1, BC2) and before any network is
+/// reachable. `PdsClient::from_config` only fails on a non-positive or
+/// non-finite `graph_rps`, which config load already refuses (BC14); the
+/// `expect` documents that this can only happen if `Config` itself is built
+/// some other way.
 pub async fn run(cfg: &Config, avatar_path: Option<&Path>) -> Result<String, PublishError> {
     let (credentials, avatar) = preflight(cfg, avatar_path)?;
-    let client = HttpPdsClient::new();
-    publish_with(&client, cfg, &credentials, avatar.as_ref()).await
+    let client = PdsClient::from_config(cfg, credentials)
+        .expect("config load already validates UPSTAGE_GRAPH_RPS is positive and finite");
+    publish_with(&client, cfg, avatar.as_ref()).await
 }
 
 #[cfg(test)]
@@ -405,7 +279,13 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+
+    use crate::appview::pds::{HttpMethod, RawResponse, RequestBody, TransportError};
+    use crate::config::Secret;
 
     fn required_pairs() -> Vec<(&'static str, &'static str)> {
         vec![("UPSTAGE_HOSTNAME", "feed.example.com"), ("UPSTAGE_PUBLISHER_DID", "did:plc:abc")]
@@ -443,10 +323,12 @@ mod tests {
     async fn missing_credentials_fails_fast() {
         // AC1, BC1: no BSKY_HANDLE or BSKY_APP_PASSWORD set at all. This
         // goes through `run`, not `preflight`, so it proves the ordering
-        // inside `run` too: the check returns before `HttpPdsClient::new`
+        // inside `run` too: the check returns before `PdsClient::from_config`
         // is built and before any network is reachable. A `run` that built
-        // its client first would reach `BSKY_PDS_URL` here and fail with a
-        // different variant, or hang for the 10 s timeout.
+        // its client first would still succeed at that step (`PdsClient`
+        // does not log in until its first call), then hang for the 10 s
+        // timeout on the first real network call this test never wants to
+        // make.
         let cfg = config_with(&[]);
         let err = run(&cfg, None).await.unwrap_err();
         match err {
@@ -577,91 +459,138 @@ mod tests {
         assert_eq!(body["record"]["avatar"], blob);
     }
 
-    // --- publish_with, via a fake PdsClient ---------------------------
+    // --- publish_with, via a fake PdsTransport ------------------------
 
-    /// An in-memory fake [`PdsClient`]. Every call is counted, so a test can
-    /// assert a later call in the sequence never ran (BC6, BC7, BC8).
+    /// A `com.atproto.server.createSession` 2xx body carrying a
+    /// real-shaped, unsigned access token, the same shape
+    /// `appview::pds::tests` builds: `PdsClient::ensure_fresh_session`
+    /// decodes `exp` out of it, so a token without one reads as already
+    /// expired.
+    fn session_body(did: &str) -> Value {
+        let header = URL_SAFE_NO_PAD.encode(b"{}");
+        let exp = Utc::now().timestamp() + 3600;
+        let payload = URL_SAFE_NO_PAD.encode(format!("{{\"exp\":{exp}}}"));
+        json!({
+            "did": did,
+            "accessJwt": format!("{header}.{payload}.sig"),
+            "refreshJwt": "refresh-jwt",
+        })
+    }
+
+    /// An in-memory fake [`PdsTransport`]: one canned status and body per
+    /// nsid, and a call counter for each (BC6, BC7, BC8), so a test can
+    /// assert a later call in the sequence never ran. Unlike
+    /// `appview::pds::tests::FakeTransport`'s response queue, each nsid
+    /// always answers the same fixture: `publish_with`'s three calls are
+    /// each made at most once per `publish_with`, so no test here needs a
+    /// sequence. `Clone`-shareable over `Arc`, the same pattern
+    /// `appview::pds::tests::FakeTransport` uses, so a test keeps a handle
+    /// to inspect after the original is moved into a [`PdsClient`].
+    #[derive(Clone)]
     struct FakePds {
-        session: Result<Session, PublishError>,
-        upload: Result<UploadResponse, PublishError>,
-        put_result: Result<(), PublishError>,
-        create_session_calls: AtomicUsize,
-        upload_blob_calls: AtomicUsize,
-        put_record_calls: AtomicUsize,
-        last_put_body: Mutex<Option<Value>>,
+        session: Arc<Mutex<(u16, Value)>>,
+        upload: Arc<Mutex<(u16, Value)>>,
+        put: Arc<Mutex<(u16, Value)>>,
+        create_session_calls: Arc<AtomicUsize>,
+        upload_blob_calls: Arc<AtomicUsize>,
+        put_record_calls: Arc<AtomicUsize>,
+        last_put_body: Arc<Mutex<Option<Value>>>,
+        /// When `Some(nsid)`, every call to that nsid answers with
+        /// [`TransportError`] instead of a status, for
+        /// `transport_failure_maps_to_publish_transport` (BC13a).
+        transport_error_nsid: Arc<Mutex<Option<&'static str>>>,
     }
 
     impl FakePds {
         fn ok(session_did: &str) -> Self {
             Self {
-                session: Ok(Session {
-                    did: session_did.to_string(),
-                    access_jwt: Secret::new("access-jwt".to_string()),
-                }),
-                upload: Ok(UploadResponse { status: 200, body: json!({ "blob": good_blob() }) }),
-                put_result: Ok(()),
-                create_session_calls: AtomicUsize::new(0),
-                upload_blob_calls: AtomicUsize::new(0),
-                put_record_calls: AtomicUsize::new(0),
-                last_put_body: Mutex::new(None),
+                session: Arc::new(Mutex::new((200, session_body(session_did)))),
+                upload: Arc::new(Mutex::new((200, json!({ "blob": good_blob() })))),
+                put: Arc::new(Mutex::new((200, json!({})))),
+                create_session_calls: Arc::new(AtomicUsize::new(0)),
+                upload_blob_calls: Arc::new(AtomicUsize::new(0)),
+                put_record_calls: Arc::new(AtomicUsize::new(0)),
+                last_put_body: Arc::new(Mutex::new(None)),
+                transport_error_nsid: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn set_session(&self, status: u16, body: Value) {
+            *self.session.lock().expect("lock") = (status, body);
+        }
+
+        fn set_upload(&self, status: u16, body: Value) {
+            *self.upload.lock().expect("lock") = (status, body);
+        }
+
+        fn set_put(&self, status: u16, body: Value) {
+            *self.put.lock().expect("lock") = (status, body);
+        }
+
+        fn fail_transport(&self, nsid: &'static str) {
+            *self.transport_error_nsid.lock().expect("lock") = Some(nsid);
+        }
+
+        fn calls(&self, counter: &AtomicUsize) -> usize {
+            counter.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl PdsTransport for FakePds {
+        async fn request(
+            &self,
+            _http_method: HttpMethod,
+            nsid: &'static str,
+            _bearer: Option<&str>,
+            _proxy: bool,
+            _query: &[(&str, &str)],
+            body: RequestBody,
+        ) -> Result<RawResponse, TransportError> {
+            if *self.transport_error_nsid.lock().expect("lock") == Some(nsid) {
+                return Err(TransportError);
+            }
+            match nsid {
+                "com.atproto.server.createSession" => {
+                    self.create_session_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    let (status, body) = self.session.lock().expect("lock").clone();
+                    Ok(RawResponse { status, body })
+                }
+                "com.atproto.repo.uploadBlob" => {
+                    self.upload_blob_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    let (status, body) = self.upload.lock().expect("lock").clone();
+                    Ok(RawResponse { status, body })
+                }
+                "com.atproto.repo.putRecord" => {
+                    self.put_record_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    if let RequestBody::Json(value) = body {
+                        *self.last_put_body.lock().expect("lock") = Some(value);
+                    }
+                    let (status, body) = self.put.lock().expect("lock").clone();
+                    Ok(RawResponse { status, body })
+                }
+                other => panic!("unexpected nsid in publish test: {other}"),
             }
         }
     }
 
-    impl PdsClient for FakePds {
-        async fn create_session(
-            &self,
-            _handle: &str,
-            _app_password: &Secret,
-        ) -> Result<Session, PublishError> {
-            self.create_session_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            match &self.session {
-                Ok(session) => Ok(session.clone()),
-                Err(PublishError::Auth { status, body }) => {
-                    Err(PublishError::Auth { status: *status, body: body.clone() })
-                }
-                Err(other) => panic!("unexpected fixture error: {other:?}"),
-            }
-        }
-
-        async fn upload_blob(
-            &self,
-            _access_jwt: &Secret,
-            _avatar: &Avatar,
-        ) -> Result<UploadResponse, PublishError> {
-            self.upload_blob_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            match &self.upload {
-                Ok(value) => Ok(value.clone()),
-                Err(PublishError::Upload { status, body }) => {
-                    Err(PublishError::Upload { status: *status, body: body.clone() })
-                }
-                Err(other) => panic!("unexpected fixture error: {other:?}"),
-            }
-        }
-
-        async fn put_record(&self, _access_jwt: &Secret, body: &Value) -> Result<(), PublishError> {
-            self.put_record_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            *self.last_put_body.lock().expect("lock") = Some(body.clone());
-            match &self.put_result {
-                Ok(()) => Ok(()),
-                Err(PublishError::PutRecord { status, body }) => {
-                    Err(PublishError::PutRecord { status: *status, body: body.clone() })
-                }
-                Err(other) => panic!("unexpected fixture error: {other:?}"),
-            }
-        }
+    /// Builds a [`PdsClient`] over a clone of `fake`, at a rate fast enough
+    /// that the limiter never slows a test down; `fake` itself stays
+    /// usable for assertions after the client is built.
+    fn client_over(fake: &FakePds) -> PdsClient<FakePds> {
+        PdsClient::new(fake.clone(), creds(), 1000.0).expect("valid rate builds a client")
     }
 
     #[tokio::test]
     async fn prints_at_uri() {
         // AC4, BC13: publish_with returns the at-URI `dispatch` prints.
         let cfg = config_with(&[("UPSTAGE_FEED_RKEY", "upstaged")]);
-        let client = FakePds::ok("did:plc:abc");
-        let uri = publish_with(&client, &cfg, &creds(), None).await.expect("publish succeeds");
+        let fake = FakePds::ok("did:plc:abc");
+        let client = client_over(&fake);
+        let uri = publish_with(&client, &cfg, None).await.expect("publish succeeds");
         assert_eq!(uri, "at://did:plc:abc/app.bsky.feed.generator/upstaged");
-        assert_eq!(client.create_session_calls.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(client.upload_blob_calls.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(client.put_record_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(fake.calls(&fake.create_session_calls), 1);
+        assert_eq!(fake.calls(&fake.upload_blob_calls), 0);
+        assert_eq!(fake.calls(&fake.put_record_calls), 1);
     }
 
     #[tokio::test]
@@ -669,8 +598,9 @@ mod tests {
         // AC5, BC7: the session's own did differs from UPSTAGE_PUBLISHER_DID;
         // put_record never runs.
         let cfg = config_with(&[]);
-        let client = FakePds::ok("did:plc:someone-else");
-        let err = publish_with(&client, &cfg, &creds(), None).await.unwrap_err();
+        let fake = FakePds::ok("did:plc:someone-else");
+        let client = client_over(&fake);
+        let err = publish_with(&client, &cfg, None).await.unwrap_err();
         match err {
             PublishError::DidMismatch { session_did, configured_did } => {
                 assert_eq!(session_did, "did:plc:someone-else");
@@ -678,47 +608,67 @@ mod tests {
             }
             other => panic!("expected DidMismatch, got {other:?}"),
         }
-        assert_eq!(client.put_record_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(fake.calls(&fake.put_record_calls), 0);
     }
 
     #[tokio::test]
     async fn create_session_failure_stops_before_upload_or_put_record() {
-        // BC6.
+        // BC6. 401 is a non-retryable 4xx (appview::retry_decision), so this
+        // fails on the first attempt.
+        let fake = FakePds::ok("did:plc:abc");
+        fake.set_session(401, json!({ "error": "bad password" }));
         let cfg = config_with(&[]);
-        let mut client = FakePds::ok("did:plc:abc");
-        client.session = Err(PublishError::Auth { status: 401, body: "bad password".to_string() });
-        let err = publish_with(&client, &cfg, &creds(), None).await.unwrap_err();
+        let client = client_over(&fake);
+        let err = publish_with(&client, &cfg, None).await.unwrap_err();
         match err {
             PublishError::Auth { status, .. } => assert_eq!(status, 401),
             other => panic!("expected Auth, got {other:?}"),
         }
-        assert_eq!(client.upload_blob_calls.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(client.put_record_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(fake.calls(&fake.upload_blob_calls), 0);
+        assert_eq!(fake.calls(&fake.put_record_calls), 0);
+    }
+
+    #[tokio::test]
+    async fn transport_failure_maps_to_publish_transport() {
+        // BC13a: a transport-level failure (every retry hit a connection
+        // error, never an HTTP response) is `PublishError::Transport`, not
+        // `Auth`, even though it happened on the session call. Costs the
+        // same 1s+2s+4s retry schedule as the 5xx tests: `None` is always
+        // retryable (appview::retry_decision).
+        let fake = FakePds::ok("did:plc:abc");
+        fake.fail_transport("com.atproto.server.createSession");
+        let cfg = config_with(&[]);
+        let client = client_over(&fake);
+        let err = publish_with(&client, &cfg, None).await.unwrap_err();
+        assert!(matches!(err, PublishError::Transport(_)), "expected Transport, got {err:?}");
     }
 
     #[tokio::test]
     async fn upload_failure_stops_before_put_record() {
-        // BC8.
+        // BC8. 500 retries three times (1s, 2s, 4s) before failing, the
+        // same real-wall-time cost `appview::pds::tests` already pays for
+        // its own retry-exhaustion test.
+        let fake = FakePds::ok("did:plc:abc");
+        fake.set_upload(500, json!({ "error": "server error" }));
         let cfg = config_with(&[]);
-        let mut client = FakePds::ok("did:plc:abc");
-        client.upload = Err(PublishError::Upload { status: 500, body: "server error".to_string() });
+        let client = client_over(&fake);
         let avatar = Avatar { bytes: vec![1, 2, 3], content_type: "image/png" };
-        let err = publish_with(&client, &cfg, &creds(), Some(&avatar)).await.unwrap_err();
+        let err = publish_with(&client, &cfg, Some(&avatar)).await.unwrap_err();
         match err {
             PublishError::Upload { status, .. } => assert_eq!(status, 500),
             other => panic!("expected Upload, got {other:?}"),
         }
-        assert_eq!(client.put_record_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(fake.calls(&fake.put_record_calls), 0);
     }
 
     #[tokio::test]
     async fn put_record_failure_surfaces() {
-        // BC9.
+        // BC9. 400 is a non-retryable 4xx.
+        let fake = FakePds::ok("did:plc:abc");
+        fake.set_put(400, json!({ "error": "bad record" }));
         let cfg = config_with(&[]);
-        let mut client = FakePds::ok("did:plc:abc");
-        client.put_result =
-            Err(PublishError::PutRecord { status: 400, body: "bad record".to_string() });
-        let err = publish_with(&client, &cfg, &creds(), None).await.unwrap_err();
+        let client = client_over(&fake);
+        let err = publish_with(&client, &cfg, None).await.unwrap_err();
         match err {
             PublishError::PutRecord { status, .. } => assert_eq!(status, 400),
             other => panic!("expected PutRecord, got {other:?}"),
@@ -730,11 +680,12 @@ mod tests {
         // BC3, BC12: an avatar given means uploadBlob runs and the blob
         // lands in the putRecord body.
         let cfg = config_with(&[]);
-        let client = FakePds::ok("did:plc:abc");
+        let fake = FakePds::ok("did:plc:abc");
+        let client = client_over(&fake);
         let avatar = Avatar { bytes: vec![1, 2, 3], content_type: "image/png" };
-        publish_with(&client, &cfg, &creds(), Some(&avatar)).await.expect("publish succeeds");
-        assert_eq!(client.upload_blob_calls.load(AtomicOrdering::SeqCst), 1);
-        let body = client.last_put_body.lock().expect("lock").clone().expect("body recorded");
+        publish_with(&client, &cfg, Some(&avatar)).await.expect("publish succeeds");
+        assert_eq!(fake.calls(&fake.upload_blob_calls), 1);
+        let body = fake.last_put_body.lock().expect("lock").clone().expect("body recorded");
         assert_eq!(body["record"]["avatar"], good_blob());
     }
 
@@ -743,12 +694,13 @@ mod tests {
         // BC17: a 2xx uploadBlob body that carries no `blob` never reaches a
         // record. The fake answers 200 with an unrelated object, so only
         // `validate_blob` can stop this.
+        let fake = FakePds::ok("did:plc:abc");
+        fake.set_upload(200, json!({ "ok": true }));
         let cfg = config_with(&[]);
-        let mut client = FakePds::ok("did:plc:abc");
-        client.upload = Ok(UploadResponse { status: 200, body: json!({ "ok": true }) });
+        let client = client_over(&fake);
         let avatar = Avatar { bytes: vec![1, 2, 3], content_type: "image/png" };
 
-        let err = publish_with(&client, &cfg, &creds(), Some(&avatar)).await.unwrap_err();
+        let err = publish_with(&client, &cfg, Some(&avatar)).await.unwrap_err();
 
         match err {
             PublishError::Upload { status, body } => {
@@ -757,9 +709,9 @@ mod tests {
             }
             other => panic!("expected Upload, got {other:?}"),
         }
-        assert_eq!(client.upload_blob_calls.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(client.put_record_calls.load(AtomicOrdering::SeqCst), 0);
-        assert!(client.last_put_body.lock().expect("lock").is_none());
+        assert_eq!(fake.calls(&fake.upload_blob_calls), 1);
+        assert_eq!(fake.calls(&fake.put_record_calls), 0);
+        assert!(fake.last_put_body.lock().expect("lock").is_none());
     }
 
     #[test]
@@ -810,18 +762,20 @@ mod tests {
         // AC-adjacent, BC14: two calls to publish_with both call
         // put_record; nothing reads the record first.
         let cfg = config_with(&[("UPSTAGE_FEED_RKEY", "upstaged")]);
-        let client = FakePds::ok("did:plc:abc");
-        publish_with(&client, &cfg, &creds(), None).await.expect("first publish succeeds");
-        publish_with(&client, &cfg, &creds(), None).await.expect("second publish succeeds");
-        assert_eq!(client.put_record_calls.load(AtomicOrdering::SeqCst), 2);
+        let fake = FakePds::ok("did:plc:abc");
+        let client = client_over(&fake);
+        publish_with(&client, &cfg, None).await.expect("first publish succeeds");
+        publish_with(&client, &cfg, None).await.expect("second publish succeeds");
+        assert_eq!(fake.calls(&fake.put_record_calls), 2);
     }
 
     #[test]
     fn debug_on_publish_error_never_contains_a_password_or_token() {
-        // BC11, three ways. No PublishError variant has a field for either
-        // secret, and the two structs that do hold one keep it in `Secret`,
-        // whose Debug prints `[redacted]`. A future field added as a plain
-        // String fails this test.
+        // BC11: no `PublishError` variant has a field for either secret.
+        // `Credentials`'s own `Debug` redaction of `app_password` is
+        // covered directly by `appview::pds::tests::debug_redacts_secrets`,
+        // since `Credentials` now lives there; this test only needs to
+        // cover the variants this module adds.
         let err = PublishError::Auth { status: 401, body: "invalid password".to_string() };
         let printed = format!("{err:?}");
         assert!(!printed.contains("app-pass"));
@@ -830,16 +784,6 @@ mod tests {
         let credentials = format!("{:?}", creds());
         assert!(!credentials.contains("app-pass"), "Credentials Debug leaked: {credentials}");
         assert!(credentials.contains("[redacted]"), "Credentials Debug: {credentials}");
-
-        let session = format!(
-            "{:?}",
-            Session {
-                did: "did:plc:abc".to_string(),
-                access_jwt: Secret::new("access-jwt".to_string()),
-            }
-        );
-        assert!(!session.contains("access-jwt"), "Session Debug leaked: {session}");
-        assert!(session.contains("[redacted]"), "Session Debug: {session}");
     }
 
     #[test]
