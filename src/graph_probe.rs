@@ -41,12 +41,16 @@ pub enum GraphProbeError {
     #[error("--handle is required: pass at least one --handle <handle>")]
     NoHandles,
     #[error(
-        "invalid --handle value \"{value}\": must not be empty, and must not contain '@' or \
-         whitespace once a single leading '@' is stripped and the result is trimmed"
+        "invalid --handle value {value:?}: must not be empty, and must not contain '@', \
+         whitespace or a control character once a single leading '@' is stripped and the \
+         result is trimmed"
     )]
     // Review round 2, defect I: an empty or malformed `--handle` value is
     // its own error, distinct from `NoHandles`, which now means only "zero
-    // `--handle` flags were given at all".
+    // `--handle` flags were given at all". Review round 3, defect P: `value`
+    // is printed with `{:?}` (`Debug`, not `Display`), so a control
+    // character in a hostile `--handle` is escaped rather than written to
+    // the terminal raw.
     InvalidHandle { value: String },
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -77,16 +81,17 @@ pub fn dedup_first_seen(handles: &[String]) -> Vec<String> {
 /// `@ alice.bsky.social` normalizes to `alice.bsky.social` before
 /// `dedup_first_seen` or any network call sees them (BC9; review round 1,
 /// defect G; review round 2, defect H). The result is `Err` when it is
-/// empty, or still holds an `@` or any whitespace: only one leading `@` is
-/// stripped, so `@@alice.bsky.social` (a second `@` left over) and `" "`
-/// (nothing left after trimming) are both invalid rather than silently
-/// mangled further.
+/// empty, or still holds an `@`, any whitespace, or a control character
+/// (`char::is_control`; review round 3, defect P): only one leading `@` is
+/// stripped, so `@@alice.bsky.social` (a second `@` left over), `" "`
+/// (nothing left after trimming) and a value carrying an escape or other
+/// control byte are all invalid rather than silently mangled or printed raw.
 fn normalize_handle(raw: &str) -> Result<String, ()> {
     let trimmed = raw.trim();
     let without_at = trimmed.strip_prefix('@').unwrap_or(trimmed).trim();
     if without_at.is_empty()
         || without_at.contains('@')
-        || without_at.chars().any(char::is_whitespace)
+        || without_at.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         Err(())
     } else {
@@ -578,13 +583,19 @@ async fn run_one_handle(
 
 /// One printable line per [`HandleFailure`] (BC4a: `<handle>: failed at
 /// <step>: <error>`), naming only the handle, the step and the error
-/// (BC16) — never a viewer DID. A pure function so the line format is
-/// tested directly, not through [`print_failures`]'s `println!` side
-/// effect.
+/// (BC16) — never a viewer DID. The handle is printed with `{:?}` (`Debug`),
+/// escaped rather than raw (BC16; review round 3, defect P), matching every
+/// other place this module prints a handle: `preflight` already rejects a
+/// control character before a handle reaches here, but the escaping is
+/// applied uniformly rather than relied on to have happened upstream. A pure
+/// function so the line format is tested directly, not through
+/// [`print_failures`]'s `println!` side effect.
 fn failure_lines(failures: &[HandleFailure]) -> Vec<String> {
     failures
         .iter()
-        .map(|failure| format!("{}: failed at {}: {}", failure.handle, failure.step, failure.error))
+        .map(|failure| {
+            format!("{:?}: failed at {}: {}", failure.handle, failure.step, failure.error)
+        })
         .collect()
 }
 
@@ -606,7 +617,9 @@ fn print_failures(failures: &[HandleFailure]) {
 pub fn print_run_report(report: &RunReport) {
     print_failures(&report.failures);
     for probe in &report.reports {
-        println!("{}:", probe.handle);
+        // Review round 3, defect P: `{:?}` escapes the handle rather than
+        // writing it raw, matching `failure_lines` above.
+        println!("{:?}:", probe.handle);
         println!(
             "  step_follows: {} calls, {} pages, {:?}",
             probe.follows_stats.calls, probe.follows_stats.pages, probe.follows_stats.elapsed
@@ -971,6 +984,25 @@ mod tests {
         assert_eq!(normalize_handle(" "), Err(()));
     }
 
+    #[test]
+    fn normalize_handle_rejects_a_control_character() {
+        // Review round 3, defect P: a raw ANSI escape sequence in a
+        // `--handle` value must not survive to a network call or a printed
+        // line.
+        assert_eq!(normalize_handle("a\x1b[31m"), Err(()));
+    }
+
+    #[test]
+    fn invalid_handle_message_escapes_a_control_character() {
+        // Review round 3, defect P: `InvalidHandle`'s `Display` uses
+        // `{value:?}`, so the message text holds the escaped `\u{1b}`, never
+        // the raw ESC byte a terminal would interpret.
+        let err = GraphProbeError::InvalidHandle { value: "a\x1b[31m".to_string() };
+        let message = err.to_string();
+        assert!(!message.contains('\x1b'));
+        assert!(message.contains("\\u{1b}"));
+    }
+
     // --- preflight InvalidHandle vs NoHandles (BC9; review round 2, defect I)
 
     #[test]
@@ -1004,8 +1036,24 @@ mod tests {
         }];
         assert_eq!(
             failure_lines(&failures),
-            vec!["alice.bsky.social: failed at step_follows: boom".to_string()]
+            vec!["\"alice.bsky.social\": failed at step_follows: boom".to_string()]
         );
+    }
+
+    #[test]
+    fn failure_lines_escape_a_handle_instead_of_printing_it_raw() {
+        // Review round 3, defect P: a handle that reaches `failure_lines`
+        // carrying a control character (it should never pass `preflight`,
+        // but this function does not trust that) is escaped, not written
+        // raw, so it cannot inject terminal control sequences.
+        let failures = vec![HandleFailure {
+            handle: "a\x1b[31m".to_string(),
+            step: "resolve_handle",
+            error: "boom".to_string(),
+        }];
+        let lines = failure_lines(&failures);
+        assert!(!lines[0].contains('\x1b'));
+        assert!(lines[0].contains("\\u{1b}"));
     }
 
     // --- ranked_order (BC2, BC13; review round 1, defect D) ----------------

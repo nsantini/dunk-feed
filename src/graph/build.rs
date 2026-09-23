@@ -80,11 +80,17 @@ pub trait GraphSource {
 
 /// Step 1: pages `get_follows` for `viewer` to the end, filling
 /// `circle.follows` with every hash and `circle.d2_sample` with the first
-/// `d2_sample_size` DIDs in response order (BC1). Stops as soon as a page
-/// comes back with no DIDs, or with a cursor equal to the one just sent,
-/// besides the ordinary end-of-list case of a `None` cursor (review round
-/// 2, defect J): a source that cannot make progress is never paged
-/// forever.
+/// `d2_sample_size` DIDs in response order (BC1). A page's DIDs are added
+/// only after its next cursor is checked against the one just sent and
+/// against every cursor sent before it in this call (review round 3, defect
+/// L): a page that repeats the cursor it was fetched with, or cycles back to
+/// one already used, carries data this step has already accounted for, so it
+/// is discarded rather than pushed into `circle.d2_sample` a second time.
+/// Paging also stops on the ordinary end-of-list case of a `None` cursor, or
+/// on an empty page (review round 2, defect J; review round 3, defect O
+/// widens the repeated-cursor check from "the last cursor sent" to "any
+/// cursor sent so far", so a source whose cursor cycles through more than
+/// one earlier value is still bounded).
 pub async fn step_follows<S: GraphSource>(
     source: &S,
     viewer: &str,
@@ -94,20 +100,35 @@ pub async fn step_follows<S: GraphSource>(
     let start = Instant::now();
     let mut calls: u32 = 0;
     let mut cursor: Option<String> = None;
+    let mut sent_cursors: HashSet<String> = HashSet::new();
     loop {
         let sent_cursor = cursor.clone();
         let page = source.get_follows(viewer, 100, cursor.take()).await?;
         calls += 1;
+        if page.dids.is_empty() {
+            break;
+        }
+        let next_cursor = page.cursor;
+        let repeats_a_cursor = match &next_cursor {
+            None => false,
+            Some(c) => Some(c) == sent_cursor.as_ref() || sent_cursors.contains(c),
+        };
+        if repeats_a_cursor {
+            break;
+        }
         for did in &page.dids {
             circle.follows.insert(hash_did(did));
             if circle.d2_sample.len() < d2_sample_size {
                 circle.d2_sample.push(did.clone());
             }
         }
-        if page.dids.is_empty() || page.cursor.is_none() || page.cursor == sent_cursor {
+        if let Some(c) = sent_cursor {
+            sent_cursors.insert(c);
+        }
+        if next_cursor.is_none() {
             break;
         }
-        cursor = page.cursor;
+        cursor = next_cursor;
     }
     Ok(StepStats { calls, pages: calls, elapsed: start.elapsed() })
 }
@@ -169,10 +190,12 @@ pub async fn step_follows_me<S: GraphSource>(
 /// (review round 1, defect B): a depth of 150 therefore makes one page of
 /// 100 and one of 50, and the stored list holds exactly 150 hashes, not the
 /// 200 the account may actually follow. An account already in `shared`
-/// costs no call. Paging for one account stops as soon as a page comes
-/// back with no DIDs, or with a cursor equal to the one just sent, besides
-/// the ordinary end-of-list case of a `None` cursor (review round 2, defect
-/// J), so a source that cannot make progress is never paged forever.
+/// costs no call. Paging for one account stops on an empty page, on the
+/// ordinary end-of-list case of a `None` cursor, or when the next cursor
+/// repeats the one just sent or any cursor already sent for this account
+/// (review round 2, defect J; review round 3, defect O widens the check from
+/// "the last cursor sent" to "any cursor sent so far", so a source whose
+/// cursor cycles through more than one earlier value is still bounded).
 pub async fn step_degree2<S: GraphSource>(
     source: &S,
     d2_sample: &[String],
@@ -189,16 +212,29 @@ pub async fn step_degree2<S: GraphSource>(
         }
         let mut collected: Vec<String> = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut sent_cursors: HashSet<String> = HashSet::new();
         while collected.len() < depth {
             let remaining = depth - collected.len();
             let page_limit = remaining.min(100) as u32;
             let sent_cursor = cursor.clone();
             let page = source.get_follows(account, page_limit, cursor.take()).await?;
             calls += 1;
-            let page_was_empty = page.dids.is_empty();
+            if page.dids.is_empty() {
+                break;
+            }
             let next_cursor = page.cursor;
+            let repeats_a_cursor = match &next_cursor {
+                None => false,
+                Some(c) => Some(c) == sent_cursor.as_ref() || sent_cursors.contains(c),
+            };
+            if repeats_a_cursor {
+                break;
+            }
             collected.extend(page.dids);
-            if page_was_empty || next_cursor.is_none() || next_cursor == sent_cursor {
+            if let Some(c) = sent_cursor {
+                sent_cursors.insert(c);
+            }
+            if next_cursor.is_none() {
                 break;
             }
             cursor = next_cursor;
@@ -468,6 +504,82 @@ mod tests {
 
         assert_eq!(stats.calls, 2);
         assert_eq!(circle.follows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn step_follows_never_pushes_a_repeated_page_into_d2_sample_twice() {
+        // Review round 3, defect L: the same DID coming back on a page that
+        // repeats its own cursor must not be pushed into `d2_sample` a
+        // second time — the cursor check happens before the page's DIDs are
+        // added, not after.
+        let source =
+            StuckSource { page: FollowsPage { dids: vec![did(1)], cursor: Some("x".to_string()) } };
+        let mut circle = Circle::new();
+
+        step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+
+        assert_eq!(circle.d2_sample, vec![did(1)]);
+    }
+
+    /// A `GraphSource` whose cursor cycles through more than one earlier
+    /// value (`None -> "a" -> "b" -> "a"`), for the wider repeated-cursor
+    /// check of review round 3, defect O: checking only "the last cursor
+    /// sent" would miss this cycle and page forever.
+    struct CyclingSource {
+        pages: Mutex<HashMap<Option<String>, FollowsPage>>,
+    }
+
+    impl GraphSource for CyclingSource {
+        async fn get_follows(
+            &self,
+            _actor: &str,
+            _limit: u32,
+            cursor: Option<String>,
+        ) -> Result<FollowsPage, PdsError> {
+            Ok(self.pages.lock().unwrap().get(&cursor).cloned().unwrap())
+        }
+
+        async fn get_relationships(
+            &self,
+            _actor: &str,
+            _others: &[String],
+        ) -> Result<Vec<String>, PdsError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn cycling_pages() -> HashMap<Option<String>, FollowsPage> {
+        HashMap::from([
+            (None, FollowsPage { dids: vec![did(1)], cursor: Some("a".to_string()) }),
+            (Some("a".to_string()), FollowsPage { dids: vec![did(2)], cursor: Some("b".to_string()) }),
+            (Some("b".to_string()), FollowsPage { dids: vec![did(3)], cursor: Some("a".to_string()) }),
+        ])
+    }
+
+    #[tokio::test]
+    async fn step_follows_stops_on_a_cursor_cycle_across_more_than_one_hop() {
+        // Review round 3, defect O: cursor cycles None -> a -> b -> a. The
+        // repeat only shows up two hops after "a" was first sent, so a check
+        // against only the immediately preceding cursor would page forever.
+        let source = CyclingSource { pages: Mutex::new(cycling_pages()) };
+        let mut circle = Circle::new();
+
+        let stats = step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+
+        assert_eq!(stats.calls, 3);
+        assert_eq!(circle.follows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn step_degree2_stops_on_a_cursor_cycle_across_more_than_one_hop() {
+        let source = CyclingSource { pages: Mutex::new(cycling_pages()) };
+        let mut shared: HashMap<String, Vec<DidHash>> = HashMap::new();
+
+        let stats =
+            step_degree2(&source, &["acct-a".to_string()], 100, &mut shared).await.unwrap();
+
+        assert_eq!(stats.calls, 3);
+        assert_eq!(shared.get("acct-a").unwrap().len(), 2);
     }
 
     #[tokio::test]
