@@ -156,10 +156,15 @@ pub async fn step_follows_me<S: GraphSource>(
 }
 
 /// Step 3: for each account in `d2_sample` with no entry yet in `shared`,
-/// pages `get_follows` up to `d2_follows_depth` DIDs (one page when the
-/// depth is 100 or less, since a page holds at most 100), and stores the
-/// sorted, deduplicated result in `shared` (BC4). An account already in
-/// `shared` costs no call.
+/// pages `get_follows` until `d2_follows_depth` raw DIDs are collected or the
+/// end is reached, truncates that raw list to exactly `d2_follows_depth`
+/// before hashing, sorting and deduplicating it, and stores the result in
+/// `shared` (BC4). Each page after the first requests only the DIDs still
+/// needed to reach the depth, never a full page of 100 when fewer remain
+/// (review round 1, defect B): a depth of 150 therefore makes one page of
+/// 100 and one of 50, and the stored list holds exactly 150 hashes, not the
+/// 200 the account may actually follow. An account already in `shared`
+/// costs no call.
 pub async fn step_degree2<S: GraphSource>(
     source: &S,
     d2_sample: &[String],
@@ -168,28 +173,30 @@ pub async fn step_degree2<S: GraphSource>(
 ) -> Result<StepStats, PdsError> {
     let start = Instant::now();
     let mut calls: u32 = 0;
-    let page_limit = d2_follows_depth.min(100);
+    let depth = d2_follows_depth as usize;
 
     for account in d2_sample {
         if shared.contains_key(account) {
             continue;
         }
-        let mut found: HashSet<DidHash> = HashSet::new();
+        let mut collected: Vec<String> = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        while collected.len() < depth {
+            let remaining = depth - collected.len();
+            let page_limit = remaining.min(100) as u32;
             let page = source.get_follows(account, page_limit, cursor.take()).await?;
             calls += 1;
-            for did in &page.dids {
-                found.insert(hash_did(did));
-            }
+            collected.extend(page.dids);
             cursor = page.cursor;
-            if cursor.is_none() || found.len() as u32 >= d2_follows_depth {
+            if cursor.is_none() {
                 break;
             }
         }
-        let mut sorted: Vec<DidHash> = found.into_iter().collect();
-        sorted.sort_unstable();
-        shared.insert(account.clone(), sorted);
+        collected.truncate(depth);
+        let mut hashed: Vec<DidHash> = collected.iter().map(|did| hash_did(did)).collect();
+        hashed.sort_unstable();
+        hashed.dedup();
+        shared.insert(account.clone(), hashed);
     }
 
     Ok(StepStats { calls, pages: calls, elapsed: start.elapsed() })
@@ -382,8 +389,10 @@ mod tests {
 
     #[tokio::test]
     async fn step_degree2_above_100_pages_until_the_depth_is_reached() {
-        // BC4: depth 150 needs two pages of 100 each (150 falls short of
-        // 100 in the first page alone).
+        // BC4; review round 1, defect B: depth 150 against 200 real follows
+        // needs a page of 100 then a page of exactly the 50 still needed,
+        // and the stored list is truncated to exactly 150, not the full 200
+        // the account follows.
         let mut follows = HashMap::new();
         follows.insert("acct-a".to_string(), (0..200).map(did).collect::<Vec<_>>());
         let source = FakeSource { follows, ..Default::default() };
@@ -392,7 +401,7 @@ mod tests {
         let stats = step_degree2(&source, &["acct-a".to_string()], 150, &mut shared).await.unwrap();
 
         assert_eq!(stats.calls, 2);
-        assert!(shared.get("acct-a").unwrap().len() >= 150);
+        assert_eq!(shared.get("acct-a").unwrap().len(), 150);
     }
 
     #[tokio::test]

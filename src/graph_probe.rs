@@ -43,37 +43,55 @@ pub enum GraphProbeError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error("every handle failed; see the failure lines above")]
+    // `run` prints each failure's line through `print_failures` before
+    // returning this variant (review round 1, defect A), so "above" refers
+    // to stdout, not to a field this error carries.
     AllFailed,
 }
 
 /// Keeps the first occurrence of each handle, dropping a later repeat
-/// (BC9a): a handle given twice is probed once, in the order it first
-/// appeared.
+/// (BC9a), comparing ASCII case-insensitively so `Alice.bsky.social` and
+/// `alice.bsky.social` collapse to one entry (review round 1, defect F): a
+/// handle given twice, in any casing, is probed once, keeping the first
+/// spelling seen.
 pub fn dedup_first_seen(handles: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::with_capacity(handles.len());
     for handle in handles {
-        if seen.insert(handle.clone()) {
+        if seen.insert(handle.to_ascii_lowercase()) {
             out.push(handle.clone());
         }
     }
     out
 }
 
+/// Trims `raw` and strips one leading `@`, so `@alice.bsky.social` and
+/// ` alice.bsky.social` both normalize to `alice.bsky.social` before
+/// `dedup_first_seen` or any network call sees them (BC9; review round 1,
+/// defect G).
+fn normalize_handle(raw: &str) -> String {
+    let trimmed = raw.trim();
+    trimmed.strip_prefix('@').unwrap_or(trimmed).to_string()
+}
+
 /// Checks `--handle` (BC9, BC9a) before credentials (BC8), and both before
 /// any network call or store open: `--handle` is not `required` in clap, so
 /// an empty list reaches here rather than clap exiting 2 on its own
-/// (spec.md "Defaults taken"). Reuses `publish::preflight`'s credential
-/// check (`avatar_path: None`, so its avatar branch never runs) instead of
-/// re-implementing the same blank/trim rule a second time.
+/// (spec.md "Defaults taken"). Each handle is trimmed and stripped of one
+/// leading `@` first (review round 1, defect G); a handle that normalizes to
+/// an empty string is treated the same as no `--handle` at all, since
+/// neither names an account to probe. Reuses `publish::preflight`'s
+/// credential check (`avatar_path: None`, so its avatar branch never runs)
+/// instead of re-implementing the same blank/trim rule a second time.
 pub fn preflight(
     cfg: &Config,
     handles: &[String],
 ) -> Result<(Vec<String>, Credentials), GraphProbeError> {
-    let handles = dedup_first_seen(handles);
-    if handles.is_empty() {
+    let normalized: Vec<String> = handles.iter().map(|handle| normalize_handle(handle)).collect();
+    if normalized.is_empty() || normalized.iter().any(|handle| handle.is_empty()) {
         return Err(GraphProbeError::NoHandles);
     }
+    let handles = dedup_first_seen(&normalized);
     let credentials = match publish::preflight(cfg, None) {
         Ok((credentials, _avatar)) => credentials,
         Err(PublishError::MissingCredentials { var }) => {
@@ -130,6 +148,25 @@ pub fn discovery_share_and_bytes_saved(
 /// `FeedItem` author hashes exist yet).
 fn filter_item(row: &FeedRow) -> FilterItem {
     FilterItem { quote_did: hash_did(&row.quote_did), original_did: hash_did(&row.original_did) }
+}
+
+/// `rows`, reordered to match the current snapshot's ranked order: runs
+/// `scorer::snapshot::build` (the same ranking and capping the served feed
+/// uses, `src/scorer/snapshot.rs`, untouched by this story) and maps each
+/// `FeedItem` it returns back to its own `FeedRow` by `quote_uri` (step 7.5,
+/// review round 1, finding 6; spec.md "Defaults taken" and `## Answers from
+/// the engineer`). `step_follows_me`'s candidates, the connection filter's
+/// `follows_me_depth` check and the circle-pairs window all read "ranked
+/// order" as this order, not `Store::feed_rows`'s own row order — the two
+/// can differ once the snapshot's caps drop or reorder rows. A `quote_uri`
+/// `snapshot::build` returns that no longer matches any input row (it never
+/// invents one) is silently dropped, since the caller only wants the rows
+/// that survived ranking, in that order.
+fn ranked_order(rows: Vec<FeedRow>, weights: &Weights, now: i64, k: f64) -> Vec<FeedRow> {
+    let by_uri: HashMap<String, FeedRow> =
+        rows.iter().map(|row| (row.quote_uri.clone(), row.clone())).collect();
+    let items = snapshot::build(rows, weights, now, k);
+    items.into_iter().filter_map(|item| by_uri.get(&item.quote_uri).cloned()).collect()
 }
 
 /// On the real `feed` rows, the count of kept items whose `promoted_at` is
@@ -205,15 +242,58 @@ pub fn time_filter_and_caps(
     Some((filter_elapsed, caps_elapsed))
 }
 
+/// Why the order check (BC14) was skipped: either the `getFollows` or the
+/// `listRecords` call it needs failed. `Status` carries the failing call's
+/// own HTTP status (BC14's "skipped (`<status>`)"); the other three name the
+/// kind of failure a status-less `PdsError` was, so the printed reason is
+/// never `0` standing in for "no status" (review round 1, defect C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    Status(u16),
+    Transport,
+    Decode,
+    Session,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::Status(status) => write!(f, "{status}"),
+            SkipReason::Transport => write!(f, "transport"),
+            SkipReason::Decode => write!(f, "decode"),
+            SkipReason::Session => write!(f, "session"),
+        }
+    }
+}
+
+/// Maps a [`PdsError`] from the order check's `getFollows` or
+/// `list_follow_records` call to the [`SkipReason`] it prints (review round
+/// 1, defect C). `PdsError::Http` with a status carries that status;
+/// `PdsError::Http` with none (a transport error that outlasted the retry
+/// schedule) and `PdsError::TooMany` (never actually reachable here, since
+/// neither call sends `others`) both read as `Transport`; `InvalidRate` is
+/// unreachable too (rejected at config load and at `PdsClient::new`, never
+/// returned by a call), and maps to `Transport` as the least misleading
+/// fallback rather than a fifth variant nothing can construct.
+fn skip_reason(err: &PdsError) -> SkipReason {
+    match err {
+        PdsError::Http { status: Some(status), .. } => SkipReason::Status(*status),
+        PdsError::Http { status: None, .. } => SkipReason::Transport,
+        PdsError::Decode { .. } => SkipReason::Decode,
+        PdsError::Session => SkipReason::Session,
+        PdsError::InvalidRate | PdsError::TooMany { .. } => SkipReason::Transport,
+    }
+}
+
 /// The order check's result (BC14): the first `getFollows` page matches the
 /// newest `app.bsky.graph.follow` records position for position, the first
-/// index where they differ, or the check was skipped, carrying the status
-/// that caused the skip.
+/// index where they differ, or the check was skipped, carrying the
+/// [`SkipReason`] that caused the skip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderCheck {
     Match,
     Difference(usize),
-    Skipped(u16),
+    Skipped(SkipReason),
 }
 
 /// Compares `follows_page` (the first `getFollows` page, in response order)
@@ -282,13 +362,6 @@ pub async fn run(cfg: &Config, handles: &[String]) -> Result<RunReport, GraphPro
 
     let store = Store::open_read_only(&cfg.db_path)?;
     let rows = store.feed_rows()?;
-    let ranked: Vec<RankedAuthors> = rows
-        .iter()
-        .map(|row| RankedAuthors {
-            quote_did: row.quote_did.clone(),
-            original_did: row.original_did.clone(),
-        })
-        .collect();
 
     // `PdsClient::from_config` only fails on an out-of-range `graph_rps`,
     // already rejected at config load (`config::graph_rps_or_default`), so
@@ -302,14 +375,38 @@ pub async fn run(cfg: &Config, handles: &[String]) -> Result<RunReport, GraphPro
     let weights = Weights::from(cfg);
     let k = f64::from(cfg.k);
 
+    // Step 7.5 (review round 1, finding 6): "ranked" is the current
+    // snapshot's order, not `Store::feed_rows`'s own order. This feeds
+    // `step_follows_me`'s candidates, the connection filter's depth check
+    // and the circle-pairs window alike (spec.md "Defaults taken"), so it
+    // is computed once, here, and passed to every one of them.
+    let ranked_rows = ranked_order(rows, &weights, now, k);
+    let ranked: Vec<RankedAuthors> = ranked_rows
+        .iter()
+        .map(|row| RankedAuthors {
+            quote_did: row.quote_did.clone(),
+            original_did: row.original_did.clone(),
+        })
+        .collect();
+
     let mut shared_d2: HashMap<String, Vec<DidHash>> = HashMap::new();
     let mut reports = Vec::new();
     let mut failures = Vec::new();
     let mut d2_samples: Vec<Vec<String>> = Vec::new();
 
     for handle in &handles {
-        match run_one_handle(&client, handle, &ranked, &rows, cfg, &weights, now, k, &mut shared_d2)
-            .await
+        match run_one_handle(
+            &client,
+            handle,
+            &ranked,
+            &ranked_rows,
+            cfg,
+            &weights,
+            now,
+            k,
+            &mut shared_d2,
+        )
+        .await
         {
             Ok((report, d2_sample)) => {
                 d2_samples.push(d2_sample);
@@ -323,6 +420,11 @@ pub async fn run(cfg: &Config, handles: &[String]) -> Result<RunReport, GraphPro
         discovery_share_and_bytes_saved(&d2_samples, &shared_d2);
 
     if reports.is_empty() {
+        // Review round 1, defect A: `cli.rs` only calls `print_run_report`
+        // on `Ok`, so the all-failed path must print its own failure lines
+        // through the same `print_failures` before returning the error —
+        // otherwise a run where every handle failed ends in silence.
+        print_failures(&failures);
         return Err(GraphProbeError::AllFailed);
     }
 
@@ -378,10 +480,12 @@ async fn run_one_handle(
     let order_check = match client.get_follows(&did, 100, None).await {
         Ok(page) => match client.list_follow_records(&did, 100).await {
             Ok(ListFollowRecordsOutcome::Ok(listed)) => check_order(&page.dids, &listed),
-            Ok(ListFollowRecordsOutcome::Failed(status)) => OrderCheck::Skipped(status),
-            Err(_) => OrderCheck::Skipped(0),
+            Ok(ListFollowRecordsOutcome::Failed(status)) => {
+                OrderCheck::Skipped(SkipReason::Status(status))
+            }
+            Err(err) => OrderCheck::Skipped(skip_reason(&err)),
         },
-        Err(_) => OrderCheck::Skipped(0),
+        Err(err) => OrderCheck::Skipped(skip_reason(&err)),
     };
 
     let filter_timing = time_filter_and_caps(
@@ -416,14 +520,35 @@ async fn run_one_handle(
     ))
 }
 
+/// One printable line per [`HandleFailure`] (BC4a: `<handle>: failed at
+/// <step>: <error>`), naming only the handle, the step and the error
+/// (BC16) — never a viewer DID. A pure function so the line format is
+/// tested directly, not through [`print_failures`]'s `println!` side
+/// effect.
+fn failure_lines(failures: &[HandleFailure]) -> Vec<String> {
+    failures
+        .iter()
+        .map(|failure| format!("{}: failed at {}: {}", failure.handle, failure.step, failure.error))
+        .collect()
+}
+
+/// Prints [`failure_lines`] for `failures`, one per line. Called both by
+/// [`print_run_report`] (the handles that failed alongside the ones that
+/// completed) and by [`run`] on the all-failed path (review round 1, defect
+/// A), so a run where every handle fails still prints why before it returns
+/// [`GraphProbeError::AllFailed`], instead of ending in silence.
+fn print_failures(failures: &[HandleFailure]) {
+    for line in failure_lines(failures) {
+        println!("{line}");
+    }
+}
+
 /// Prints `report`, one line per number (BC10, BC11, BC12, BC13, BC14),
 /// naming only handles, step names and statuses (BC16) — never a viewer
 /// DID. Kept separate from [`run`] so a test checks the numbers `run`
 /// collects, not this function's text (spec.md `## Approach`).
 pub fn print_run_report(report: &RunReport) {
-    for failure in &report.failures {
-        println!("{}: failed at {}: {}", failure.handle, failure.step, failure.error);
-    }
+    print_failures(&report.failures);
     for probe in &report.reports {
         println!("{}:", probe.handle);
         println!(
@@ -668,6 +793,142 @@ mod tests {
         let page = vec!["did:plc:a".to_string()];
         let listed = vec!["did:plc:a".to_string(), "did:plc:b".to_string()];
         assert_eq!(check_order(&page, &listed), OrderCheck::Difference(1));
+    }
+
+    // --- skip_reason (BC14; review round 1, defect C) ----------------------
+
+    #[test]
+    fn skip_reason_maps_each_error_shape() {
+        assert_eq!(
+            skip_reason(&PdsError::Http { method: "op", status: Some(404), attempts: 1 }),
+            SkipReason::Status(404)
+        );
+        assert_eq!(
+            skip_reason(&PdsError::Http { method: "op", status: None, attempts: 3 }),
+            SkipReason::Transport
+        );
+        assert_eq!(
+            skip_reason(&PdsError::Decode { method: "op", reason: "bad json".to_string() }),
+            SkipReason::Decode
+        );
+        assert_eq!(skip_reason(&PdsError::Session), SkipReason::Session);
+    }
+
+    #[test]
+    fn skip_reason_never_prints_a_bare_zero() {
+        // A status-less failure must read as a word, never the number 0
+        // standing in for "no status" (review round 1, defect C).
+        let printed =
+            format!("{}", skip_reason(&PdsError::Http { method: "op", status: None, attempts: 1 }));
+        assert_ne!(printed, "0");
+        assert_eq!(printed, "transport");
+    }
+
+    // --- dedup_first_seen case-insensitivity (BC9a; review round 1, defect F)
+
+    #[test]
+    fn dedup_first_seen_collapses_case_insensitively_and_keeps_first_spelling() {
+        let handles = vec!["Alice.bsky.social".to_string(), "alice.bsky.social".to_string()];
+        assert_eq!(dedup_first_seen(&handles), vec!["Alice.bsky.social"]);
+    }
+
+    // --- preflight normalization (BC9; review round 1, defect G) -----------
+
+    #[test]
+    fn preflight_strips_at_and_trims_whitespace() {
+        let lookup = |name: &str| match name {
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "BSKY_HANDLE" => Some("upstage.bsky.social".to_string()),
+            "BSKY_APP_PASSWORD" => Some("secret".to_string()),
+            _ => None,
+        };
+        let cfg = crate::config::load(lookup).expect("config loads");
+
+        let (deduped, _) =
+            preflight(&cfg, &["@alice.bsky.social".to_string()]).expect("a leading @ is stripped");
+        assert_eq!(deduped, vec!["alice.bsky.social"]);
+
+        let (deduped, _) = preflight(&cfg, &[" alice.bsky.social".to_string()])
+            .expect("surrounding whitespace is trimmed");
+        assert_eq!(deduped, vec!["alice.bsky.social"]);
+    }
+
+    #[test]
+    fn preflight_rejects_an_empty_handle_before_credentials() {
+        // BC9: an empty handle is the usage error, checked before the
+        // missing-credentials check even though this config has neither.
+        let cfg = base_config();
+        let err = preflight(&cfg, &["".to_string()]).unwrap_err();
+        assert!(matches!(err, GraphProbeError::NoHandles));
+    }
+
+    // --- print_failures (BC4a, BC16; review round 1, defect A) -------------
+
+    #[test]
+    fn failure_lines_name_the_handle_step_and_error() {
+        let failures = vec![HandleFailure {
+            handle: "alice.bsky.social".to_string(),
+            step: "step_follows",
+            error: "boom".to_string(),
+        }];
+        assert_eq!(
+            failure_lines(&failures),
+            vec!["alice.bsky.social: failed at step_follows: boom".to_string()]
+        );
+    }
+
+    // --- ranked_order (BC2, BC13; review round 1, defect D) ----------------
+
+    #[test]
+    fn ranked_order_follows_the_snapshot_not_the_stored_order() {
+        // Two rows with distinct authors and days, so neither cap drops or
+        // reorders either one: `snapshot::build` only reorders them by its
+        // own recomputed rank. `strong` carries far more engagement than
+        // `weak` (100 likes against 1, both against the same default
+        // `v_likes_o`), enough to outrank `weak`'s slight recency edge
+        // (`score::rank`'s age term falls off much more slowly than its
+        // engagement term rises here) — so `strong` ranks first even though
+        // it is stored second.
+        let now = 1_700_200_000;
+        let mut strong = feed_row("did:plc:strong", "did:plc:strong-o", 1_700_000_000);
+        strong.v_likes_q = 100;
+        let mut weak = feed_row("did:plc:weak", "did:plc:weak-o", 1_700_086_400);
+        weak.v_likes_q = 1;
+        let weights = Weights { repost: 2.0, reply: 0.5 };
+        let k = 5.0;
+
+        // Confirms the ranking assumption above directly through `score::rank`,
+        // so the test does not rely on hand-computed numbers matching
+        // `recompute_ranks`'s own formula.
+        let rank_of = |row: &FeedRow| {
+            let eq = crate::score::engagement(
+                &crate::score::Counts { likes: row.v_likes_q as u32, reposts: 0, replies: 0 },
+                &weights,
+            );
+            let eo = crate::score::engagement(
+                &crate::score::Counts { likes: row.v_likes_o as u32, reposts: 0, replies: 0 },
+                &weights,
+            );
+            let d = crate::score::ratio(eq, eo, k);
+            let age_hours = (now - row.quoted_at) as f64 / 3600.0;
+            crate::score::rank(d, eq, age_hours)
+        };
+        assert!(
+            rank_of(&strong) > rank_of(&weak),
+            "test setup: `strong` must outrank `weak` for this test to exercise the reorder"
+        );
+
+        let stored_uris = vec![weak.quote_uri.clone(), strong.quote_uri.clone()];
+        let stored_order = vec![weak.clone(), strong.clone()];
+
+        let ranked = ranked_order(stored_order, &weights, now, k);
+        let ranked_uris: Vec<String> = ranked.into_iter().map(|row| row.quote_uri).collect();
+
+        assert_eq!(ranked_uris, vec![strong.quote_uri.clone(), weak.quote_uri.clone()]);
+        // Sanity: the stored order was not already the snapshot order —
+        // otherwise this test would pass without exercising the fix.
+        assert_ne!(stored_uris, ranked_uris);
     }
 }
 

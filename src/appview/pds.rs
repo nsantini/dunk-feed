@@ -809,17 +809,24 @@ impl<T: PdsTransport> PdsClient<T> {
     /// recent) `rkey` TID comes first — the newest follow, matching what a
     /// fresh `getFollows` page shows at its own front. `graph_probe`'s
     /// order check (slice 4.0, BC14) compares this page against
-    /// `get_follows`'s first page by subject DID and position. A non-2xx
-    /// status is returned as `Ok(ListFollowRecordsOutcome::Failed(status))`
-    /// rather than an error, so that check can print
-    /// `order check: skipped (<status>)` and move on instead of failing
-    /// the whole probe; any other failure (a transport error, a decode
-    /// failure, a session failure) still propagates as `Err`.
+    /// `get_follows`'s first page by subject DID and position. Only a
+    /// non-2xx status from the `listRecords` request itself becomes
+    /// `Ok(ListFollowRecordsOutcome::Failed(status))`, checked by `method`
+    /// as well as `status` (review round 1, defect E): `self.call` also
+    /// carries a login or a refresh through `ensure_fresh_session`, and a
+    /// failure there is a `PdsError::Http` whose `method` is
+    /// `com.atproto.server.createSession` or `refreshSession`, not this
+    /// call's own nsid. That failure — like `PdsError::Session`, a decode
+    /// failure, or a transport error that outlasts the retry schedule —
+    /// still propagates as `Err`, so the caller does not mistake "the
+    /// viewer could not be authenticated" for "this PDS does not host the
+    /// repo" and print the wrong skip reason.
     pub async fn list_follow_records(
         &self,
         repo: &str,
         limit: u32,
     ) -> Result<ListFollowRecordsOutcome, PdsError> {
+        const LIST_RECORDS_NSID: &str = "com.atproto.repo.listRecords";
         let limit = limit.to_string();
         let query: [(&str, &str); 4] = [
             ("repo", repo),
@@ -830,7 +837,7 @@ impl<T: PdsTransport> PdsClient<T> {
         match self
             .call::<ListRecordsResponse>(
                 HttpMethod::Get,
-                "com.atproto.repo.listRecords",
+                LIST_RECORDS_NSID,
                 &query,
                 RequestBody::None,
             )
@@ -839,7 +846,7 @@ impl<T: PdsTransport> PdsClient<T> {
             Ok(response) => Ok(ListFollowRecordsOutcome::Ok(
                 response.records.into_iter().map(|record| record.value.subject).collect(),
             )),
-            Err(PdsError::Http { status: Some(status), .. }) => {
+            Err(PdsError::Http { method: LIST_RECORDS_NSID, status: Some(status), .. }) => {
                 Ok(ListFollowRecordsOutcome::Failed(status))
             }
             Err(other) => Err(other),
@@ -1534,6 +1541,31 @@ mod tests {
             .await
             .expect("a non-2xx status is not an Err");
         assert_eq!(outcome, ListFollowRecordsOutcome::Failed(404));
+    }
+
+    #[tokio::test]
+    async fn list_follow_records_propagates_a_login_failure_as_err() {
+        // Review round 1, defect E: a 401 on `createSession` is a login
+        // failure, not a non-2xx from `listRecords` itself, so it must not
+        // become `Ok(Failed(401))`. `createSession` itself has no retryable
+        // status in `retry_decision`'s schedule, so this fails on the first
+        // attempt.
+        let transport = FakeTransport::new();
+        transport.push_ok(401, json!({ "error": "AuthenticationRequired" }));
+
+        let client =
+            PdsClient::new(transport, creds(), 1000.0).expect("valid rate builds a client");
+        let err = client
+            .list_follow_records("did:plc:actor", 100)
+            .await
+            .expect_err("a login failure is Err, not Ok(Failed(status))");
+        match err {
+            PdsError::Http { method, status, .. } => {
+                assert_eq!(method, LOGIN_NSID);
+                assert_eq!(status, Some(401));
+            }
+            other => panic!("expected Http from the login attempt, got {other:?}"),
+        }
     }
 
     #[tokio::test]
