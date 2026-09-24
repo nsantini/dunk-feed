@@ -5,7 +5,7 @@
 //! BC7a, BC8, BC24). [`run_touch_flush`] is the periodic task that writes
 //! `last_request_at` to SQLite at most once every 60 s per viewer (BC23).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,6 +21,26 @@ use crate::store::{unix_now, Store};
 /// `src/config.rs` to the PRD's score-table constants, and this one is not
 /// in it.
 pub const RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// How many consecutive failed first-build attempts a viewer gets before the
+/// worker gives up on it (BC8 as amended, review round 1, defect W): fewer
+/// than this many failures still retry after [`RETRY_DELAY`]; at this count,
+/// [`process_job`] removes the viewer instead of scheduling another retry.
+/// Not an environment variable, the same reason [`RETRY_DELAY`] is not.
+pub(crate) const MAX_FIRST_BUILD_ATTEMPTS: u32 = 5;
+
+/// How long [`GraphHandle::enqueue_first_build`] refuses a new first build
+/// for a viewer the worker gave up on (defect W), after which a fresh
+/// request may start one again.
+pub(crate) const REMOVAL_COOLDOWN_SECS: i64 = 60 * 60;
+
+/// The worker's fixed page cap for a first build's `step_follows` (review
+/// round 1, defect Z): a viewer with far more than this many pages of
+/// follows still gets a circle, built from whatever was fetched before the
+/// cap, rather than blocking the queue paging to the end. `graph_probe::run`
+/// passes `None` instead, since the probe measures a whole list's real page
+/// count.
+pub(crate) const FIRST_BUILD_MAX_PAGES: u32 = 100;
 
 /// How often [`run_touch_flush`] wakes to check for due touches. Shorter
 /// than [`TOUCH_MIN_INTERVAL_SECS`] so a touch is never held back much past
@@ -51,6 +71,10 @@ pub struct JobQueue {
     /// that arrives while a build is retrying still de-duplicates against
     /// it.
     outstanding: Mutex<HashSet<ViewerDid>>,
+    /// Consecutive failed first-build attempts per viewer since its last
+    /// success or removal (BC8 as amended, defect W). A viewer with no entry
+    /// has failed zero times.
+    attempts: Mutex<HashMap<ViewerDid, u32>>,
     notify: Notify,
 }
 
@@ -60,6 +84,7 @@ impl JobQueue {
         Arc::new(JobQueue {
             pending: Mutex::new(VecDeque::new()),
             outstanding: Mutex::new(HashSet::new()),
+            attempts: Mutex::new(HashMap::new()),
             notify: Notify::new(),
         })
     }
@@ -113,14 +138,29 @@ impl JobQueue {
         self.pending.lock().expect("JobQueue pending poisoned").push_back(viewer);
         self.notify.notify_one();
     }
+
+    /// Records one failed first-build attempt for `viewer` and returns the
+    /// new count (BC8 as amended, defect W).
+    fn record_failure(&self, viewer: &ViewerDid) -> u32 {
+        let mut attempts = self.attempts.lock().expect("JobQueue attempts poisoned");
+        let count = attempts.entry(viewer.clone()).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Clears `viewer`'s failed-attempt count (defect W): called on a
+    /// successful save (BC7) or once the worker gives up and removes the
+    /// viewer, so a later first build starts counting from zero.
+    fn clear_attempts(&self, viewer: &ViewerDid) {
+        self.attempts.lock().expect("JobQueue attempts poisoned").remove(viewer);
+    }
 }
 
 /// One job attempt: writes the `building_d1` row (BC7a), runs step 1, and
-/// on success saves the circle, swaps it into `handle`, and calls
-/// `drop_lists`; on any failure — a `PdsError` from step 1, or a
-/// `StoreError` from either save (BC24) — logs one `warn` naming the
-/// failure kind and no DID (BC21), and re-queues `viewer` after
-/// `retry_delay` (BC8).
+/// on success saves the circle, swaps it into `handle`, clears the failed-
+/// attempt count and calls `drop_lists`; on any failure — a `PdsError` from
+/// step 1, or a `StoreError` from either save (BC24) — hands off to
+/// [`handle_failure`] (BC8 as amended, defect W).
 #[allow(clippy::too_many_arguments)]
 async fn process_job<S: GraphSource>(
     viewer: &ViewerDid,
@@ -137,14 +177,17 @@ async fn process_job<S: GraphSource>(
         store.viewer_save_state(&viewer.0, CircleState::BuildingD1.as_str(), start_now)
     {
         tracing::warn!(kind = ?err, "graph: worker failed to save building_d1 state");
-        schedule_retry(queue, viewer.clone(), retry_delay);
+        handle_failure(viewer, handle, queue, store, drop_lists, retry_delay).await;
         return;
     }
 
     let mut circle = Circle::new();
-    if let Err(err) = step_follows(source, &viewer.0, d2_sample_size, &mut circle).await {
+    if let Err(err) =
+        step_follows(source, &viewer.0, d2_sample_size, &mut circle, Some(FIRST_BUILD_MAX_PAGES))
+            .await
+    {
         tracing::warn!(kind = ?err, "graph: worker step_follows failed");
-        schedule_retry(queue, viewer.clone(), retry_delay);
+        handle_failure(viewer, handle, queue, store, drop_lists, retry_delay).await;
         return;
     }
 
@@ -158,7 +201,7 @@ async fn process_job<S: GraphSource>(
         &circle.follows,
     ) {
         tracing::warn!(kind = ?err, "graph: worker failed to save circle");
-        schedule_retry(queue, viewer.clone(), retry_delay);
+        handle_failure(viewer, handle, queue, store, drop_lists, retry_delay).await;
         return;
     }
 
@@ -166,6 +209,44 @@ async fn process_job<S: GraphSource>(
     circle.last_request_at = saved_at;
     handle.insert_ready(viewer, circle);
     queue.complete(viewer);
+    queue.clear_attempts(viewer);
+    if let Some(drop_lists) = drop_lists {
+        drop_lists(&viewer.0);
+    }
+}
+
+/// One job attempt's failure path (BC8 as amended, review round 1, defect
+/// W): below [`MAX_FIRST_BUILD_ATTEMPTS`] failures, re-queues `viewer` after
+/// `retry_delay` exactly as before; at the limit, gives up instead — deletes
+/// `viewer`'s SQLite row (`viewer_delete`), removes its in-memory circle and
+/// starts its [`REMOVAL_COOLDOWN_SECS`] cooldown (freeing the
+/// `UPSTAGE_MAX_VIEWERS` slot `GraphHandle::enqueue_first_build` counts
+/// against), drops its cached lists, and logs one `warn` naming the attempt
+/// count and no DID (BC21).
+async fn handle_failure(
+    viewer: &ViewerDid,
+    handle: &Arc<GraphHandle>,
+    queue: &Arc<JobQueue>,
+    store: &Store,
+    drop_lists: Option<&DropListsFn>,
+    retry_delay: Duration,
+) {
+    let attempts = queue.record_failure(viewer);
+    if attempts < MAX_FIRST_BUILD_ATTEMPTS {
+        schedule_retry(queue, viewer.clone(), retry_delay);
+        return;
+    }
+
+    tracing::warn!(
+        attempts,
+        "graph: worker giving up on first build after repeated failures, removing viewer"
+    );
+    if let Err(err) = store.viewer_delete(&viewer.0) {
+        tracing::warn!(kind = ?err, "graph: failed to delete viewer row after giving up");
+    }
+    handle.remove_after_giving_up(viewer, unix_now(), REMOVAL_COOLDOWN_SECS);
+    queue.complete(viewer);
+    queue.clear_attempts(viewer);
     if let Some(drop_lists) = drop_lists {
         drop_lists(&viewer.0);
     }
@@ -426,6 +507,38 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(queue.try_pop(), Some(viewer), "the job was re-queued after the retry delay");
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_five_failed_attempts_in_a_row() {
+        // BC8 as amended, review round 1, defect W: a viewer whose first
+        // build fails `MAX_FIRST_BUILD_ATTEMPTS` times running is removed
+        // instead of retried forever, freeing its `UPSTAGE_MAX_VIEWERS`
+        // slot and its SQLite row.
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        handle.enqueue_first_build(viewer.clone(), unix_now());
+
+        let source = FailingSource { calls: StdMutex::new(0) };
+        let store = memory_store();
+        let queue = handle.queue();
+
+        for attempt in 1..=MAX_FIRST_BUILD_ATTEMPTS {
+            let job = queue.pop().await;
+            assert_eq!(job, viewer);
+            process_job(&job, &handle, &queue, &store, &source, 10, None, Duration::from_millis(5))
+                .await;
+            if attempt < MAX_FIRST_BUILD_ATTEMPTS {
+                // Below the limit: the circle is still there, retrying.
+                assert_eq!(handle.get(&viewer).unwrap().state, CircleState::BuildingD1);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        assert!(handle.get(&viewer).is_none(), "the viewer was removed after repeated failures");
+        assert!(store.viewer_load_all().unwrap().is_empty(), "the viewers row was deleted");
+        assert!(queue.try_pop().is_none(), "no job is queued during the cooldown");
+        assert_eq!(*source.calls.lock().unwrap(), MAX_FIRST_BUILD_ATTEMPTS);
     }
 
     #[tokio::test]

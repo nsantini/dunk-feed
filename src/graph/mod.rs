@@ -96,6 +96,11 @@ pub struct GraphHandle {
     /// The unix second [`Self::warn_at_cap`] last logged its one-per-minute
     /// warning at (BC6a). `None` until the first time the cap is hit.
     cap_warned_at: Mutex<Option<i64>>,
+    /// A viewer the worker gave up on (review round 1, defect W), mapped to
+    /// the unix second [`Self::enqueue_first_build`] may start a new first
+    /// build for it again. A viewer with no entry here has never been given
+    /// up on.
+    cooldowns: Mutex<HashMap<ViewerDid, i64>>,
 }
 
 /// The cap warning's cooldown (BC6a): "at most once per minute".
@@ -111,6 +116,7 @@ impl GraphHandle {
             max_viewers,
             touches: Mutex::new(HashMap::new()),
             cap_warned_at: Mutex::new(None),
+            cooldowns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -169,6 +175,17 @@ impl GraphHandle {
     /// `max_viewers` circles (BC6a). `now` is the unix second the request
     /// arrived, used only to rate-limit the cap warning.
     pub fn enqueue_first_build(&self, viewer: ViewerDid, now: i64) {
+        {
+            // Defect W: a viewer the worker gave up on gets no new circle
+            // and no job until its cooldown has passed, even though it has
+            // no entry in `circles` any more.
+            let cooldowns = self.cooldowns.lock().expect("GraphHandle cooldowns mutex poisoned");
+            if let Some(&not_before) = cooldowns.get(&viewer) {
+                if now < not_before {
+                    return;
+                }
+            }
+        }
         let mut circles = self.circles.write().expect("GraphHandle circles mutex poisoned");
         if circles.contains_key(&viewer) {
             // BC5: a circle already exists — building or ready — so no
@@ -222,6 +239,24 @@ impl GraphHandle {
         circle.circle_version = version;
         circles.insert(viewer.clone(), Arc::new(circle));
         version
+    }
+
+    /// Removes `viewer`'s in-memory circle and starts a `cooldown_secs`
+    /// cooldown before [`Self::enqueue_first_build`] accepts a new job for
+    /// it (review round 1, defect W): the worker
+    /// (`graph::queue::process_job`) calls this after
+    /// `graph::queue::MAX_FIRST_BUILD_ATTEMPTS` failed attempts in a row,
+    /// freeing the slot `enqueue_first_build`'s `UPSTAGE_MAX_VIEWERS` cap
+    /// counts against. `pub(crate)` for the same reason
+    /// [`Self::insert_ready`] is: the worker, in `graph::queue`, is the only
+    /// production caller, but this module's own tests exercise it directly
+    /// too.
+    pub(crate) fn remove_after_giving_up(&self, viewer: &ViewerDid, now: i64, cooldown_secs: i64) {
+        self.circles.write().expect("GraphHandle circles mutex poisoned").remove(viewer);
+        self.cooldowns
+            .lock()
+            .expect("GraphHandle cooldowns mutex poisoned")
+            .insert(viewer.clone(), now + cooldown_secs);
     }
 
     /// Records `viewer`'s latest request time in memory (BC23). The
@@ -357,6 +392,41 @@ mod tests {
         // with whatever `last_request_at` was recorded most recently.
         handle.record_touch(&viewer, 1_040);
         assert_eq!(handle.due_flushes(1_071, 60), vec![(viewer, 1_040)]);
+    }
+
+    #[test]
+    fn remove_after_giving_up_frees_the_slot_immediately() {
+        // Defect W: removal drops the circle right away, so a different
+        // viewer can take its `UPSTAGE_MAX_VIEWERS` slot at once, even
+        // while the removed viewer's own cooldown is still running.
+        let handle = GraphHandle::new(1);
+        let viewer = ViewerDid("did:plc:a".to_string());
+        handle.enqueue_first_build(viewer.clone(), 1_000);
+        assert!(handle.get(&viewer).is_some());
+
+        handle.remove_after_giving_up(&viewer, 1_000, 3_600);
+        assert!(handle.get(&viewer).is_none());
+
+        let other = ViewerDid("did:plc:b".to_string());
+        handle.enqueue_first_build(other.clone(), 1_000);
+        assert!(handle.get(&other).is_some(), "the freed slot took the new viewer");
+    }
+
+    #[test]
+    fn enqueue_after_giving_up_is_blocked_until_the_cooldown_expires() {
+        // Defect W: `enqueue_first_build` refuses a new job for a viewer the
+        // worker gave up on until its cooldown has passed, then behaves as
+        // if the viewer were new.
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:a".to_string());
+        handle.enqueue_first_build(viewer.clone(), 1_000);
+        handle.remove_after_giving_up(&viewer, 1_000, 3_600);
+
+        handle.enqueue_first_build(viewer.clone(), 1_000 + 3_600 - 1);
+        assert!(handle.get(&viewer).is_none(), "still cooling down");
+
+        handle.enqueue_first_build(viewer.clone(), 1_000 + 3_600);
+        assert!(handle.get(&viewer).is_some(), "cooldown has expired");
     }
 
     fn migrated_store() -> Store {

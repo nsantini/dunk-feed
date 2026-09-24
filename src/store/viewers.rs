@@ -64,6 +64,13 @@ fn parse_d2_sample(text: &str) -> Result<Vec<String>, StoreError> {
 /// queries rather than a join, so a viewer with zero follows still gets a
 /// row with an empty `follows` set instead of being silently dropped by an
 /// inner join.
+///
+/// A row whose `d2_sample` fails to parse is skipped rather than failing the
+/// whole load (review round 1, defect Y): this binary is the only writer, so
+/// a malformed row can only be a partial write from an earlier crash, and
+/// one bad row must not make `GraphHandle::from_store` lose every other
+/// viewer's circle. One `warn` names the failing table and column, never the
+/// viewer DID (BC21).
 pub fn viewer_load_all(conn: &Connection) -> Result<Vec<ViewerRow>, StoreError> {
     let mut follows_by_viewer: HashMap<String, HashSet<u64>> = HashMap::new();
     {
@@ -93,7 +100,13 @@ pub fn viewer_load_all(conn: &Connection) -> Result<Vec<ViewerRow>, StoreError> 
     let mut out = Vec::new();
     for row in mapped {
         let (viewer_did, first_seen_at, last_request_at, d1_refreshed_at, state, d2_sample) = row?;
-        let d2_sample = parse_d2_sample(&d2_sample)?;
+        let d2_sample = match parse_d2_sample(&d2_sample) {
+            Ok(d2_sample) => d2_sample,
+            Err(err) => {
+                tracing::warn!(?err, "store: skipping a malformed viewers row");
+                continue;
+            }
+        };
         let follows = follows_by_viewer.remove(&viewer_did).unwrap_or_default();
         out.push(ViewerRow {
             viewer_did,
@@ -339,23 +352,21 @@ mod tests {
         }
     }
 
+    // Review round 1, defect Y: a malformed `d2_sample` must not fail the
+    // whole load — it is skipped, and every other row still comes back.
     #[test]
-    fn malformed_d2_sample_is_a_malformed_row_error() {
+    fn viewer_load_all_skips_a_malformed_row_and_keeps_the_rest() {
         let conn = migrated_conn();
+        viewer_save_state(&conn, "did:plc:good", "building_d1", 1_700_000_000).unwrap();
         conn.execute(
             "INSERT INTO viewers (viewer_did, first_seen_at, last_request_at, state, d2_sample)
-             VALUES ('did:plc:a', 1, 1, 'ready', 'not-json')",
+             VALUES ('did:plc:bad', 1, 1, 'ready', 'not-json')",
             [],
         )
         .unwrap();
 
-        let err = viewer_load_all(&conn).unwrap_err();
-        match err {
-            StoreError::MalformedRow { table, column } => {
-                assert_eq!(table, "viewers");
-                assert_eq!(column, "d2_sample");
-            }
-            other => panic!("expected MalformedRow, got {other:?}"),
-        }
+        let rows = viewer_load_all(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].viewer_did, "did:plc:good");
     }
 }
