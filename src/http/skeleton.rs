@@ -699,7 +699,7 @@ mod tests {
         assert!(json.get("cursor").is_none());
         assert_eq!(
             rx.try_recv(),
-            Ok(crate::auth::ResolveRequest::Miss(did.to_string())),
+            Ok(crate::auth::ResolveRequest::Miss { did: did.to_string(), token: token.clone() }),
             "a cache miss must enqueue a Miss for the resolver"
         );
     }

@@ -40,20 +40,35 @@ pub struct AuthConfig {
 }
 
 /// A DID resolved and verified from a request's bearer token (BC12). Any
-/// `#` fragment on the token's `iss` was already removed (BC8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `#` fragment on the token's `iss` was already removed (BC8). `Hash` so
+/// `graph::GraphHandle` (slice 2.0) can key its circle map and its
+/// touch-flush snapshot on it directly.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ViewerDid(pub String);
 
 /// A DID sent to the resolver task (`did.rs`, slice 2.0) over the bounded
-/// channel. `Miss` is a DID the cache has never held a key for (BC9);
-/// `Refetch` is a DID whose cached key is stale (BC14) or just failed to
-/// verify a signature (BC11) — the resolver treats both the same way,
-/// fetching the DID document again because the key can rotate.
+/// channel. `Miss` is a DID the cache has never held a key for (BC9) and
+/// carries the request's raw token alongside it (BC22): once the resolver
+/// caches a key for it, it re-verifies this same token and, on `Ok`, calls
+/// the optional first-build hook — an unsigned or forged token can never
+/// ride a real DID's successful key fetch into a build. `Refetch` is a DID
+/// whose cached key is stale (BC14) or just failed to verify a signature
+/// (BC11) — the resolver treats both the same way, fetching the DID
+/// document again because the key can rotate; a stale-key path never needs
+/// a first build (the viewer's circle, if any, already exists), so it
+/// carries no token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveRequest {
-    Miss(String),
+    Miss { did: String, token: String },
     Refetch(String),
 }
+
+/// A hook the resolver (`did.rs`) calls after a `Miss`'s carried token
+/// re-verifies against the freshly cached key (BC22). `run` wires this to
+/// `graph::GraphHandle::enqueue_first_build` once the graph subsystem has
+/// started; `None` when it has not (BC18), so the resolver runs the same
+/// whether or not a graph exists.
+pub type FirstBuildHook = std::sync::Arc<dyn Fn(ViewerDid) + Send + Sync>;
 
 /// Every way `verify` can reject a request. The handler
 /// (`src/http/skeleton.rs`, slice 3.0) turns every variant into the same
@@ -93,17 +108,21 @@ const RESOLVER_CHANNEL_CAPACITY: usize = 1024;
 /// spawned on its own (unsupervised) task: `run` (`src/ingest/mod.rs`)
 /// calls this only when `UPSTAGE_PERSONALISE` is `true` (BC1), and never
 /// again for the life of the process. `max_entries` is `2 *
-/// UPSTAGE_MAX_VIEWERS` (BC16), computed by the caller. The returned
-/// `Sender` and `KeyCache` go into `http::AuthHandle`.
+/// UPSTAGE_MAX_VIEWERS` (BC16), computed by the caller. `first_build_hook`
+/// is `Some` only once the graph subsystem has started (BC18, BC22); the
+/// resolver runs the same either way. The returned `Sender` and `KeyCache`
+/// go into `http::AuthHandle`.
 pub fn spawn_resolver(
     plc_url: String,
     max_entries: usize,
+    auth_cfg: AuthConfig,
+    first_build_hook: Option<FirstBuildHook>,
 ) -> (mpsc::Sender<ResolveRequest>, std::sync::Arc<KeyCache>) {
     let cache = std::sync::Arc::new(KeyCache::new(max_entries));
     let (tx, rx) = mpsc::channel(RESOLVER_CHANNEL_CAPACITY);
     let fetcher = did::HttpDidFetcher::new(plc_url);
     let resolver_cache = std::sync::Arc::clone(&cache);
-    tokio::spawn(did::run_resolver(rx, fetcher, resolver_cache));
+    tokio::spawn(did::run_resolver(rx, fetcher, resolver_cache, auth_cfg, first_build_hook));
     (tx, cache)
 }
 
@@ -183,7 +202,12 @@ pub fn verify(
             // dropped send does not lock the DID out until the cooldown
             // would otherwise allow another attempt.
             if cache.should_send_miss(&checked.viewer_did, now)
-                && resolver_tx.try_send(ResolveRequest::Miss(checked.viewer_did.clone())).is_err()
+                && resolver_tx
+                    .try_send(ResolveRequest::Miss {
+                        did: checked.viewer_did.clone(),
+                        token: token.to_string(),
+                    })
+                    .is_err()
             {
                 cache.miss_send_dropped(&checked.viewer_did);
             }
@@ -202,6 +226,28 @@ pub fn verify(
             Err(err)
         }
     }
+}
+
+/// Re-verifies `token` against `cache` without a resolver channel to send
+/// to (BC22): `did.rs`'s resolver calls this right after caching a freshly
+/// fetched key for a `Miss`, so an unsigned or forged token can never ride
+/// a real DID's successful key fetch into a `FirstBuildHook` call. A
+/// `Missing` cache lookup here is simply a failure — there is nothing
+/// further this function can enqueue on its own, unlike `verify`'s handling
+/// of the same case.
+pub(crate) fn verify_no_resolve(
+    token: &str,
+    now: i64,
+    cache: &KeyCache,
+    cfg: &AuthConfig,
+) -> Result<ViewerDid, AuthError> {
+    let checked = jwt::check(token, now, &cfg.service_did)?;
+    let key = match cache.get(&checked.viewer_did, now) {
+        did::Lookup::Fresh(key) | did::Lookup::Stale(key) => key,
+        did::Lookup::Missing => return Err(AuthError::KeyUnknown),
+    };
+    keys::verify(&key, checked.alg, &checked.signing_input, &checked.signature)?;
+    Ok(ViewerDid(checked.viewer_did))
 }
 
 #[cfg(test)]
@@ -441,7 +487,10 @@ mod tests {
         let did = "did:plc:dddddddddddddddddddddddd";
         let token = sign_token(did, "ES256K", 60, |_msg| vec![0u8; 64]);
         assert_eq!(verify(&token, NOW, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
-        assert_eq!(rx.try_recv(), Ok(ResolveRequest::Miss(did.to_string())));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ResolveRequest::Miss { did: did.to_string(), token: token.clone() })
+        );
     }
 
     #[test]
@@ -455,21 +504,31 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(1);
         // Fill the channel so the next `try_send` fails with `Full`.
-        tx.try_send(ResolveRequest::Miss("did:plc:filler0000000000000".to_string())).unwrap();
+        tx.try_send(ResolveRequest::Miss {
+            did: "did:plc:filler0000000000000".to_string(),
+            token: "filler-token".to_string(),
+        })
+        .unwrap();
 
         assert_eq!(verify(&token, NOW, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
         // The filler was the only thing enqueued; our DID's send was
         // dropped because the channel was full.
         assert_eq!(
             rx.try_recv(),
-            Ok(ResolveRequest::Miss("did:plc:filler0000000000000".to_string()))
+            Ok(ResolveRequest::Miss {
+                did: "did:plc:filler0000000000000".to_string(),
+                token: "filler-token".to_string(),
+            })
         );
         assert!(rx.try_recv().is_err(), "the dropped Miss must not have been queued");
 
         // The channel now has room. A later request for the same DID must
         // enqueue it again at once, not wait out the hourly cooldown.
         assert_eq!(verify(&token, NOW + 1, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
-        assert_eq!(rx.try_recv(), Ok(ResolveRequest::Miss(did.to_string())));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ResolveRequest::Miss { did: did.to_string(), token: token.clone() })
+        );
     }
 
     #[test]
@@ -484,7 +543,10 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(verify(&token, NOW, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
         }
-        assert_eq!(rx.try_recv(), Ok(ResolveRequest::Miss(did.to_string())));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ResolveRequest::Miss { did: did.to_string(), token: token.clone() })
+        );
         assert!(rx.try_recv().is_err(), "only one Miss should have been enqueued");
     }
 
