@@ -114,6 +114,22 @@ pub struct AppState {
     pub writer: WriterHandle,
     pub health: HealthState,
     pub cfg: HttpConfig,
+    /// The viewer graph index (network-feed story 06, slice 4.0):
+    /// `skeleton::handler`'s personalised branch reads it to find a
+    /// viewer's circle and to enqueue a first build (BC4). `None` when
+    /// `cfg.personalise` is `false`, or when it is `true` but the graph
+    /// subsystem never started (`ingest::start_graph_subsystem`, BC18) —
+    /// either way, a verified viewer just gets the empty page (BC5, BC6a
+    /// empty-page case).
+    pub graph: Option<Arc<crate::graph::GraphHandle>>,
+    /// The per-viewer feed list cache (`http::viewer`, slice 3.0):
+    /// `skeleton::handler`'s personalised branch calls `list_for` on every
+    /// request. `Arc`-shared, not owned outright, because `run`
+    /// (`src/ingest/mod.rs`, slice 4.0) also clones it into the worker's
+    /// drop-lists callback (`graph::queue::DropListsFn`), which calls
+    /// `drop_viewer` once a circle changes (BC7) from a task that outlives
+    /// any single request and never holds this `AppState` itself.
+    pub viewer_lists: Arc<crate::http::viewer::ViewerLists>,
 }
 
 /// Every way `serve` can fail. `run` (`src/ingest/mod.rs`) wraps this as
@@ -237,6 +253,8 @@ mod tests {
             writer,
             health: HealthState::new(),
             cfg: HttpConfig::from(&cfg),
+            graph: None,
+            viewer_lists: Arc::new(crate::http::viewer::ViewerLists::new()),
         })
     }
 
@@ -256,6 +274,34 @@ mod tests {
             writer,
             health: HealthState::new(),
             cfg: http_cfg,
+            graph: None,
+            viewer_lists: Arc::new(crate::http::viewer::ViewerLists::new()),
+        })
+    }
+
+    /// Like [`test_state_with_auth`], but with `graph` attached
+    /// (`skeleton::tests::first_open_empty_fast`, `foreign_cursor`,
+    /// `circle_change_mid_scroll`, network-feed story 06, slice 4.0): a
+    /// verified viewer's personalised requests are then served through
+    /// this `GraphHandle` and a fresh `ViewerLists`, exactly the shape
+    /// `run` (`src/ingest/mod.rs`) attaches when the graph subsystem
+    /// starts (BC18, BC19).
+    pub(crate) fn test_state_with_graph(
+        cfg: Config,
+        auth: AuthHandle,
+        graph: Arc<crate::graph::GraphHandle>,
+    ) -> Arc<AppState> {
+        let store = crate::store::Store::open_memory().expect("in-memory store must open");
+        let writer = store.writer().expect("writer thread must start");
+        let mut http_cfg = HttpConfig::from(&cfg);
+        http_cfg.auth = Some(auth);
+        Arc::new(AppState {
+            snapshot: SnapshotHandle::new(),
+            writer,
+            health: HealthState::new(),
+            cfg: http_cfg,
+            graph: Some(graph),
+            viewer_lists: Arc::new(crate::http::viewer::ViewerLists::new()),
         })
     }
 

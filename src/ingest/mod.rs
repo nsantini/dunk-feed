@@ -816,15 +816,20 @@ async fn wait_for_shutdown_signal() {
 /// Starts the graph subsystem — a second `Store` connection, the
 /// `GraphHandle` loaded from it (BC19), the worker task and the touch-flush
 /// task (network-feed story 06) — when `cfg.bsky_handle` and
-/// `cfg.bsky_app_password` are both set, and returns the hook `run` wires
-/// into the resolver so a verified viewer with no circle gets a first build
-/// (BC22). Returns `None`, logging one `error` line, when either credential
-/// is missing (BC18) or any step here fails: `run` itself never fails over
-/// this, since a verified viewer just keeps getting empty pages either way.
-/// `drop_lists` is `None` for now — `src/http/viewer.rs` (slice 3.0) has no
-/// `ViewerLists` yet for the worker to drop entries from; slice 4.0's `run`
-/// wiring passes one.
-fn start_graph_subsystem(cfg: &Config) -> Option<crate::auth::FirstBuildHook> {
+/// `cfg.bsky_app_password` are both set. Returns the loaded `GraphHandle`
+/// (slice 4.0: `run` attaches it to `AppState::graph`, BC4) alongside the
+/// hook `run` wires into the resolver so a verified viewer with no circle
+/// gets a first build (BC22). Returns `None`, logging one `error` line,
+/// when either credential is missing (BC18) or any step here fails: `run`
+/// itself never fails over this, since a verified viewer just keeps
+/// getting empty pages either way (BC4's "no graph" case).
+/// `viewer_lists` is cloned into the worker's drop-lists callback
+/// (`graph::queue::DropListsFn`), so a freshly built circle's cached list
+/// is dropped the moment it swaps in (BC7).
+fn start_graph_subsystem(
+    cfg: &Config,
+    viewer_lists: std::sync::Arc<crate::http::viewer::ViewerLists>,
+) -> Option<(std::sync::Arc<crate::graph::GraphHandle>, crate::auth::FirstBuildHook)> {
     let (handle, app_password) = match (&cfg.bsky_handle, &cfg.bsky_app_password) {
         (Some(handle), Some(app_password)) => (handle.clone(), app_password.clone()),
         _ => {
@@ -863,6 +868,16 @@ fn start_graph_subsystem(cfg: &Config) -> Option<crate::auth::FirstBuildHook> {
     };
 
     let d2_sample_size = cfg.d2_follows_sample as usize;
+    // BC7: dropping a viewer's cached lists the moment the worker swaps in
+    // a fresh circle, so the next request rebuilds against it rather than
+    // serving a list filtered against the one it just replaced.
+    let drop_lists: crate::graph::DropListsFn = {
+        let viewer_lists = std::sync::Arc::clone(&viewer_lists);
+        std::sync::Arc::new(move |viewer_did: &str| {
+            viewer_lists.drop_viewer(&crate::auth::ViewerDid(viewer_did.to_string()));
+        })
+    };
+
     let worker_handle = std::sync::Arc::clone(&graph_handle);
     let worker_store = graph_store.clone();
     tokio::spawn(crate::graph::run_worker(
@@ -870,7 +885,7 @@ fn start_graph_subsystem(cfg: &Config) -> Option<crate::auth::FirstBuildHook> {
         worker_store,
         pds_client,
         d2_sample_size,
-        None,
+        Some(drop_lists),
     ));
 
     let flush_handle = std::sync::Arc::clone(&graph_handle);
@@ -878,9 +893,11 @@ fn start_graph_subsystem(cfg: &Config) -> Option<crate::auth::FirstBuildHook> {
     tokio::spawn(crate::graph::run_touch_flush(flush_handle, flush_store));
 
     let hook_handle = std::sync::Arc::clone(&graph_handle);
-    Some(std::sync::Arc::new(move |viewer: crate::auth::ViewerDid| {
-        hook_handle.enqueue_first_build(viewer, crate::store::unix_now());
-    }))
+    let hook: crate::auth::FirstBuildHook =
+        std::sync::Arc::new(move |viewer: crate::auth::ViewerDid| {
+            hook_handle.enqueue_first_build(viewer, crate::store::unix_now());
+        });
+    Some((graph_handle, hook))
 }
 
 /// `upstage run`'s entry point, TECH-DESIGN section 5.1 end to end: opens
@@ -993,14 +1010,23 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
     // carries `None` otherwise, and `skeleton::handler` never reads
     // `Authorization` in that case either.
     let mut http_config = crate::http::HttpConfig::from(cfg);
+    // network-feed story 06, slice 4.0: the per-viewer list cache is built
+    // unconditionally (cheap, empty until a request or a worker save
+    // touches it) so `AppState::viewer_lists` always has one to hand out,
+    // whether or not the graph subsystem below ever starts.
+    let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+    let mut graph_handle: Option<std::sync::Arc<crate::graph::GraphHandle>> = None;
     if cfg.personalise {
         let auth_cfg = crate::auth::AuthConfig { service_did: cfg.service_did.clone() };
         // network-feed story 06: the graph subsystem (a second `Store`
         // connection, the in-memory `GraphHandle`, the worker and the
         // touch-flush task) starts only when credentials exist too (BC18);
         // `first_build_hook` stays `None` otherwise, so the resolver task
-        // below runs the same either way.
-        let first_build_hook = start_graph_subsystem(cfg);
+        // below runs the same either way, and `graph_handle` stays `None`
+        // (BC4's "no graph" case: verified viewers get empty pages).
+        let subsystem = start_graph_subsystem(cfg, std::sync::Arc::clone(&viewer_lists));
+        let first_build_hook = subsystem.as_ref().map(|(_, hook)| std::sync::Arc::clone(hook));
+        graph_handle = subsystem.map(|(handle, _)| handle);
 
         let (resolver_tx, cache) = crate::auth::spawn_resolver(
             cfg.plc_url.clone(),
@@ -1015,6 +1041,8 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
         writer: writer.clone(),
         health: liveness,
         cfg: http_config,
+        graph: graph_handle,
+        viewer_lists,
     });
     let http_handle: tokio::task::JoinHandle<Result<(), IngestError>> = tokio::spawn(async move {
         crate::http::serve(&http_cfg, http_state, http_shutdown_rx).await.map_err(IngestError::Http)
@@ -2708,7 +2736,8 @@ mod tests {
         // and the caller gets no hook to wire into the resolver.
         let cfg = test_config();
         assert!(cfg.bsky_handle.is_none());
-        assert!(start_graph_subsystem(&cfg).is_none());
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+        assert!(start_graph_subsystem(&cfg, viewer_lists).is_none());
     }
 
     #[tokio::test]
@@ -2719,8 +2748,9 @@ mod tests {
         let path = temp_db_path("start-graph");
         let cfg = test_config_with_graph(&path);
 
-        let hook = start_graph_subsystem(&cfg);
-        assert!(hook.is_some(), "credentials present: a first-build hook must come back");
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+        let subsystem = start_graph_subsystem(&cfg, viewer_lists);
+        assert!(subsystem.is_some(), "credentials present: a graph handle and hook must come back");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));
@@ -2743,8 +2773,9 @@ mod tests {
         }
         let cfg = test_config_with_graph(&path);
 
-        let hook = start_graph_subsystem(&cfg);
-        assert!(hook.is_some());
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+        let subsystem = start_graph_subsystem(&cfg, viewer_lists);
+        assert!(subsystem.is_some());
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));

@@ -85,18 +85,91 @@ pub fn decode(cursor: &str) -> Result<(u64, usize, f64, String), CursorError> {
 
     let generation: u64 = generation_field.parse().map_err(|_| CursorError::BadGeneration)?;
     let index: usize = index_field.parse().map_err(|_| CursorError::BadIndex)?;
-
-    if rank_field.len() != 16 || !rank_field.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(CursorError::BadRankField);
-    }
-    let bits = u64::from_str_radix(rank_field, 16).map_err(|_| CursorError::BadRankField)?;
-    let rank = f64::from_bits(bits);
+    let rank = parse_rank_field(rank_field)?;
 
     if cid.is_empty() {
         return Err(CursorError::EmptyCid);
     }
 
     Ok((generation, index, rank, cid.to_string()))
+}
+
+/// Parses the 16-hex-digit rank field both `decode` and `decode_personal`
+/// share, so the exact-bits round trip (BC31) is implemented once.
+fn parse_rank_field(rank_field: &str) -> Result<f64, CursorError> {
+    if rank_field.len() != 16 || !rank_field.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(CursorError::BadRankField);
+    }
+    let bits = u64::from_str_radix(rank_field, 16).map_err(|_| CursorError::BadRankField)?;
+    Ok(f64::from_bits(bits))
+}
+
+/// `decode_personal`'s return shape: `(generation, circle_version, index,
+/// rank, cid)`. `circle_version` is `None` for a plain four-field cursor
+/// (BC17a) and `Some` for the five-field `encode_personal` shape (BC14). A
+/// named alias, not the bare tuple, so clippy's `type_complexity` lint
+/// stays quiet and every reader — this module and `src/http/skeleton.rs`
+/// alike — sees one name for the same five fields.
+pub type PersonalCursor = (u64, Option<u64>, usize, f64, String);
+
+/// Encodes the personalised cursor (spec.md `## Approach`, slice 4.0):
+/// `generation ":" circle_version ":" index ":" rank_bits_hex ":"
+/// quote_cid`. The fifth field, `circle_version`, pins the viewer's per-
+/// generation, per-circle-version list (`http::viewer::ViewerLists`,
+/// BC13), so `src/http/skeleton.rs`'s personalised path can tell "the same
+/// list that served the last page" (BC14, an O(1) resume) from "the circle
+/// changed since" (BC16, BC17) exactly the way `encode`/`decode`'s
+/// `generation` field already tells one scorer pass from another on the
+/// global path.
+pub fn encode_personal(
+    generation: u64,
+    circle_version: u64,
+    index: usize,
+    rank: f64,
+    cid: &str,
+) -> String {
+    let raw = format!("{generation}:{circle_version}:{index}:{:016x}:{cid}", rank.to_bits());
+    URL_SAFE_NO_PAD.encode(raw.as_bytes())
+}
+
+/// Decodes a cursor on the personalised path (BC17a, BC17b): accepts either
+/// the plain four-field `encode` shape (`circle_version` comes back `None`,
+/// so BC17's cid-then-rank scan applies) or the five-field `encode_personal`
+/// shape (`circle_version` comes back `Some`, enabling BC14's O(1) resume).
+/// Anything but exactly four or five `:`-separated fields is
+/// `WrongFieldCount`, the same error `decode`'s own field-count check
+/// raises, since both are "this cursor is not shaped like anything this
+/// server ever issued".
+pub fn decode_personal(cursor: &str) -> Result<PersonalCursor, CursorError> {
+    let raw = URL_SAFE_NO_PAD.decode(cursor.as_bytes()).map_err(|_| CursorError::Base64)?;
+    let text = String::from_utf8(raw).map_err(|_| CursorError::Utf8)?;
+
+    let parts: Vec<&str> = text.split(':').collect();
+    match parts.as_slice() {
+        [generation_field, index_field, rank_field, cid] => {
+            let generation: u64 =
+                generation_field.parse().map_err(|_| CursorError::BadGeneration)?;
+            let index: usize = index_field.parse().map_err(|_| CursorError::BadIndex)?;
+            let rank = parse_rank_field(rank_field)?;
+            if cid.is_empty() {
+                return Err(CursorError::EmptyCid);
+            }
+            Ok((generation, None, index, rank, cid.to_string()))
+        }
+        [generation_field, circle_version_field, index_field, rank_field, cid] => {
+            let generation: u64 =
+                generation_field.parse().map_err(|_| CursorError::BadGeneration)?;
+            let circle_version: u64 =
+                circle_version_field.parse().map_err(|_| CursorError::BadGeneration)?;
+            let index: usize = index_field.parse().map_err(|_| CursorError::BadIndex)?;
+            let rank = parse_rank_field(rank_field)?;
+            if cid.is_empty() {
+                return Err(CursorError::EmptyCid);
+            }
+            Ok((generation, Some(circle_version), index, rank, cid.to_string()))
+        }
+        _ => Err(CursorError::WrongFieldCount),
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +289,48 @@ mod tests {
         let raw = format!("1:2:{}:", "0".repeat(16));
         let encoded = URL_SAFE_NO_PAD.encode(raw.as_bytes());
         assert_eq!(decode(&encoded), Err(CursorError::EmptyCid));
+    }
+
+    // 4.1: the five-field personalised codec round-trips, carrying
+    // `circle_version` as `Some`.
+    #[test]
+    fn personal_round_trip() {
+        let encoded = encode_personal(7, 3, 42, 1.5, "bafyabc123");
+        let decoded = decode_personal(&encoded).expect("round trip should decode");
+        assert_eq!(decoded, (7, Some(3), 42, 1.5, "bafyabc123".to_string()));
+    }
+
+    // BC17a: a four-field cursor (the global `encode`'s own shape) is still
+    // accepted on the personalised path, with `circle_version` coming back
+    // `None` so BC17's cid-then-rank scan applies.
+    #[test]
+    fn personal_decode_accepts_four_field_cursor() {
+        let four_field = encode(7, 42, 1.5, "bafyabc123");
+        let decoded = decode_personal(&four_field).expect("a plain four-field cursor must decode");
+        assert_eq!(decoded, (7, None, 42, 1.5, "bafyabc123".to_string()));
+    }
+
+    // BC17b: a malformed cursor on the personalised path fails the same way
+    // `decode` does on the global path.
+    #[test]
+    fn personal_decode_fails_on_wrong_field_count() {
+        let raw = format!("1:2:{}:cid:extra:extra2", "0".repeat(16));
+        let encoded = URL_SAFE_NO_PAD.encode(raw.as_bytes());
+        assert_eq!(decode_personal(&encoded), Err(CursorError::WrongFieldCount));
+
+        let too_few = URL_SAFE_NO_PAD.encode(b"1:2:3");
+        assert_eq!(decode_personal(&too_few), Err(CursorError::WrongFieldCount));
+    }
+
+    #[test]
+    fn personal_decode_fails_not_base64() {
+        assert_eq!(decode_personal("not valid base64!!! ###"), Err(CursorError::Base64));
+    }
+
+    #[test]
+    fn personal_decode_fails_bad_circle_version() {
+        let raw = format!("1:abc:2:{}:cid", "0".repeat(16));
+        let encoded = URL_SAFE_NO_PAD.encode(raw.as_bytes());
+        assert_eq!(decode_personal(&encoded), Err(CursorError::BadGeneration));
     }
 }

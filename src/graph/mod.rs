@@ -21,7 +21,7 @@ pub mod circle;
 pub mod filter;
 
 pub use circle::Circle;
-pub use queue::{run_touch_flush, run_worker, JobQueue};
+pub use queue::{run_touch_flush, run_worker, DropListsFn, JobQueue};
 
 /// A DID's `xxh3_64` hash, kept in place of the DID string wherever a
 /// `Circle` or the connection filter only needs to compare, not print, an
@@ -206,7 +206,16 @@ impl GraphHandle {
     /// before (or to 1, for a viewer with no prior entry), and installs the
     /// new `Arc`. Returns the new version, so the caller (the worker) can
     /// pass it to the drop-lists callback if it ever needs to.
-    fn insert_ready(&self, viewer: &ViewerDid, mut circle: Circle) -> u64 {
+    ///
+    /// `pub(crate)`, not private: `src/http/skeleton.rs` (slice 4.0,
+    /// `circle_change_mid_scroll`, BC16) is outside `graph::`'s own module
+    /// tree and has no other way to simulate a worker's second save at a
+    /// fixed snapshot generation — story 06 ships no refresh trigger yet
+    /// (spec.md `## Non-goals`), so a test is the only caller besides
+    /// `graph::queue::process_job`. A mechanical ripple, the same kind
+    /// `spec.md`'s `## Defaults taken` already records for slice 2.0's
+    /// one-line `src/http/skeleton.rs` edit.
+    pub(crate) fn insert_ready(&self, viewer: &ViewerDid, mut circle: Circle) -> u64 {
         let mut circles = self.circles.write().expect("GraphHandle circles mutex poisoned");
         let version = circles.get(viewer).map(|c| c.circle_version + 1).unwrap_or(1);
         circle.state = CircleState::Ready;
