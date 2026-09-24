@@ -18,6 +18,7 @@
 pub mod authors;
 pub mod counts;
 pub mod feed;
+pub mod follows_cache;
 pub mod interactions;
 pub mod meta;
 pub mod pairs;
@@ -582,6 +583,30 @@ impl Store {
     ) -> Result<Vec<feed::FeedAuthors>, StoreError> {
         let conn = self.read_lock()?;
         feed::feed_authors_by_quote_uri(&conn, quote_uris)
+    }
+
+    /// Reads one `follows_cache` row (BC12, the restart preload;
+    /// `graph::cache::FollowsCache::get`'s SQLite fallback on a memory
+    /// miss, BC1b). `Ok(None)` when `account_did` has no row.
+    pub fn follows_get(
+        &self,
+        account_did: &str,
+    ) -> Result<Option<follows_cache::FollowsCacheRow>, StoreError> {
+        let conn = self.read_lock()?;
+        follows_cache::follows_get(&conn, account_did)
+    }
+
+    /// Inserts or replaces one `follows_cache` row (BC1, BC6b). Called by
+    /// step 3 (`graph::queue::run_step3`, slice 2.0) after each successful
+    /// `getFollows` fetch.
+    pub fn follows_put(
+        &self,
+        account_did: &str,
+        fetched_at: i64,
+        follows: &[u64],
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        follows_cache::follows_put(&conn, account_did, fetched_at, follows)
     }
 
     /// Starts the one writer thread with `WriterConfig::default()`

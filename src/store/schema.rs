@@ -70,7 +70,10 @@ const V1_STATEMENTS: &[&str] = &[
 /// Version 2's statements, TECH-DESIGN-network-feed §8. Story 06's
 /// Non-goals: `viewer_checks` and `follows_cache` are created empty in this
 /// story, with no reader or writer yet; `store/viewers.rs` reads and writes
-/// only `viewers` and `viewer_follows`. Hashes (`subject_hash`,
+/// only `viewers` and `viewer_follows`. Story 07 gives `viewer_checks` its
+/// reader and writer; story 08 does the same for `follows_cache`, in
+/// `store/follows_cache.rs`. No schema change either time: this table
+/// shape has been enough since story 06. Hashes (`subject_hash`,
 /// `author_hash`) are `xxh3_64` `DidHash` values reinterpreted as `i64` for
 /// SQLite's signed `INTEGER` storage (`as i64` between same-width integers
 /// is a lossless bit-for-bit cast, reversed on read with `as u64`), so a

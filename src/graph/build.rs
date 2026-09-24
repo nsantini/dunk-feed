@@ -194,26 +194,77 @@ pub async fn step_follows_me<S: GraphSource>(
     Ok(StepStats { calls, pages: calls, elapsed: start.elapsed() })
 }
 
-/// Step 3: for each account in `d2_sample` with no entry yet in `shared`,
-/// pages `get_follows` until `d2_follows_depth` raw DIDs are collected or the
-/// end is reached, truncates that raw list to exactly `d2_follows_depth`
-/// before hashing, sorting and deduplicating it, and stores the result in
-/// `shared` (BC4). Each page after the first requests only the DIDs still
-/// needed to reach the depth, never a full page of 100 when fewer remain
-/// (review round 1, defect B): a depth of 150 therefore makes one page of
-/// 100 and one of 50, and the stored list holds exactly 150 hashes, not the
-/// 200 the account may actually follow. An account already in `shared` costs
-/// no call. Each fetched page's DIDs are appended to `collected` before its
-/// next cursor is checked (review round 4, defect Q): a page is only ever
-/// fetched once, because each cursor is sent at most once, so a page that
-/// happens to repeat an earlier cursor is still the one fresh page for that
-/// cursor and its DIDs count toward the depth (subject to the truncation
-/// below, so this never lets an account exceed `d2_follows_depth`). Paging
-/// for one account stops when the page carries no DIDs, when its next cursor
-/// is `None`, or when that next cursor was already sent for this account
-/// (review round 2, defect J; review round 3, defect O widens the check from
-/// "the last cursor sent" to "any cursor sent so far", so a source whose
-/// cursor cycles through more than one earlier value is still bounded).
+/// Fetches one account's newest `depth` follows, hashed, sorted and
+/// deduplicated (BC1: "Hashes sorted and deduplicated"), plus the number of
+/// `get_follows` calls that took (for [`StepStats`] and [`step_degree2`]'s
+/// own call count). Shared by [`step_degree2`] below and
+/// `graph::queue::run_step3` (slice 2.0, story 08): `step_degree2` stops the
+/// whole step at the first `PdsError`, which story 08's worker step 3 cannot
+/// afford — one failed account must not block every other account in the
+/// same `d2_sample` (spec.md `## Approach`, Rejected: "call
+/// `step_degree2` as it is") — so both callers page through this one helper
+/// and decide for themselves what a single account's `Err` means, instead of
+/// one caller wrapping the other.
+///
+/// Each page after the first requests only the DIDs still needed to reach
+/// `depth`, never a full page of 100 when fewer remain (review round 1,
+/// defect B): a depth of 150 therefore makes one page of 100 and one of 50,
+/// and the returned list holds exactly 150 hashes, not the 200 the account
+/// may actually follow. Each fetched page's DIDs are appended to `collected`
+/// before its next cursor is checked (review round 4, defect Q): a page is
+/// only ever fetched once, because each cursor is sent at most once, so a
+/// page that happens to repeat an earlier cursor is still the one fresh page
+/// for that cursor and its DIDs count toward the depth (subject to the
+/// truncation below, so this never lets an account exceed `depth`). Paging
+/// stops when the page carries no DIDs, when its next cursor is `None`, or
+/// when that next cursor was already sent for this account (review round 2,
+/// defect J; review round 3, defect O widens the check from "the last cursor
+/// sent" to "any cursor sent so far", so a source whose cursor cycles
+/// through more than one earlier value is still bounded).
+pub async fn fetch_account_follows<S: GraphSource>(
+    source: &S,
+    account: &str,
+    depth: u32,
+) -> Result<(Vec<DidHash>, u32), PdsError> {
+    let depth = depth as usize;
+    let mut calls: u32 = 0;
+    let mut collected: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut sent_cursors: HashSet<String> = HashSet::new();
+    while collected.len() < depth {
+        let remaining = depth - collected.len();
+        let page_limit = remaining.min(100) as u32;
+        let sent_cursor = cursor.clone();
+        let page = source.get_follows(account, page_limit, cursor.take()).await?;
+        calls += 1;
+        let page_was_empty = page.dids.is_empty();
+        collected.extend(page.dids);
+        if let Some(c) = sent_cursor {
+            sent_cursors.insert(c);
+        }
+        if page_was_empty {
+            break;
+        }
+        let next_cursor = page.cursor;
+        match &next_cursor {
+            None => break,
+            Some(c) if sent_cursors.contains(c) => break,
+            Some(_) => {}
+        }
+        cursor = next_cursor;
+    }
+    collected.truncate(depth);
+    let mut hashed: Vec<DidHash> = collected.iter().map(|did| hash_did(did)).collect();
+    hashed.sort_unstable();
+    hashed.dedup();
+    Ok((hashed, calls))
+}
+
+/// Step 3, the probe's own path (`graph_probe::run_one_handle`), behaviour
+/// unchanged from before [`fetch_account_follows`] existed: for each account
+/// in `d2_sample` with no entry yet in `shared`, calls
+/// [`fetch_account_follows`] for `d2_follows_depth` and stores the result
+/// (BC4). An account already in `shared` costs no call.
 pub async fn step_degree2<S: GraphSource>(
     source: &S,
     d2_sample: &[String],
@@ -222,41 +273,14 @@ pub async fn step_degree2<S: GraphSource>(
 ) -> Result<StepStats, PdsError> {
     let start = Instant::now();
     let mut calls: u32 = 0;
-    let depth = d2_follows_depth as usize;
 
     for account in d2_sample {
         if shared.contains_key(account) {
             continue;
         }
-        let mut collected: Vec<String> = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut sent_cursors: HashSet<String> = HashSet::new();
-        while collected.len() < depth {
-            let remaining = depth - collected.len();
-            let page_limit = remaining.min(100) as u32;
-            let sent_cursor = cursor.clone();
-            let page = source.get_follows(account, page_limit, cursor.take()).await?;
-            calls += 1;
-            let page_was_empty = page.dids.is_empty();
-            collected.extend(page.dids);
-            if let Some(c) = sent_cursor {
-                sent_cursors.insert(c);
-            }
-            if page_was_empty {
-                break;
-            }
-            let next_cursor = page.cursor;
-            match &next_cursor {
-                None => break,
-                Some(c) if sent_cursors.contains(c) => break,
-                Some(_) => {}
-            }
-            cursor = next_cursor;
-        }
-        collected.truncate(depth);
-        let mut hashed: Vec<DidHash> = collected.iter().map(|did| hash_did(did)).collect();
-        hashed.sort_unstable();
-        hashed.dedup();
+        let (hashed, account_calls) =
+            fetch_account_follows(source, account, d2_follows_depth).await?;
+        calls += account_calls;
         shared.insert(account.clone(), hashed);
     }
 

@@ -26,9 +26,11 @@ pub struct Circle {
     pub checked: HashSet<DidHash>,
     pub d2_sample: Vec<String>,
     /// `building_d1` while step 1 is in flight or retrying, `building_fm`
-    /// once step 1 has saved and step 2 is in flight or retrying, `ready`
-    /// once step 2 has saved successfully or the worker gave up retrying it
-    /// (BC7, BC3, BC4b).
+    /// once step 1 has saved and step 2 is in flight or retrying,
+    /// `building_d2` once step 2 has saved successfully and step 3 is in
+    /// flight or was interrupted by a restart (story 08 BC5a, BC12a),
+    /// `ready` once step 3 has completed or the worker gave up retrying
+    /// step 2 (BC7, BC3, BC4b, story 08 BC5).
     pub state: CircleState,
     /// The last time a request touched this viewer, unix seconds (BC23).
     /// `0` until the first request or worker save sets it.

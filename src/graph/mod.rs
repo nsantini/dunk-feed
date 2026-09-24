@@ -17,9 +17,11 @@ pub use crate::auth::ViewerDid;
 use crate::store::{Store, StoreError};
 
 pub mod build;
+pub mod cache;
 pub mod circle;
 pub mod filter;
 
+pub use cache::FollowsCache;
 pub use circle::Circle;
 pub use queue::{run_touch_flush, run_worker, DropListsFn, JobQueue};
 
@@ -37,8 +39,7 @@ pub fn hash_did(did: &str) -> DidHash {
 }
 
 /// A `viewers.state` value (`store::viewers::ViewerRow::state`), design
-/// §8. Story 07 adds `BuildingFm`; `building_d2` is still story 08's to
-/// add.
+/// §8. Story 07 added `BuildingFm`; story 08 (this) adds `BuildingD2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CircleState {
     /// Step 1 is queued or running, or a prior attempt failed and is
@@ -51,9 +52,17 @@ pub enum CircleState {
     /// (BC3a, BC8, BC9a). `follows` and `d2_sample` are complete and safe
     /// to serve; `checked` and `follows_me` may be empty or partial.
     BuildingFm,
-    /// Step 2 has saved successfully at least once, or the worker gave up
-    /// retrying it without deleting the viewer (BC3, BC4b). `checked` and
-    /// `follows_me` may still be partial in the give-up case.
+    /// Step 2 has saved successfully at least once and step 3
+    /// (`graph::queue::run_step3`, story 08 spec.md BC5a, BC5c) is queued,
+    /// running, or was interrupted by a restart and re-enqueued (BC12a).
+    /// `follows`, `d2_sample`, `checked` and `follows_me` are all complete
+    /// and safe to serve; the shared `FollowsCache` may hold no entry yet,
+    /// a stale one, or the fresh one step 3 is building.
+    BuildingD2,
+    /// Step 2 has saved successfully at least once and step 3 has completed
+    /// too, or the worker gave up retrying step 2 without deleting the
+    /// viewer (BC3, BC4b, BC5). `checked` and `follows_me` may still be
+    /// partial in the step 2 give-up case.
     Ready,
 }
 
@@ -63,22 +72,25 @@ impl CircleState {
         match self {
             CircleState::BuildingD1 => "building_d1",
             CircleState::BuildingFm => "building_fm",
+            CircleState::BuildingD2 => "building_d2",
             CircleState::Ready => "ready",
         }
     }
 
     /// Parses a stored `viewers.state` value. Falls back to `BuildingD1`
-    /// for anything but exactly `"ready"` or `"building_fm"`, rather than
-    /// raising an error: an unrecognised state can only mean a build
-    /// attempt was interrupted before it finished (this binary is the only
-    /// writer), and treating it as still building step 1 safely
-    /// re-enqueues it (BC19) instead of failing the whole startup load over
-    /// one row.
+    /// for anything but exactly `"ready"`, `"building_fm"` or
+    /// `"building_d2"`, rather than raising an error: an unrecognised state
+    /// can only mean a build attempt was interrupted before it finished
+    /// (this binary is the only writer), and treating it as still building
+    /// step 1 safely re-enqueues it (BC19) instead of failing the whole
+    /// startup load over one row.
     fn from_store_str(state: &str) -> Self {
         if state == CircleState::Ready.as_str() {
             CircleState::Ready
         } else if state == CircleState::BuildingFm.as_str() {
             CircleState::BuildingFm
+        } else if state == CircleState::BuildingD2.as_str() {
+            CircleState::BuildingD2
         } else {
             CircleState::BuildingD1
         }
@@ -126,6 +138,11 @@ pub struct GraphHandle {
     /// The unix second [`Self::warn_at_cap`] last logged its one-per-minute
     /// warning at (BC6a). `None` until the first time the cap is hit.
     cap_warned_at: Mutex<Option<i64>>,
+    /// The one `FollowsCache` every viewer's degree-2 lookups share (story
+    /// 08 spec.md `## Approach`). Step 3 (`graph::queue::run_step3`, slice
+    /// 2.0) writes it; `http::viewer::build_list` (slice 3.0) reads it
+    /// through [`Self::follows_cache`].
+    follows_cache: Arc<FollowsCache>,
 }
 
 /// The cap warning's cooldown (BC6a): "at most once per minute".
@@ -141,28 +158,35 @@ impl GraphHandle {
             max_viewers,
             touches: Mutex::new(HashMap::new()),
             cap_warned_at: Mutex::new(None),
+            follows_cache: Arc::new(FollowsCache::new()),
         })
     }
 
     /// Loads every `viewers` row from `store` (BC19, BC9), builds a circle
     /// for each — `checked` and `follows_me` included (BC9) — and
-    /// re-enqueues a `FirstBuild` job for any row still in `building_d1` or
-    /// `building_fm`: a restart mid-build picks the job back up instead of
-    /// losing it, resuming at step 2 for a `building_fm` row (BC9a) rather
-    /// than repeating step 1. A `ready` row's step 2 retry, if one was
-    /// pending at the moment of the restart, is not resumed (spec.md
-    /// `## Defaults taken`): its data is already good enough to serve, and
-    /// a future refresh (story 09) is what reruns step 2 for it. Loaded
-    /// circles bypass the `UPSTAGE_MAX_VIEWERS` cap
-    /// [`Self::enqueue_first_build`] enforces: they already exist in
-    /// SQLite, so refusing to load one back into memory would silently
-    /// drop a viewer the store already accepted.
+    /// re-enqueues a `FirstBuild` job for any row still in `building_d1`,
+    /// `building_fm` or `building_d2` (story 08 BC12a): a restart mid-build
+    /// picks the job back up instead of losing it, resuming at step 2 for a
+    /// `building_fm` row (BC9a) or at step 3 only for a `building_d2` row
+    /// (`graph::queue::process_job`'s BC5c routing), rather than repeating
+    /// earlier steps. A `ready` row's step 2 retry, if one was pending at
+    /// the moment of the restart, is not resumed (spec.md `## Defaults
+    /// taken`): its data is already good enough to serve, and a future
+    /// refresh (story 09) is what reruns step 2 for it. Loaded circles
+    /// bypass the `UPSTAGE_MAX_VIEWERS` cap [`Self::enqueue_first_build`]
+    /// enforces: they already exist in SQLite, so refusing to load one back
+    /// into memory would silently drop a viewer the store already accepted.
+    /// Also preloads the shared [`FollowsCache`] with every `follows_cache`
+    /// row a loaded circle's `d2_sample` names (BC12), regardless of that
+    /// circle's own state.
     pub fn from_store(store: &Store, max_viewers: usize) -> Result<Arc<Self>, StoreError> {
         let handle = Self::new(max_viewers);
         let rows = store.viewer_load_all()?;
+        let mut d2_accounts: std::collections::HashSet<String> = std::collections::HashSet::new();
         for row in rows {
             let viewer = ViewerDid(row.viewer_did);
             let state = CircleState::from_store_str(&row.state);
+            d2_accounts.extend(row.d2_sample.iter().cloned());
             let mut circle = Circle::new();
             circle.follows = row.follows;
             circle.checked = row.checked;
@@ -179,10 +203,20 @@ impl GraphHandle {
                 .expect("GraphHandle state lock poisoned")
                 .circles
                 .insert(viewer.clone(), Arc::new(circle));
-            if state == CircleState::BuildingD1 || state == CircleState::BuildingFm {
+            if state == CircleState::BuildingD1
+                || state == CircleState::BuildingFm
+                || state == CircleState::BuildingD2
+            {
+                // BC12a: a building_d2 row resumes at step 3 only
+                // (`graph::queue::process_job`'s BC5c routing).
                 handle.queue.push(viewer);
             }
         }
+        // BC12: preload every follows_cache row a loaded circle's
+        // d2_sample names, so the first request after a restart has
+        // degree-2 items with no new fetch. A missing or malformed row is
+        // skipped by `FollowsCache::preload` itself, logged with no DID.
+        handle.follows_cache.preload(store, d2_accounts.iter().map(String::as_str))?;
         Ok(handle)
     }
 
@@ -191,6 +225,15 @@ impl GraphHandle {
     /// lifetime.
     pub fn queue(&self) -> Arc<JobQueue> {
         Arc::clone(&self.queue)
+    }
+
+    /// The [`FollowsCache`] every viewer's degree-2 lookups share.
+    /// `Arc`-shared so the worker task and the HTTP handler each hold a
+    /// clone independent of this handle's own lifetime, the same pattern
+    /// [`Self::queue`] uses. `graph::queue::run_step3` (slice 2.0) is the
+    /// first production caller; `http::viewer` (slice 3.0) is the second.
+    pub fn follows_cache(&self) -> Arc<FollowsCache> {
+        Arc::clone(&self.follows_cache)
     }
 
     /// The current circle for `viewer`, if one has been created — `None`
@@ -710,5 +753,57 @@ mod tests {
             "resumes at step 2, not the ready row"
         );
         assert!(queue.try_pop().is_none(), "the ready row is not re-enqueued");
+    }
+
+    #[test]
+    fn restart_loads_follows_cache() {
+        // AC7; BC12, BC12a: a restart preloads every `follows_cache` row a
+        // loaded circle's `d2_sample` names, with no fetch, and re-enqueues
+        // a `building_d2` row to resume at step 3 only
+        // (`graph::queue::process_job`'s BC5c routing).
+        let store = migrated_store();
+        let d2_sample = vec!["did:plc:account".to_string()];
+        let follows: std::collections::HashSet<u64> = [1_u64].into_iter().collect();
+        store
+            .viewer_save_circle(
+                "did:plc:viewer",
+                "building_d1",
+                1_700_000_000,
+                1_700_000_000,
+                &d2_sample,
+                &follows,
+            )
+            .unwrap();
+        let checked: std::collections::HashSet<u64> = [10_u64].into_iter().collect();
+        store
+            .viewer_save_checks(
+                "did:plc:viewer",
+                "building_d2",
+                1_700_000_050,
+                &checked,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        store.follows_put("did:plc:account", 1_700_000_060, &[5_u64, 6]).unwrap();
+
+        let handle = GraphHandle::from_store(&store, 10).unwrap();
+
+        let circle = handle.get(&ViewerDid("did:plc:viewer".to_string())).expect("circle loaded");
+        assert_eq!(circle.state, CircleState::BuildingD2);
+        assert_eq!(circle.d2_sample, d2_sample);
+        assert_eq!(circle.circle_version, 1, "step 1 and step 2 data are servable");
+
+        // BC12: the preload put the row in memory at `from_store` time, with
+        // no fetch through this test's `store` since — `degree2_set` never
+        // reads SQLite at all (BC11a), so a non-empty result here can only
+        // come from the preload.
+        let cached = handle.follows_cache().degree2_set(&d2_sample);
+        assert_eq!(cached, std::collections::HashSet::from([5_u64, 6]));
+
+        // BC12a: the building_d2 row is re-enqueued, to resume at step 3
+        // only.
+        let queue = handle.queue();
+        let popped = queue.try_pop().expect("the building_d2 row was re-enqueued");
+        assert_eq!(popped, ViewerDid("did:plc:viewer".to_string()));
     }
 }
