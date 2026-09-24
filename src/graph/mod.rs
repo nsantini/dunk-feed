@@ -37,8 +37,8 @@ pub fn hash_did(did: &str) -> DidHash {
 }
 
 /// A `viewers.state` value (`store::viewers::ViewerRow::state`), design
-/// §8. Story 06's Non-goals: no `building_fm` or `building_d2` yet — those
-/// are stories 07 and 08.
+/// §8. Story 07 adds `BuildingFm`; `building_d2` is still story 08's to
+/// add.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CircleState {
     /// Step 1 is queued or running, or a prior attempt failed and is
@@ -46,7 +46,14 @@ pub enum CircleState {
     /// circle starts here, before the worker has ever touched it.
     #[default]
     BuildingD1,
-    /// Step 1 has saved successfully at least once (BC7).
+    /// Step 1 has saved successfully at least once and step 2
+    /// (`build::step_follows_me`) is queued, running, or waiting to retry
+    /// (BC3a, BC8, BC9a). `follows` and `d2_sample` are complete and safe
+    /// to serve; `checked` and `follows_me` may be empty or partial.
+    BuildingFm,
+    /// Step 2 has saved successfully at least once, or the worker gave up
+    /// retrying it without deleting the viewer (BC3, BC4b). `checked` and
+    /// `follows_me` may still be partial in the give-up case.
     Ready,
 }
 
@@ -55,19 +62,23 @@ impl CircleState {
     pub fn as_str(&self) -> &'static str {
         match self {
             CircleState::BuildingD1 => "building_d1",
+            CircleState::BuildingFm => "building_fm",
             CircleState::Ready => "ready",
         }
     }
 
     /// Parses a stored `viewers.state` value. Falls back to `BuildingD1`
-    /// for anything but exactly `"ready"`, rather than raising an error: an
-    /// unrecognised state can only mean a build attempt was interrupted
-    /// before it finished (this binary is the only writer), and treating it
-    /// as still building safely re-enqueues it (BC19) instead of failing
-    /// the whole startup load over one row.
+    /// for anything but exactly `"ready"` or `"building_fm"`, rather than
+    /// raising an error: an unrecognised state can only mean a build
+    /// attempt was interrupted before it finished (this binary is the only
+    /// writer), and treating it as still building step 1 safely
+    /// re-enqueues it (BC19) instead of failing the whole startup load over
+    /// one row.
     fn from_store_str(state: &str) -> Self {
         if state == CircleState::Ready.as_str() {
             CircleState::Ready
+        } else if state == CircleState::BuildingFm.as_str() {
+            CircleState::BuildingFm
         } else {
             CircleState::BuildingD1
         }
@@ -133,10 +144,16 @@ impl GraphHandle {
         })
     }
 
-    /// Loads every `viewers` row from `store` (BC19), builds a circle for
-    /// each, and re-enqueues a `FirstBuild` job for any row still in
-    /// `building_d1` — a restart mid-build picks the job back up instead of
-    /// losing it. Loaded circles bypass the `UPSTAGE_MAX_VIEWERS` cap
+    /// Loads every `viewers` row from `store` (BC19, BC9), builds a circle
+    /// for each — `checked` and `follows_me` included (BC9) — and
+    /// re-enqueues a `FirstBuild` job for any row still in `building_d1` or
+    /// `building_fm`: a restart mid-build picks the job back up instead of
+    /// losing it, resuming at step 2 for a `building_fm` row (BC9a) rather
+    /// than repeating step 1. A `ready` row's step 2 retry, if one was
+    /// pending at the moment of the restart, is not resumed (spec.md
+    /// `## Defaults taken`): its data is already good enough to serve, and
+    /// a future refresh (story 09) is what reruns step 2 for it. Loaded
+    /// circles bypass the `UPSTAGE_MAX_VIEWERS` cap
     /// [`Self::enqueue_first_build`] enforces: they already exist in
     /// SQLite, so refusing to load one back into memory would silently
     /// drop a viewer the store already accepted.
@@ -148,11 +165,13 @@ impl GraphHandle {
             let state = CircleState::from_store_str(&row.state);
             let mut circle = Circle::new();
             circle.follows = row.follows;
+            circle.checked = row.checked;
+            circle.follows_me = row.follows_me;
             circle.d2_sample = row.d2_sample;
             circle.last_request_at = row.last_request_at;
             circle.d1_refreshed_at = row.d1_refreshed_at;
             circle.state = state;
-            circle.circle_version = if state == CircleState::Ready { 1 } else { 0 };
+            circle.circle_version = if state == CircleState::BuildingD1 { 0 } else { 1 };
 
             handle
                 .state
@@ -160,7 +179,7 @@ impl GraphHandle {
                 .expect("GraphHandle state lock poisoned")
                 .circles
                 .insert(viewer.clone(), Arc::new(circle));
-            if state == CircleState::BuildingD1 {
+            if state == CircleState::BuildingD1 || state == CircleState::BuildingFm {
                 handle.queue.push(viewer);
             }
         }
@@ -232,27 +251,63 @@ impl GraphHandle {
         }
     }
 
-    /// Swaps in a freshly built circle for `viewer` (BC7): sets its state
-    /// to `ready`, bumps `circle_version` past whatever the handle held
-    /// before (or to 1, for a viewer with no prior entry), and installs the
-    /// new `Arc`. Returns the new version, so the caller (the worker) can
-    /// pass it to the drop-lists callback if it ever needs to.
+    /// Swaps in a freshly built circle for `viewer` at `new_state`: bumps
+    /// `circle_version` past whatever the handle held before (or to 1, for
+    /// a viewer with no prior entry), and installs the new `Arc`. Returns
+    /// the new version, so the caller (the worker) can pass it to the
+    /// drop-lists callback if it ever needs to. `graph::queue::process_job`
+    /// calls this after step 1 (`CircleState::BuildingFm`, BC3a) and again
+    /// after step 2 (`CircleState::Ready`, BC3, BC4).
     ///
     /// `pub(crate)`, not private: `src/http/skeleton.rs` (slice 4.0,
     /// `circle_change_mid_scroll`, BC16) is outside `graph::`'s own module
     /// tree and has no other way to simulate a worker's second save at a
-    /// fixed snapshot generation — story 06 ships no refresh trigger yet
-    /// (spec.md `## Non-goals`), so a test is the only caller besides
-    /// `graph::queue::process_job`. A mechanical ripple, the same kind
-    /// `spec.md`'s `## Defaults taken` already records for slice 2.0's
-    /// one-line `src/http/skeleton.rs` edit.
-    pub(crate) fn insert_ready(&self, viewer: &ViewerDid, mut circle: Circle) -> u64 {
+    /// fixed snapshot generation, so a test is a caller besides
+    /// `graph::queue::process_job`.
+    pub(crate) fn swap_circle(
+        &self,
+        viewer: &ViewerDid,
+        mut circle: Circle,
+        new_state: CircleState,
+    ) -> u64 {
         let mut state = self.state.write().expect("GraphHandle state lock poisoned");
         let version = state.circles.get(viewer).map(|c| c.circle_version + 1).unwrap_or(1);
-        circle.state = CircleState::Ready;
+        circle.state = new_state;
         circle.circle_version = version;
         state.circles.insert(viewer.clone(), Arc::new(circle));
         version
+    }
+
+    /// [`Self::swap_circle`] at `CircleState::Ready` (BC7). Kept as its own
+    /// name since story 06's tests and `src/http/skeleton.rs` already call
+    /// it under this name for the common "swap in a finished circle" case.
+    pub(crate) fn insert_ready(&self, viewer: &ViewerDid, circle: Circle) -> u64 {
+        self.swap_circle(viewer, circle, CircleState::Ready)
+    }
+
+    /// Promotes the circle already held for `viewer` to `CircleState::Ready`
+    /// in place, bumping `circle_version` the same as [`Self::swap_circle`]
+    /// (review round 2, defect AH): unlike [`Self::insert_ready`], this takes
+    /// no `Circle` from the caller to swap in — it only re-saves whatever
+    /// data is already in memory (the last attempt that actually saved), so
+    /// a step 2 attempt's own unsaved `checked`/`follows_me` can never leak
+    /// into memory as `ready` just because the worker gave up retrying it.
+    /// `graph::queue::handle_step2_failure` calls this at step 2's give-up
+    /// (BC4b). Does nothing, under the same write lock as the read, when
+    /// `viewer` has no circle (review round 2, defect AI: e.g. a concurrent
+    /// step 1 give-up already removed it) — so this can never recreate a
+    /// circle for a viewer the store no longer has a row for either. Returns
+    /// the new `circle_version`, or `None` when there was no circle to
+    /// promote.
+    pub(crate) fn mark_ready(&self, viewer: &ViewerDid) -> Option<u64> {
+        let mut state = self.state.write().expect("GraphHandle state lock poisoned");
+        let existing = state.circles.get(viewer)?.clone();
+        let version = existing.circle_version + 1;
+        let mut circle = (*existing).clone();
+        circle.state = CircleState::Ready;
+        circle.circle_version = version;
+        state.circles.insert(viewer.clone(), Arc::new(circle));
+        Some(version)
     }
 
     /// Removes `viewer`'s in-memory circle and starts a `cooldown_secs`
@@ -582,5 +637,78 @@ mod tests {
         let queue = handle.queue();
         let popped = queue.try_pop().expect("building_d1 row was re-enqueued");
         assert_eq!(popped, ViewerDid("did:plc:building".to_string()));
+    }
+
+    #[test]
+    fn restart_loads_checks() {
+        // AC7, BC9, BC9a: a `building_fm` row loads its step 1 `follows`
+        // plus whatever `checked`/`follows_me` it already has, at
+        // `circle_version` 1 (its step 1 data is servable, BC8), and is
+        // re-enqueued to resume at step 2. A `ready` row's `checked` and
+        // `follows_me` load too, but a `ready` row is not re-enqueued
+        // (spec.md `## Defaults taken`: a pending step 2 retry is not
+        // resumed after a restart).
+        let store = migrated_store();
+        let follows: std::collections::HashSet<u64> = [1_u64].into_iter().collect();
+        store
+            .viewer_save_circle(
+                "did:plc:fm",
+                "building_fm",
+                1_700_000_000,
+                1_700_000_000,
+                &[],
+                &follows,
+            )
+            .unwrap();
+        let checked: std::collections::HashSet<u64> = [10_u64, 20].into_iter().collect();
+        let follows_me: std::collections::HashSet<u64> = [10_u64].into_iter().collect();
+        store
+            .viewer_save_checks("did:plc:fm", "building_fm", 1_700_000_050, &checked, &follows_me)
+            .unwrap();
+
+        let ready_follows: std::collections::HashSet<u64> = [2_u64].into_iter().collect();
+        store
+            .viewer_save_circle(
+                "did:plc:ready",
+                "ready",
+                1_700_000_000,
+                1_700_000_000,
+                &[],
+                &ready_follows,
+            )
+            .unwrap();
+        let ready_checked: std::collections::HashSet<u64> = [30_u64].into_iter().collect();
+        store
+            .viewer_save_checks(
+                "did:plc:ready",
+                "ready",
+                1_700_000_050,
+                &ready_checked,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+
+        let handle = GraphHandle::from_store(&store, 10).unwrap();
+
+        let fm =
+            handle.get(&ViewerDid("did:plc:fm".to_string())).expect("building_fm circle loaded");
+        assert_eq!(fm.state, CircleState::BuildingFm);
+        assert_eq!(fm.follows, follows);
+        assert_eq!(fm.checked, checked);
+        assert_eq!(fm.follows_me, follows_me);
+        assert_eq!(fm.circle_version, 1, "step 1 data is servable (BC8)");
+
+        let ready =
+            handle.get(&ViewerDid("did:plc:ready".to_string())).expect("ready circle loaded");
+        assert_eq!(ready.checked, ready_checked);
+
+        let queue = handle.queue();
+        let popped = queue.try_pop().expect("the building_fm row was re-enqueued");
+        assert_eq!(
+            popped,
+            ViewerDid("did:plc:fm".to_string()),
+            "resumes at step 2, not the ready row"
+        );
+        assert!(queue.try_pop().is_none(), "the ready row is not re-enqueued");
     }
 }

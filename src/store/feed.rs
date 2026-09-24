@@ -92,6 +92,50 @@ pub fn promote(conn: &Connection, row: &FeedRow) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// A `feed` row's author DIDs, keyed by `quote_uri`, for the graph worker's
+/// step 2 candidate lookup (slice 2.0, BC1). `FeedItem` (`graph::` types)
+/// holds only author hashes, never DID strings, so the worker reads them
+/// back from `feed` for the snapshot items it is considering.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedAuthors {
+    pub quote_uri: String,
+    pub quote_did: String,
+    pub original_did: String,
+}
+
+/// Reads `quote_uri`, `quote_did` and `original_did` for the rows in
+/// `quote_uris` that still exist in `feed` (BC1a): a `quote_uri` demoted or
+/// dropped after the snapshot was built has no row, and is silently absent
+/// from the result rather than an error. Chunked past `MAX_BOUND_PARAMS`
+/// through `for_each_in_chunk` (BC50's rule), the same shape
+/// `authors::authors_get_many` uses for its `IN (...)` read. An empty
+/// `quote_uris` makes no query at all.
+#[allow(dead_code)] // First caller is the worker (`graph/queue.rs`, slice 2.0).
+pub fn feed_authors_by_quote_uri(
+    conn: &Connection,
+    quote_uris: &[&str],
+) -> Result<Vec<FeedAuthors>, StoreError> {
+    let mut rows = Vec::new();
+    crate::store::for_each_in_chunk(quote_uris, |chunk, placeholders| {
+        let sql = format!(
+            "SELECT quote_uri, quote_did, original_did FROM feed WHERE quote_uri IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mapped = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok(FeedAuthors {
+                quote_uri: row.get(0)?,
+                quote_did: row.get(1)?,
+                original_did: row.get(2)?,
+            })
+        })?;
+        for row in mapped {
+            rows.push(row?);
+        }
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
 /// Every `feed` row, ordered `rank DESC, quote_cid ASC` (BC62), matching
 /// TECH-DESIGN section 7.3's starting order. The tie rule on `quote_cid` is
 /// total, so the order is stable across runs (BC63).
@@ -280,5 +324,82 @@ mod tests {
             vec!["cid-z", "cid-a", "cid-b"],
             "rank 5.0 first, then the rank-1.0 tie broken by quote_cid"
         );
+    }
+
+    // BC1: the lookup returns the quoter and original DIDs for a `quote_uri`
+    // that still has a `feed` row.
+    #[test]
+    fn feed_authors_by_quote_uri_returns_known_rows() {
+        let conn = migrated_conn();
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
+        insert_pair_row(&conn, quote_uri);
+        promote(&conn, &feed_row(quote_uri, 1.0, 1_700_000_000)).unwrap();
+
+        let rows = feed_authors_by_quote_uri(&conn, &[quote_uri]).unwrap();
+        assert_eq!(
+            rows,
+            vec![FeedAuthors {
+                quote_uri: quote_uri.to_string(),
+                quote_did: "did:plc:q".to_string(),
+                original_did: "did:plc:o".to_string(),
+            }]
+        );
+    }
+
+    // BC1a: a `quote_uri` with no `feed` row (demoted after the snapshot was
+    // built) is silently absent from the result, not an error.
+    #[test]
+    fn feed_authors_by_quote_uri_skips_a_missing_row() {
+        let conn = migrated_conn();
+        let quote_uri = "at://did:plc:q/app.bsky.feed.post/q1";
+        insert_pair_row(&conn, quote_uri);
+        promote(&conn, &feed_row(quote_uri, 1.0, 1_700_000_000)).unwrap();
+
+        let rows = feed_authors_by_quote_uri(
+            &conn,
+            &[quote_uri, "at://did:plc:q/app.bsky.feed.post/missing"],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].quote_uri, quote_uri);
+    }
+
+    #[test]
+    fn feed_authors_by_quote_uri_of_empty_list_makes_no_query_and_returns_empty() {
+        let conn = migrated_conn();
+        assert_eq!(feed_authors_by_quote_uri(&conn, &[]).unwrap(), Vec::new());
+    }
+
+    // BC2's chunking rule (BC50): a lookup longer than `MAX_BOUND_PARAMS`
+    // splits into multiple statements instead of failing with "too many SQL
+    // variables".
+    #[test]
+    fn feed_authors_by_quote_uri_chunks_past_the_bound_parameter_limit() {
+        let conn = migrated_conn();
+        let n = crate::store::MAX_BOUND_PARAMS + 10;
+        let mut quote_uris = Vec::with_capacity(n);
+        for i in 0..n {
+            let quote_uri = format!("at://did:plc:q/app.bsky.feed.post/q{i}");
+            let quote_cid = format!("cid{i}");
+            crate::store::pairs::insert_pair(
+                &conn,
+                &quote_uri,
+                "did:plc:q",
+                &quote_cid,
+                "at://did:plc:o/app.bsky.feed.post/o1",
+                "did:plc:o",
+                1_700_000_000,
+                1_700_000_000,
+            )
+            .unwrap();
+            let mut row = feed_row(&quote_uri, 1.0, 1_700_000_000);
+            row.quote_cid = quote_cid;
+            promote(&conn, &row).unwrap();
+            quote_uris.push(quote_uri);
+        }
+
+        let refs: Vec<&str> = quote_uris.iter().map(String::as_str).collect();
+        let rows = feed_authors_by_quote_uri(&conn, &refs).unwrap();
+        assert_eq!(rows.len(), n);
     }
 }

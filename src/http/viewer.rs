@@ -27,12 +27,6 @@ use crate::graph::circle::Circle;
 use crate::graph::filter::{connected_indices, FilterItem};
 use crate::scorer::snapshot::{caps, FeedItem, Snapshot};
 
-/// Story 06 does not build `follows_me` or a degree-2 sample yet (spec.md
-/// `## Non-goals`): every call into `connected_indices` from this module
-/// passes an empty degree-2 set and a zero `follows_me_depth`, so only a
-/// `circle.follows` match ever keeps an item.
-const FOLLOWS_ME_DEPTH: usize = 0;
-
 /// One viewer's capped list at a specific `(generation, circle_version)`:
 /// indices into that generation's `Snapshot::items`, already filtered to
 /// the viewer's circle and capped (BC9). Cheap to clone — an `Arc` around
@@ -55,15 +49,22 @@ struct ViewerEntry {
 /// of these on `AppState` alongside the `GraphHandle`, calling `list_for`
 /// on every personalised request and `drop_viewer` from the worker's
 /// drop-lists callback once a circle changes (BC7).
-#[derive(Default)]
 pub struct ViewerLists {
     entries: Mutex<HashMap<ViewerDid, ViewerEntry>>,
+    /// `cfg.follows_me_depth` (network-feed story 07, BC6, BC6a): the
+    /// index bound `build_list` passes to `connected_indices` for a
+    /// `circle.follows_me` match. Set once at construction (`src/ingest/
+    /// mod.rs`'s `start_graph_subsystem`), since the flag it comes from
+    /// never changes for the life of the process.
+    follows_me_depth: usize,
 }
 
 impl ViewerLists {
-    /// An empty cache, holding no viewer's list yet.
-    pub fn new() -> Self {
-        ViewerLists { entries: Mutex::new(HashMap::new()) }
+    /// An empty cache, holding no viewer's list yet, filtering every
+    /// future `follows_me` match to the first `follows_me_depth` items
+    /// (BC6, BC6a).
+    pub fn new(follows_me_depth: usize) -> Self {
+        ViewerLists { entries: Mutex::new(HashMap::new()), follows_me_depth }
     }
 
     /// The list for `viewer` at `snapshot`'s generation and `circle`'s
@@ -95,7 +96,7 @@ impl ViewerLists {
             }
         }
 
-        let fresh = build_list(circle, snapshot);
+        let fresh = build_list(circle, snapshot, self.follows_me_depth);
         let previous = entries.remove(viewer).map(|entry| entry.current);
         entries.insert(viewer.clone(), ViewerEntry { current: fresh.clone(), previous });
         fresh
@@ -117,22 +118,23 @@ fn matches(list: &ViewerList, generation: u64, circle_version: u64) -> bool {
 }
 
 /// Filters `snapshot.items` to the ones connected to `circle`
-/// (`connected_indices`, BC9, BC12), then applies the two page caps to the
-/// kept indices alone (BC10). `snapshot.items` is already rank-ordered
-/// (`scorer::snapshot::build`'s `sort_by_rank`), and `connected_indices`
-/// preserves input order, so the kept indices `caps::apply` receives are
-/// still in rank order — the same precondition `caps::apply` already
-/// assumes for the global list.
-fn build_list(circle: &Circle, snapshot: &Snapshot) -> ViewerList {
+/// (`connected_indices`, BC9, BC12; network-feed story 07 BC5, BC6, BC6a
+/// for the `follows_me_depth` bound on a `follows_me`-only match), then
+/// applies the two page caps to the kept indices alone (BC10).
+/// `snapshot.items` is already rank-ordered (`scorer::snapshot::build`'s
+/// `sort_by_rank`), and `connected_indices` preserves input order, so the
+/// kept indices `caps::apply` receives are still in rank order — the same
+/// precondition `caps::apply` already assumes for the global list.
+fn build_list(circle: &Circle, snapshot: &Snapshot, follows_me_depth: usize) -> ViewerList {
     let items: &[FeedItem] = snapshot.items.as_slice();
     let filter_items: Vec<FilterItem> = items
         .iter()
         .map(|item| FilterItem { quote_did: item.quote_did, original_did: item.original_did })
         .collect();
 
-    // Story 06 non-goal: no degree-2 sample yet (spec.md `## Non-goals`).
+    // No degree-2 sample yet (story 08 non-goal, spec.md `## Non-goals`).
     let d2_set: HashSet<u64> = HashSet::new();
-    let kept = connected_indices(&filter_items, circle, &d2_set, FOLLOWS_ME_DEPTH);
+    let kept = connected_indices(&filter_items, circle, &d2_set, follows_me_depth);
     let capped = caps::apply(items, &kept);
 
     ViewerList {
@@ -179,12 +181,20 @@ mod tests {
         circle
     }
 
+    /// A circle whose only connection to `follows_me` authors is through
+    /// `follows_me` itself, not `follows` (network-feed story 07).
+    fn circle_with_follows_me(follows: &[u64], follows_me: &[u64], circle_version: u64) -> Circle {
+        let mut circle = ready_circle(follows, circle_version);
+        circle.follows_me = follows_me.iter().copied().collect();
+        circle
+    }
+
     // BC12: an empty `follows` keeps nothing.
     #[test]
     fn empty_follows_yields_empty_list() {
         let circle = ready_circle(&[], 1);
         let snap = snapshot(1, vec![item("at://q/1", "cid1", 1, 2, 1_700_000_000, 3.0)]);
-        let lists = ViewerLists::new();
+        let lists = ViewerLists::new(0);
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
         let list = lists.list_for(&viewer, &circle, &snap);
@@ -213,7 +223,7 @@ mod tests {
         let snap = snapshot(1, vec![item_a, item_b]);
 
         let circle = ready_circle(&[connected_quoter], 1);
-        let lists = ViewerLists::new();
+        let lists = ViewerLists::new(0);
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
         let list = lists.list_for(&viewer, &circle, &snap);
@@ -247,7 +257,7 @@ mod tests {
         }
         let snap = snapshot(1, items);
         let circle = ready_circle(&[connected], 1);
-        let lists = ViewerLists::new();
+        let lists = ViewerLists::new(0);
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
         let list = lists.list_for(&viewer, &circle, &snap);
@@ -267,7 +277,7 @@ mod tests {
             vec![item("at://q/1", "cid1", connected, hash_did("did:plc:o"), 1_700_000_000, 1.0)],
         );
         let circle_v1 = ready_circle(&[connected], 1);
-        let lists = ViewerLists::new();
+        let lists = ViewerLists::new(0);
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
         let first = lists.list_for(&viewer, &circle_v1, &snap);
@@ -288,6 +298,72 @@ mod tests {
         );
     }
 
+    // AC2; BC5, BC6, BC6a: a `follows_me`-only match is kept while its
+    // index in the uncapped snapshot is below `follows_me_depth`, and
+    // dropped once the index reaches the depth. `author` is the quoter at
+    // index 0 and the original at index 1 (both below depth 2, both kept)
+    // and the quoter again at index 2 (at the depth bound, dropped).
+    #[test]
+    fn follows_me_depth() {
+        let author = hash_did("did:plc:follows-me-author");
+        let items = vec![
+            item("at://q/0", "cid0", author, hash_did("did:plc:orig0"), 1_700_000_000, 30.0),
+            item("at://q/1", "cid1", hash_did("did:plc:quoter1"), author, 1_700_000_000, 20.0),
+            item("at://q/2", "cid2", author, hash_did("did:plc:orig2"), 1_700_000_000, 10.0),
+        ];
+        let snap = snapshot(1, items);
+        let circle = circle_with_follows_me(&[], &[author], 1);
+        let lists = ViewerLists::new(2);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+
+        let list = lists.list_for(&viewer, &circle, &snap);
+
+        assert_eq!(
+            list.indices.as_slice(),
+            &[0, 1],
+            "index 2 sits at the depth bound and is dropped"
+        );
+    }
+
+    // AC3, BC7: once step 2 adds `follows_me`, the item step 1 already kept
+    // through `circle.follows` is still kept, alongside the new
+    // `follows_me` match.
+    #[test]
+    fn step2_keeps_step1_items() {
+        let step1_author = hash_did("did:plc:step1-author");
+        let fm_author = hash_did("did:plc:fm-author");
+        let items = vec![
+            item(
+                "at://q/step1",
+                "cid-s1",
+                step1_author,
+                hash_did("did:plc:orig-s1"),
+                1_700_000_000,
+                30.0,
+            ),
+            item(
+                "at://q/fm",
+                "cid-fm",
+                fm_author,
+                hash_did("did:plc:orig-fm"),
+                1_700_000_000,
+                20.0,
+            ),
+        ];
+        let snap = snapshot(1, items);
+        let circle = circle_with_follows_me(&[step1_author], &[fm_author], 1);
+        let lists = ViewerLists::new(5);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+
+        let list = lists.list_for(&viewer, &circle, &snap);
+
+        assert_eq!(
+            list.indices.as_slice(),
+            &[0, 1],
+            "the step 1 item and the new follows_me item both survive"
+        );
+    }
+
     // BC7: `drop_viewer` clears both entries, so the next call rebuilds
     // rather than serving a stale list.
     #[test]
@@ -298,7 +374,7 @@ mod tests {
             vec![item("at://q/1", "cid1", connected, hash_did("did:plc:o"), 1_700_000_000, 1.0)],
         );
         let circle = ready_circle(&[connected], 1);
-        let lists = ViewerLists::new();
+        let lists = ViewerLists::new(0);
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
         let first = lists.list_for(&viewer, &circle, &snap);

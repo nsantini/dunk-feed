@@ -254,7 +254,9 @@ mod tests {
             health: HealthState::new(),
             cfg: HttpConfig::from(&cfg),
             graph: None,
-            viewer_lists: Arc::new(crate::http::viewer::ViewerLists::new()),
+            viewer_lists: Arc::new(crate::http::viewer::ViewerLists::new(
+                cfg.follows_me_depth as usize,
+            )),
         })
     }
 
@@ -275,7 +277,9 @@ mod tests {
             health: HealthState::new(),
             cfg: http_cfg,
             graph: None,
-            viewer_lists: Arc::new(crate::http::viewer::ViewerLists::new()),
+            viewer_lists: Arc::new(crate::http::viewer::ViewerLists::new(
+                cfg.follows_me_depth as usize,
+            )),
         })
     }
 
@@ -301,7 +305,9 @@ mod tests {
             health: HealthState::new(),
             cfg: http_cfg,
             graph: Some(graph),
-            viewer_lists: Arc::new(crate::http::viewer::ViewerLists::new()),
+            viewer_lists: Arc::new(crate::http::viewer::ViewerLists::new(
+                cfg.follows_me_depth as usize,
+            )),
         })
     }
 
