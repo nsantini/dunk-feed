@@ -16,11 +16,19 @@ use super::{CircleState, DidHash};
 #[derive(Debug, Clone, Default)]
 pub struct Circle {
     pub follows: HashSet<DidHash>,
+    /// A hash from `checked` that step 2 (`build::step_follows_me`) found
+    /// following the viewer back (BC10: always a subset of `checked`).
     pub follows_me: HashSet<DidHash>,
+    /// Every hash step 2 has sent to `getRelationships` for this viewer so
+    /// far, whether or not it follows back (BC1a's "not in `follows` or
+    /// `checked`" skip rule, BC4a's "only DIDs not in `checked`" resume
+    /// rule).
     pub checked: HashSet<DidHash>,
     pub d2_sample: Vec<String>,
-    /// `building_d1` while the worker's first build is in flight or
-    /// retrying, `ready` once step 1 has saved successfully (BC7).
+    /// `building_d1` while step 1 is in flight or retrying, `building_fm`
+    /// once step 1 has saved and step 2 is in flight or retrying, `ready`
+    /// once step 2 has saved successfully or the worker gave up retrying it
+    /// (BC7, BC3, BC4b).
     pub state: CircleState,
     /// The last time a request touched this viewer, unix seconds (BC23).
     /// `0` until the first request or worker save sets it.
