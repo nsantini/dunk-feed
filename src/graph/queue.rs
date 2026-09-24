@@ -1678,7 +1678,11 @@ mod tests {
         let calls = dropped.lock().unwrap().clone();
         assert_eq!(
             calls,
-            vec!["did:plc:viewer".to_string(), "did:plc:viewer".to_string(), "did:plc:viewer".to_string()],
+            vec![
+                "did:plc:viewer".to_string(),
+                "did:plc:viewer".to_string(),
+                "did:plc:viewer".to_string()
+            ],
             "one drop per successful put (a, b), plus one more when the loop finishes"
         );
     }
@@ -1690,9 +1694,7 @@ mod tests {
         // trusting a forward-skewed timestamp.
         let store = memory_store();
         let real_now = unix_now();
-        store
-            .follows_put("did:plc:a", real_now + 3_600, &[hash_did("did:plc:old")])
-            .unwrap();
+        store.follows_put("did:plc:a", real_now + 3_600, &[hash_did("did:plc:old")]).unwrap();
 
         let handle = GraphHandle::new(10);
         let viewer = ViewerDid("did:plc:viewer".to_string());
@@ -1712,6 +1714,10 @@ mod tests {
         let fetched = source.fetched.lock().unwrap().clone();
         assert!(fetched.contains(&"did:plc:a".to_string()), "a future fetched_at is refetched");
         let row = store.follows_get("did:plc:a").unwrap().unwrap();
-        assert_eq!(row.follows, vec![hash_did("did:plc:new")], "the stale future entry is replaced");
+        assert_eq!(
+            row.follows,
+            vec![hash_did("did:plc:new")],
+            "the stale future entry is replaced"
+        );
     }
 }
