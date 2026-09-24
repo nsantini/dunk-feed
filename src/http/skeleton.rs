@@ -114,12 +114,12 @@ fn resolve_cursor(raw: Option<&str>) -> Result<Option<(u64, usize, f64, String)>
     }
 }
 
-/// Path 3 (BC55): the index the page starts at, found in one linear scan of
-/// `items` (TECH-DESIGN section 11.1's budget line;
-/// `snapshot::apply_cap_one_per_quoter_per_50` leaves `items` not totally
-/// ordered by `(rank DESC, cid ASC)`, so a binary search has no defined
-/// answer over it). Reached only once path 1 and path 2 (`resolve_start`)
-/// have both failed to place the cursor. `cursor_value: None` (BC22, BC57)
+/// Path 3 (BC55): the index into `global` the page starts at, found in one
+/// linear scan of `global` (TECH-DESIGN section 11.1's budget line;
+/// `caps::apply`'s cap 2 leaves `global` not totally ordered by `(rank
+/// DESC, cid ASC)` over `items`, so a binary search has no defined answer
+/// over it). Reached only once path 1 and path 2 (`resolve_start`) have
+/// both failed to place the cursor. `cursor_value: None` (BC22, BC57)
 /// always starts at 0 without scanning.
 ///
 /// Round 2 finding 1: an exact `(rank, cid)` match always wins, wherever it
@@ -127,16 +127,16 @@ fn resolve_cursor(raw: Option<&str>) -> Result<Option<(u64, usize, f64, String)>
 /// cursor by `cmp_rank_then_cid` — the scan never returns early on that
 /// weaker signal; it only remembers the first one as a fallback and keeps
 /// going. That is the whole invariant: **never go backwards, so never
-/// repeat within a session.** `snapshot::apply_cap_one_per_quoter_per_50`
-/// can place an item earlier in `items` than its raw `(rank, cid)` would
-/// otherwise sort — a cap-2 deferral — so an earlier index can legitimately
-/// sort after the cursor (BC37) while the cursor's own item still sits
-/// later, not yet reached; returning that earlier index would replay
-/// whatever this pagination session already served up to it. Scanning to
-/// completion for the exact match instead means an index once returned is
-/// never returned again, no matter how the deferral reordered `items`
-/// (BC37: exact match at `k` always starts the next page at `k + 1`; BC38:
-/// with no exact match at all, the first-sorts-after fallback stands).
+/// repeat within a session.** `caps::apply`'s cap 2 can place an item
+/// earlier in `global` than its raw `(rank, cid)` would otherwise sort — a
+/// cap-2 deferral — so an earlier position can legitimately sort after the
+/// cursor (BC37) while the cursor's own item still sits later, not yet
+/// reached; returning that earlier position would replay whatever this
+/// pagination session already served up to it. Scanning to completion for
+/// the exact match instead means a position once returned is never
+/// returned again, no matter how the deferral reordered `global` (BC37:
+/// exact match at `k` always starts the next page at `k + 1`; BC38: with no
+/// exact match at all, the first-sorts-after fallback stands).
 ///
 /// The accepted cost (BC39, rewritten for slice 7.0): this path alone can
 /// still repeat or drop an item, and only when a cursor is older than two
@@ -151,10 +151,11 @@ fn resolve_cursor(raw: Option<&str>) -> Result<Option<(u64, usize, f64, String)>
 /// empty, with no `cursor` in the response — rather than repeating or
 /// looping. A plain refresh, a fresh request with no cursor, still serves
 /// every item in the current snapshot.
-fn page_start(items: &[FeedItem], cursor_value: Option<(f64, String)>) -> usize {
+fn page_start(items: &[FeedItem], cursor_value: Option<(f64, String)>, global: &[u32]) -> usize {
     let Some((rank, cid)) = cursor_value else { return 0 };
     let mut after: Option<usize> = None;
-    for (i, item) in items.iter().enumerate() {
+    for (i, &idx) in global.iter().enumerate() {
+        let item = &items[idx as usize];
         match cmp_rank_then_cid((item.rank, &item.quote_cid), (rank, &cid)) {
             std::cmp::Ordering::Equal => return i + 1,
             std::cmp::Ordering::Greater => {
@@ -165,32 +166,34 @@ fn page_start(items: &[FeedItem], cursor_value: Option<(f64, String)>) -> usize 
             std::cmp::Ordering::Less => {}
         }
     }
-    after.unwrap_or(items.len())
+    after.unwrap_or(global.len())
 }
 
 /// Three-path page resolution (TECH-DESIGN section 11.1, BC53 to BC57): given
 /// the two generations `SnapshotHandle::generations` returned (BC50, one
 /// call per request) and the decoded cursor, picks which generation's list
-/// to serve from and the index it starts at within that list. `None`
-/// (BC22, BC57) always resolves to `(current, 0)` without scanning.
+/// to serve from and the index it starts at within that generation's
+/// `global`. `None` (BC22, BC57) always resolves to `(current, 0)` without
+/// scanning.
 ///
 /// Path 1 (BC53, BC59): the cursor's `generation` matches `current` or
-/// `previous`, and that generation's `index` is in bounds and names the
-/// same `quote_cid` — an exact O(1) resume at `index + 1` of that same
-/// generation. An out-of-bounds index or a `quote_cid` mismatch at that
-/// index means the generation no longer looks the way the cursor
-/// remembers it (BC59), so path 1 does not apply and resolution falls
-/// through rather than trusting a stale index.
+/// `previous`, and that generation's `index` is a position in `global` in
+/// bounds, naming an item in `items` with the same `quote_cid` — an exact
+/// O(1) resume at `index + 1` of that same generation. An out-of-bounds
+/// index or a `quote_cid` mismatch at that index means the generation no
+/// longer looks the way the cursor remembers it (BC59), so path 1 does not
+/// apply and resolution falls through rather than trusting a stale index.
 ///
-/// Path 2 (BC54): path 1 did not apply. Scan the *current* list for an
-/// item with the cursor's `quote_cid`; if one is found, start just after
-/// it, in the current generation.
+/// Path 2 (BC54): path 1 did not apply. Scan the *current* generation's
+/// `global`, in order, for the item with the cursor's `quote_cid`; if one
+/// is found, start just after its position in `global`, in the current
+/// generation.
 ///
 /// Path 3 (BC55): neither path applied. Fall back to `page_start`'s
-/// rank/cid scan over the current list — the one path BC39 accepts as
-/// capable of repeating or dropping an item, reached only once the
-/// cursor's generation has fallen out of both slots and its `quote_cid` no
-/// longer resolves in the current list either.
+/// rank/cid scan over the current generation's `global` — the one path
+/// BC39 accepts as capable of repeating or dropping an item, reached only
+/// once the cursor's generation has fallen out of both slots and its
+/// `quote_cid` no longer resolves in the current list either.
 fn resolve_start<'a>(
     current: &'a Snapshot,
     previous: &'a Option<Snapshot>,
@@ -210,20 +213,24 @@ fn resolve_start<'a>(
 
     if let Some(snap) = matched_generation {
         // BC59: an out-of-bounds index falls through rather than panicking.
-        if let Some(item) = snap.items.get(cursor_index) {
-            if item.quote_cid == cursor_cid {
+        if let Some(&idx) = snap.global.get(cursor_index) {
+            if snap.items[idx as usize].quote_cid == cursor_cid {
                 return (snap, cursor_index + 1);
             }
         }
     }
 
-    // Path 2 (BC54): one scan of the current list by `quote_cid`.
-    if let Some(pos) = current.items.iter().position(|item| item.quote_cid == cursor_cid) {
+    // Path 2 (BC54): one scan of the current generation's `global` by
+    // `quote_cid`.
+    if let Some(pos) =
+        current.global.iter().position(|&idx| current.items[idx as usize].quote_cid == cursor_cid)
+    {
         return (current, pos + 1);
     }
 
-    // Path 3 (BC55, BC39): the rank/cid scan, over the current list only.
-    let start = page_start(&current.items, Some((cursor_rank, cursor_cid)));
+    // Path 3 (BC55, BC39): the rank/cid scan, over the current generation's
+    // `global` only.
+    let start = page_start(&current.items, Some((cursor_rank, cursor_cid)), &current.global);
     (current, start)
 }
 
@@ -255,12 +262,14 @@ fn build<'a>(
 
     let (snapshot, start) = resolve_start(current, previous, cursor_value);
     let items = snapshot.items.as_slice();
-    let page: Vec<&FeedItem> = items.iter().skip(start).take(limit).collect();
+    let global = snapshot.global.as_slice();
+    let page: Vec<&FeedItem> =
+        global.iter().skip(start).take(limit).map(|&idx| &items[idx as usize]).collect();
 
     // BC8, BC56: omitted once the page reaches the end of that generation's
-    // list; otherwise names the generation it was served from and the
-    // index of the last item served within that generation.
-    let cursor = if start + page.len() < items.len() {
+    // `global`; otherwise names the generation it was served from and the
+    // index into `global` of the last item served within that generation.
+    let cursor = if start + page.len() < global.len() {
         let last_index = start + page.len() - 1;
         page.last()
             .map(|item| cursor::encode(snapshot.generation, last_index, item.rank, &item.quote_cid))
@@ -314,13 +323,27 @@ mod tests {
     const FEED_URI: &str = "at://did:plc:abc/app.bsky.feed.generator/upstaged";
 
     fn item(quote_uri: &str, quote_cid: &str, rank: f64, ratio: f64) -> FeedItem {
-        FeedItem { quote_uri: quote_uri.to_string(), quote_cid: quote_cid.to_string(), rank, ratio }
+        FeedItem {
+            quote_uri: quote_uri.to_string(),
+            quote_cid: quote_cid.to_string(),
+            rank,
+            ratio,
+            quote_did: 1,
+            original_did: 2,
+            quoted_at: 1_700_000_000,
+            promoted_at: 1_700_000_000,
+        }
     }
 
+    /// Fixture snapshots build `items` already in the shape the caps would
+    /// have produced, so `global` is every index in order — no cap is
+    /// exercised again by these fixtures, which are about pagination, not
+    /// capping (that lives in `scorer::snapshot::caps`).
     fn state_with_items(items: Vec<FeedItem>) -> Arc<AppState> {
         let cfg = test_config("127.0.0.1:0");
         let state = test_state(cfg);
-        state.snapshot.swap(Arc::new(items));
+        let global: Vec<u32> = (0..items.len() as u32).collect();
+        state.snapshot.swap(Arc::new(items), Arc::new(global));
         state
     }
 
@@ -472,6 +495,21 @@ mod tests {
         assert!(json["cursor"].is_string());
     }
 
+    /// The identity `global` for a fixture's `items`: every index in order,
+    /// so `page_start`'s tests exercise the scan without a cap reordering
+    /// anything (`deferral_snapshot` below sets up the reordered case).
+    fn ids(items: &[FeedItem]) -> Vec<u32> {
+        (0..items.len() as u32).collect()
+    }
+
+    /// `state.snapshot.swap` with the identity `global`, for tests that
+    /// swap in a fresh generation's `items` directly and are not exercising
+    /// a cap.
+    fn swap_items(state: &Arc<AppState>, items: Vec<FeedItem>) {
+        let global = ids(&items);
+        state.snapshot.swap(Arc::new(items), Arc::new(global));
+    }
+
     // BC7, BC32: page_start behaviour, unit-tested directly.
     #[test]
     fn page_start_exact_match_starts_after_it() {
@@ -480,7 +518,7 @@ mod tests {
             item("at://q/2", "cid2", 2.0, 1.0),
             item("at://q/3", "cid3", 1.0, 1.0),
         ];
-        assert_eq!(page_start(&items, Some((2.0, "cid2".to_string()))), 2);
+        assert_eq!(page_start(&items, Some((2.0, "cid2".to_string())), &ids(&items)), 2);
     }
 
     #[test]
@@ -489,13 +527,13 @@ mod tests {
         // the first item that sorts strictly after it.
         let items = vec![item("at://q/1", "cid1", 3.0, 1.0), item("at://q/3", "cid3", 1.0, 1.0)];
         // A stale cursor at rank 2.0 sorts between the two remaining items.
-        assert_eq!(page_start(&items, Some((2.0, "cidX".to_string()))), 1);
+        assert_eq!(page_start(&items, Some((2.0, "cidX".to_string())), &ids(&items)), 1);
     }
 
     #[test]
     fn page_start_cursor_past_the_end_returns_len() {
         let items = vec![item("at://q/1", "cid1", 3.0, 1.0)];
-        assert_eq!(page_start(&items, Some((0.0, "zzz".to_string()))), 1);
+        assert_eq!(page_start(&items, Some((0.0, "zzz".to_string())), &ids(&items)), 1);
     }
 
     /// A snapshot holding a genuine cap-2 deferral: `cid6`'s rank (50.0) is
@@ -526,7 +564,7 @@ mod tests {
     #[test]
     fn page_start_exact_match_wins_over_an_earlier_sorts_after_index() {
         let items = deferral_snapshot();
-        assert_eq!(page_start(&items, Some((50.0, "cid6".to_string()))), 7);
+        assert_eq!(page_start(&items, Some((50.0, "cid6".to_string())), &ids(&items)), 7);
     }
 
     // 6.2: paging one item at a time over `deferral_snapshot` terminates
@@ -536,11 +574,12 @@ mod tests {
     #[test]
     fn page_start_pages_a_deferral_snapshot_exactly_once_and_terminates() {
         let items = deferral_snapshot();
+        let global = ids(&items);
         let mut cursor: Option<(f64, String)> = None;
         let mut served = Vec::new();
 
         for _ in 0..=items.len() {
-            let start = page_start(&items, cursor.clone());
+            let start = page_start(&items, cursor.clone(), &global);
             if start >= items.len() {
                 break;
             }
@@ -571,13 +610,14 @@ mod tests {
             item("at://q/c", "cid-c", 60.0, 1.0),
         ];
 
+        let global = ids(&next_generation);
         assert_eq!(
-            page_start(&next_generation, Some(stale_cursor)),
+            page_start(&next_generation, Some(stale_cursor), &global),
             next_generation.len(),
             "truncates to an empty page rather than repeating or looping"
         );
         assert_eq!(
-            page_start(&next_generation, None),
+            page_start(&next_generation, None, &global),
             0,
             "a fresh no-cursor request against the same generation serves everything"
         );
@@ -717,7 +757,7 @@ mod tests {
         // items differently, and swaps generation 1 into `previous`.
         let regenerated =
             vec![item("at://q/x", "cid-x", 500.0, 1.0), item("at://q/y", "cid-y", 400.0, 1.0)];
-        state.snapshot.swap(Arc::new(regenerated));
+        swap_items(&state, regenerated);
 
         let uri2 = format!(
             "/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=100&cursor={cursor}"
@@ -745,11 +785,11 @@ mod tests {
     #[tokio::test]
     async fn path_2_scans_current_list_by_cid_once_the_generation_falls_out() {
         let state = state_with_items(vec![item("at://q/old", "cid-old", 10.0, 1.0)]); // gen 1
-        state.snapshot.swap(Arc::new(vec![item("at://q/mid", "cid-mid", 5.0, 1.0)])); // gen 2
-        state.snapshot.swap(Arc::new(vec![
-            item("at://q/old", "cid-old", 1.0, 1.0),
-            item("at://q/new", "cid-new", 50.0, 1.0),
-        ])); // gen 3: generation 1 held by neither current (3) nor previous (2)
+        swap_items(&state, vec![item("at://q/mid", "cid-mid", 5.0, 1.0)]); // gen 2
+        swap_items(
+            &state,
+            vec![item("at://q/old", "cid-old", 1.0, 1.0), item("at://q/new", "cid-new", 50.0, 1.0)],
+        ); // gen 3: generation 1 held by neither current (3) nor previous (2)
 
         let app = router(state);
         let cursor = cursor::encode(1, 0, 10.0, "cid-old");
@@ -773,11 +813,14 @@ mod tests {
     #[tokio::test]
     async fn path_3_rank_scan_runs_once_generation_and_cid_both_fall_out() {
         let state = state_with_items(vec![item("at://q/old", "cid-old", 10.0, 1.0)]); // gen 1
-        state.snapshot.swap(Arc::new(vec![item("at://q/mid", "cid-mid", 5.0, 1.0)])); // gen 2
-        state.snapshot.swap(Arc::new(vec![
-            item("at://q/high", "cid-high", 20.0, 1.0),
-            item("at://q/low", "cid-low", 1.0, 1.0),
-        ])); // gen 3: cid-old is gone entirely
+        swap_items(&state, vec![item("at://q/mid", "cid-mid", 5.0, 1.0)]); // gen 2
+        swap_items(
+            &state,
+            vec![
+                item("at://q/high", "cid-high", 20.0, 1.0),
+                item("at://q/low", "cid-low", 1.0, 1.0),
+            ],
+        ); // gen 3: cid-old is gone entirely
 
         let app = router(state);
         let cursor = cursor::encode(1, 0, 10.0, "cid-old");
@@ -810,6 +853,7 @@ mod tests {
         let current = Snapshot {
             generation: 1,
             items: Arc::new(vec![item("at://q/old", "cid-old", 10.0, 1.0)]),
+            global: Arc::new(vec![0]),
         };
         let previous = None;
         // Index 5 does not exist in a one-item list.
@@ -819,5 +863,168 @@ mod tests {
 
         assert_eq!(snapshot.generation, 1, "path 2 still serves the current generation");
         assert_eq!(start, 1, "path 2 found cid-old at index 0 and starts just after it");
+    }
+
+    // AC4, BC8: served bytes match the `01` capped-build oracle, byte for
+    // byte, for the same input rows — a full page and a page reached via
+    // cursor alike. The oracle serves its capped `Vec<FeedItem>` as a plain
+    // snapshot (its own `global` is every index in order, since it is
+    // already capped); the new path serves `build`'s uncapped `items` plus
+    // `global`. `global_matches_v1` (`scorer::snapshot`) already proves the
+    // two agree on content and order; this test proves the served
+    // `getFeedSkeleton` bytes agree too, on a fixture where both caps
+    // actually fire.
+    #[tokio::test]
+    async fn global_output_unchanged() {
+        use crate::score::Weights;
+        use crate::scorer::snapshot::{build, build_v1_capped_oracle};
+        use crate::store::feed::FeedRow;
+
+        // Like `feed_row`, but with `v_likes_q` set explicitly and every
+        // other count at zero, so the row's *computed* rank
+        // (`recompute_ranks`, which ignores the fixture's own `rank` field)
+        // is driven only by `likes`, at a shared `quoted_at` so age never
+        // confounds the order.
+        fn feed_row_with_likes(
+            quote_uri: &str,
+            quote_did: &str,
+            original_did: &str,
+            quoted_at: i64,
+            likes: i64,
+        ) -> FeedRow {
+            FeedRow {
+                quote_uri: quote_uri.to_string(),
+                quote_cid: format!("cid-{quote_uri}"),
+                quote_did: quote_did.to_string(),
+                original_did: original_did.to_string(),
+                quoted_at,
+                v_likes_q: likes,
+                v_reposts_q: 0,
+                v_replies_q: 0,
+                v_likes_o: 0,
+                v_reposts_o: 0,
+                v_replies_o: 0,
+                ratio: 12.0,
+                rank: 0.0,
+                promoted_at: quoted_at,
+                verified_at: quoted_at,
+            }
+        }
+
+        async fn fetch(state: Arc<AppState>, uri: String) -> (axum::http::HeaderMap, Vec<u8>) {
+            let app = router(state);
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let headers = response.headers().clone();
+            let body =
+                axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec();
+            (headers, body)
+        }
+
+        let weights = Weights { repost: 3.0, reply: 5.0 };
+        let now = 1_700_100_000i64;
+        let k = 5.0;
+
+        // Rank order (descending likes, all rows at the same age):
+        // cap1-high, cap1-low, repeatq-first, filler1, filler2, repeatq-again.
+        // `cap1-high`/`cap1-low` share `(original_did, day)` (BC4): cap 1
+        // drops `cap1-low`. `repeatq-first`/`repeatq-again` share quoter
+        // `repeatq` (BC5); only 2 filler rows (well inside the 49-item
+        // window) separate them and nothing follows to free the window, so
+        // cap 2 defers `repeatq-again` and then drops it when the main list
+        // runs out — both caps fire.
+        let rows = vec![
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/cap1-high",
+                "did:plc:cap1-quoter-high",
+                "did:plc:cap1-author",
+                now,
+                500,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/cap1-low",
+                "did:plc:cap1-quoter-low",
+                "did:plc:cap1-author",
+                now,
+                480,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/repeatq-first",
+                "did:plc:repeatq",
+                "did:plc:orig-first",
+                now,
+                460,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/filler1",
+                "did:plc:filler-quoter1",
+                "did:plc:orig-filler1",
+                now,
+                440,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/filler2",
+                "did:plc:filler-quoter2",
+                "did:plc:orig-filler2",
+                now,
+                420,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/repeatq-again",
+                "did:plc:repeatq",
+                "did:plc:orig-again",
+                now,
+                400,
+            ),
+        ];
+
+        let oracle = build_v1_capped_oracle(rows.clone(), &weights, now, k);
+        let (items, global) = build(rows, &weights, now, k);
+
+        // Both caps must actually have fired before the byte comparison
+        // below means anything.
+        assert_eq!(global.len(), 4, "cap 1 drops one row, cap 2 drops another");
+        let survivors: Vec<&str> =
+            global.iter().map(|&i| items[i as usize].quote_uri.as_str()).collect();
+        assert!(
+            !survivors.contains(&"at://did:plc:q/app.bsky.feed.post/cap1-low"),
+            "cap 1 must drop the lower-rank same-author-same-day row"
+        );
+        assert!(
+            !survivors.contains(&"at://did:plc:q/app.bsky.feed.post/repeatq-again"),
+            "cap 2 must drop the deferred row once the main list runs out"
+        );
+
+        let oracle_state = state_with_items(oracle);
+        let new_state = {
+            let cfg = test_config("127.0.0.1:0");
+            let state = test_state(cfg);
+            state.snapshot.swap(Arc::new(items), Arc::new(global));
+            state
+        };
+
+        // Full page.
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let (headers_a, body_a) = fetch(oracle_state.clone(), uri.clone()).await;
+        let (headers_b, body_b) = fetch(new_state.clone(), uri).await;
+        assert_eq!(headers_a, headers_b, "headers must match byte for byte");
+        assert_eq!(body_a, body_b, "a full page must match the 01 output byte for byte");
+
+        // Cursor page: page 1 at limit=2, then follow the cursor for page 2.
+        let uri1 = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=2");
+        let (_, body1_a) = fetch(oracle_state.clone(), uri1.clone()).await;
+        let (_, body1_b) = fetch(new_state.clone(), uri1).await;
+        assert_eq!(body1_a, body1_b, "page 1 must match the 01 output byte for byte");
+        let json1: Value = serde_json::from_slice(&body1_a).unwrap();
+        let cursor = json1["cursor"].as_str().expect("more items remain").to_string();
+
+        let uri2 =
+            format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=2&cursor={cursor}");
+        let (headers2_a, body2_a) = fetch(oracle_state, uri2.clone()).await;
+        let (headers2_b, body2_b) = fetch(new_state, uri2).await;
+        assert_eq!(headers2_a, headers2_b, "headers must match byte for byte");
+        assert_eq!(body2_a, body2_b, "a cursor page must match the 01 output byte for byte");
     }
 }
