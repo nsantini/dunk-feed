@@ -251,6 +251,28 @@ pub fn viewer_save_checks(
     Ok(())
 }
 
+/// Updates a `viewers` row's `state` only, and only if the row still exists
+/// (review round 2, defect AI): unlike `viewer_save_state`, this is a plain
+/// `UPDATE`, never an upsert, so a viewer deleted (e.g. `viewer_delete`, at
+/// step 1's give-up) between the worker's last read of it and this call gets
+/// no row recreated for it. `graph::queue::handle_step2_failure` calls this
+/// at step 2's give-up (BC4b) instead of `viewer_save_state`, which would
+/// otherwise insert a fresh `building_d1` row (its `ON CONFLICT` branch never
+/// runs without a match) for a viewer the store no longer has one for. A
+/// no-op, not an error, when `viewer_did` has no row.
+#[allow(dead_code)] // First caller is the worker (`graph/queue.rs`, slice 5.0).
+pub fn viewer_set_state_if_exists(
+    conn: &Connection,
+    viewer_did: &str,
+    state: &str,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE viewers SET state = ?2 WHERE viewer_did = ?1",
+        rusqlite::params![viewer_did, state],
+    )?;
+    Ok(())
+}
+
 /// Updates `last_request_at` only, for the worker's touch flush (BC23): at
 /// most once every 60 s for each viewer, written by the worker task rather
 /// than the request path. A no-op, not an error, when `viewer_did` has no
@@ -485,6 +507,30 @@ mod tests {
             viewer_save_checks(&conn, "did:plc:none", "ready", 1, &checked, &HashSet::new());
 
         assert!(result.is_err());
+    }
+
+    // Review round 2, defect AI: `viewer_set_state_if_exists` creates no row
+    // for a viewer the store has none for, unlike `viewer_save_state`'s
+    // upsert.
+    #[test]
+    fn set_state_if_exists_of_an_unknown_viewer_creates_no_row() {
+        let conn = migrated_conn();
+        viewer_set_state_if_exists(&conn, "did:plc:missing", "ready").unwrap();
+        assert_eq!(viewer_load_all(&conn).unwrap(), Vec::new());
+    }
+
+    // The existing-row case: the state changes, nothing else does.
+    #[test]
+    fn set_state_if_exists_of_a_known_viewer_updates_state_only() {
+        let conn = migrated_conn();
+        viewer_save_state(&conn, "did:plc:a", "building_fm", 1_700_000_000).unwrap();
+
+        viewer_set_state_if_exists(&conn, "did:plc:a", "ready").unwrap();
+
+        let rows = viewer_load_all(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "ready");
+        assert_eq!(rows[0].first_seen_at, 1_700_000_000);
     }
 
     // A hash near `u64::MAX` round-trips through the `i64` reinterpret cast

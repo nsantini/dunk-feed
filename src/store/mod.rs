@@ -533,6 +533,20 @@ impl Store {
         viewers::viewer_touch(&conn, viewer_did, last_request_at)
     }
 
+    /// Updates a `viewers` row's `state` only, creating no row when the
+    /// viewer has none (review round 2, defect AI). No production caller
+    /// yet: the worker's step 2 give-up (`graph/queue.rs`, slice 5.0) is the
+    /// first.
+    #[allow(dead_code)]
+    pub fn viewer_set_state_if_exists(
+        &self,
+        viewer_did: &str,
+        state: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        viewers::viewer_set_state_if_exists(&conn, viewer_did, state)
+    }
+
     /// Deletes a viewer's `viewers`, `viewer_follows` and `viewer_checks`
     /// rows. No caller until story 09's eviction.
     #[allow(dead_code)]

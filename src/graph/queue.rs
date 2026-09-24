@@ -433,7 +433,7 @@ async fn run_step2<S: GraphSource>(
         Ok(ranked) => ranked,
         Err(err) => {
             tracing::warn!(kind = ?err, "graph: worker failed to read step 2 candidates");
-            handle_step2_failure(viewer, queue, retry_delay, handle, store, circle).await;
+            handle_step2_failure(viewer, queue, retry_delay, handle, store).await;
             return;
         }
     };
@@ -466,37 +466,46 @@ async fn run_step2<S: GraphSource>(
             // before the failure still saved and swaps in, but the job is
             // still retried.
             tracing::warn!(kind = ?err, "graph: worker step_follows_me failed");
-            handle.insert_ready(viewer, circle.clone());
+            handle.insert_ready(viewer, circle);
             if let Some(drop_lists) = drop_lists {
                 drop_lists(&viewer.0);
             }
-            handle_step2_failure(viewer, queue, retry_delay, handle, store, circle).await;
+            handle_step2_failure(viewer, queue, retry_delay, handle, store).await;
         }
         (Ok(_), Err(save_err)) => {
             // BC4c: the save itself failed. Nothing new is kept in memory;
             // the last successfully saved data (from an earlier attempt, or
-            // step 1's own save) stays as-is unless give-up promotes it.
+            // step 1's own save) stays as-is unless give-up promotes it
+            // (defect AH: never this attempt's unsaved `circle`).
             tracing::warn!(kind = ?save_err, "graph: worker failed to save step 2 checks");
-            handle_step2_failure(viewer, queue, retry_delay, handle, store, circle).await;
+            handle_step2_failure(viewer, queue, retry_delay, handle, store).await;
         }
         (Err(err), Err(save_err)) => {
             tracing::warn!(kind = ?err, "graph: worker step_follows_me failed");
             tracing::warn!(kind = ?save_err, "graph: worker failed to save partial step 2 checks");
-            handle_step2_failure(viewer, queue, retry_delay, handle, store, circle).await;
+            handle_step2_failure(viewer, queue, retry_delay, handle, store).await;
         }
     }
 }
 
-/// Step 2's failure path (BC4b as amended, review round 1, defect AF): below
-/// [`MAX_FIRST_BUILD_ATTEMPTS`] step 2 failures in a row, re-queues `viewer`
-/// after `retry_delay`, leaving `circle` (the caller's last attempt, saved or
-/// not) as the in-memory and on-disk state exactly as `run_step2` left them.
-/// At the limit, stops retrying step 2 instead — but, unlike
-/// [`handle_step1_failure`], the viewer already has a servable circle (BC8,
-/// BC8a) — so give-up here promotes `circle` to `CircleState::Ready` in
-/// memory (`GraphHandle::insert_ready`, keeping its data and the normal
-/// `circle_version` bump) and writes `viewers.state = 'ready'` best effort:
-/// a failed write is logged with no DID and left as-is, the same accepted
+/// Step 2's failure path (BC4b as amended, review round 1 defect AF, review
+/// round 2 defects AH and AI): below [`MAX_FIRST_BUILD_ATTEMPTS`] step 2
+/// failures in a row, re-queues `viewer` after `retry_delay`, touching
+/// neither the in-memory circle nor its saved row — `run_step2` already left
+/// both exactly as its own save attempt did or did not change them. At the
+/// limit, stops retrying step 2 instead — but, unlike [`handle_step1_failure`],
+/// the viewer already has a servable circle (BC8, BC8a) — so give-up
+/// promotes whatever circle `handle` still holds for `viewer` to
+/// `CircleState::Ready` (`GraphHandle::mark_ready`, defect AH): never this
+/// attempt's own `circle` parameter, since a `viewer_save_checks` failure
+/// (BC4c) means that value's `checked`/`follows_me` never reached SQLite and
+/// must not leak into memory just because the worker gives up retrying it.
+/// `mark_ready` is a no-op when `handle` already has no circle for `viewer`
+/// (defect AI: e.g. a concurrent step 1 give-up already removed it), and the
+/// matching `viewers.state = 'ready'` write uses
+/// `Store::viewer_set_state_if_exists`, a plain `UPDATE`, for the same reason
+/// — neither call recreates a viewer the store or the handle no longer has.
+/// A failed write is logged with no DID and left as-is, the same accepted
 /// limitation `handle_step1_failure`'s own best-effort delete already
 /// documents, since a restart's `GraphHandle::from_store` would simply
 /// re-enqueue a row still `building_fm` and retry step 2 again rather than
@@ -507,7 +516,6 @@ async fn handle_step2_failure(
     retry_delay: Duration,
     handle: &Arc<GraphHandle>,
     store: &Store,
-    circle: Circle,
 ) {
     let attempts = queue.record_step2_failure(viewer);
     if attempts < MAX_FIRST_BUILD_ATTEMPTS {
@@ -516,8 +524,8 @@ async fn handle_step2_failure(
     }
 
     tracing::warn!(attempts, "graph: worker giving up on step 2 retries after repeated failures");
-    handle.insert_ready(viewer, circle);
-    if let Err(err) = store.viewer_save_state(&viewer.0, CircleState::Ready.as_str(), unix_now()) {
+    handle.mark_ready(viewer);
+    if let Err(err) = store.viewer_set_state_if_exists(&viewer.0, CircleState::Ready.as_str()) {
         tracing::warn!(kind = ?err, "graph: failed to save ready state after giving up on step 2");
     }
     queue.complete(viewer);
@@ -1239,6 +1247,93 @@ mod tests {
         let _ = std::fs::remove_file(&path_str);
         let _ = std::fs::remove_file(format!("{path_str}-wal"));
         let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    }
+
+    #[tokio::test]
+    async fn step2_give_up_never_keeps_an_unsaved_attempt() {
+        // Review round 2, defect AH: five `viewer_save_checks` failures in a
+        // row must not swap this attempt's own (never persisted)
+        // `checked`/`follows_me` into memory just because the worker gives
+        // up retrying step 2. `handle_step2_failure` promotes whatever
+        // `handle` still holds — the last data that actually saved — to
+        // `Ready`, so the in-memory circle ends up identical to what a fresh
+        // `GraphHandle::from_store` load of the same (unmodified) file would
+        // produce, just with `state` advanced to `ready`.
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("upstage-graph-queue-ah-{nanos}.sqlite3"));
+        let path_str = path.to_str().unwrap().to_string();
+        let follows: HashSet<u64> = [hash_did("did:plc:known")].into_iter().collect();
+        {
+            let seed = Store::open_path(&path_str).unwrap();
+            seed.viewer_save_circle("did:plc:viewer", "building_fm", 1, 1, &[], &follows).unwrap();
+        }
+        let read_only_store = Store::open_read_only(&path_str).unwrap();
+
+        let handle = GraphHandle::from_store(&read_only_store, 10).unwrap();
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let queue = handle.queue();
+        queue.try_pop(); // drop the restart re-enqueue; this test drives run_step2 itself.
+
+        let snapshot = SnapshotHandle::new();
+        snapshot.swap(Arc::new(Vec::new()), Arc::new(Vec::new())); // BC1b: no candidates.
+        let source = ManyFollowsSource { follows: Vec::new() };
+
+        for _ in 0..MAX_FIRST_BUILD_ATTEMPTS {
+            run_step2(
+                &viewer,
+                &handle,
+                &queue,
+                &read_only_store,
+                &source,
+                handle.get(&viewer).unwrap().as_ref().clone(),
+                &snapshot,
+                10,
+                None,
+                Duration::from_millis(5),
+            )
+            .await;
+        }
+
+        let result = handle.get(&viewer).expect("circle still exists");
+        assert_eq!(result.state, CircleState::Ready, "give-up promotes the circle to ready");
+
+        // A fresh load of the same, never-successfully-written-to file has
+        // exactly the same follows/checked/follows_me the give-up circle
+        // ended up with — nothing from the failed attempts leaked in.
+        let reload_store = Store::open_read_only(&path_str).unwrap();
+        let fresh = GraphHandle::from_store(&reload_store, 10).unwrap();
+        let fresh_circle = fresh.get(&viewer).expect("fresh load finds the same row");
+        assert_eq!(result.follows, fresh_circle.follows);
+        assert_eq!(result.checked, fresh_circle.checked);
+        assert_eq!(result.follows_me, fresh_circle.follows_me);
+
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    }
+
+    #[tokio::test]
+    async fn step2_give_up_does_not_recreate_a_deleted_viewer() {
+        // Review round 2, defect AI: if a concurrent step 1 give-up already
+        // removed the viewer's in-memory circle and its `viewers` row before
+        // step 2's own give-up runs, `handle_step2_failure` recreates
+        // neither: `GraphHandle::mark_ready` is a no-op with no circle to
+        // promote, and `Store::viewer_set_state_if_exists`'s plain `UPDATE`
+        // matches no row.
+        let store = memory_store();
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let queue = handle.queue();
+        handle.enqueue_first_build(viewer.clone(), unix_now());
+        handle.remove_after_giving_up(&viewer, unix_now(), 3_600);
+
+        for _ in 0..MAX_FIRST_BUILD_ATTEMPTS {
+            handle_step2_failure(&viewer, &queue, Duration::from_millis(5), &handle, &store).await;
+        }
+
+        assert!(handle.get(&viewer).is_none(), "no circle was recreated");
+        assert!(store.viewer_load_all().unwrap().is_empty(), "no viewers row was created");
     }
 
     #[tokio::test]

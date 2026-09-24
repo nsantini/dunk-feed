@@ -285,6 +285,31 @@ impl GraphHandle {
         self.swap_circle(viewer, circle, CircleState::Ready)
     }
 
+    /// Promotes the circle already held for `viewer` to `CircleState::Ready`
+    /// in place, bumping `circle_version` the same as [`Self::swap_circle`]
+    /// (review round 2, defect AH): unlike [`Self::insert_ready`], this takes
+    /// no `Circle` from the caller to swap in — it only re-saves whatever
+    /// data is already in memory (the last attempt that actually saved), so
+    /// a step 2 attempt's own unsaved `checked`/`follows_me` can never leak
+    /// into memory as `ready` just because the worker gave up retrying it.
+    /// `graph::queue::handle_step2_failure` calls this at step 2's give-up
+    /// (BC4b). Does nothing, under the same write lock as the read, when
+    /// `viewer` has no circle (review round 2, defect AI: e.g. a concurrent
+    /// step 1 give-up already removed it) — so this can never recreate a
+    /// circle for a viewer the store no longer has a row for either. Returns
+    /// the new `circle_version`, or `None` when there was no circle to
+    /// promote.
+    pub(crate) fn mark_ready(&self, viewer: &ViewerDid) -> Option<u64> {
+        let mut state = self.state.write().expect("GraphHandle state lock poisoned");
+        let existing = state.circles.get(viewer)?.clone();
+        let version = existing.circle_version + 1;
+        let mut circle = (*existing).clone();
+        circle.state = CircleState::Ready;
+        circle.circle_version = version;
+        state.circles.insert(viewer.clone(), Arc::new(circle));
+        Some(version)
+    }
+
     /// Removes `viewer`'s in-memory circle and starts a `cooldown_secs`
     /// cooldown before [`Self::enqueue_first_build`] accepts a new job for
     /// it (review round 1, defect W): the worker
