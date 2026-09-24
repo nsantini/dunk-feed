@@ -35,13 +35,16 @@ impl FollowsCache {
         Self::default()
     }
 
-    /// BC1a: fresh when `now - fetched_at < refresh_age_h * 3600`. Equal to
-    /// the age or older is stale. A `fetched_at` in the future (a clock
-    /// skew this binary never itself produces, but a restart could load
-    /// from an earlier crash) yields a negative difference, which is still
-    /// less than a positive age in seconds, so it reads as fresh.
+    /// BC1a as amended (review round 1, defect AK): fresh when `0 <= now -
+    /// fetched_at < refresh_age_h * 3600`. Equal to the age or older is
+    /// stale. A `fetched_at` later than `now` — a clock skew this binary
+    /// never itself produces, but a restart could load from an earlier
+    /// crash — yields a negative difference, which is stale too, so step 3
+    /// fetches that account again rather than trusting a forward-skewed
+    /// timestamp indefinitely.
     pub fn is_fresh(now: i64, fetched_at: i64, refresh_age_h: u32) -> bool {
-        now - fetched_at < i64::from(refresh_age_h) * 3600
+        let age = now - fetched_at;
+        age >= 0 && age < i64::from(refresh_age_h) * 3600
     }
 
     /// The cached entry for `account_did`, or `None` when there is none
@@ -141,11 +144,11 @@ mod tests {
 
     #[test]
     fn is_fresh_boundary() {
-        // BC1a: equal to the age is stale, one second younger is fresh, and
-        // a future fetched_at is fresh too.
+        // BC1a as amended (defect AK): equal to the age is stale, one
+        // second younger is fresh, and a future fetched_at is stale.
         assert!(!FollowsCache::is_fresh(1_000 + 3_600, 1_000, 1));
         assert!(FollowsCache::is_fresh(1_000 + 3_599, 1_000, 1));
-        assert!(FollowsCache::is_fresh(1_000, 1_000 + 10, 1));
+        assert!(!FollowsCache::is_fresh(1_000, 1_000 + 10, 1));
     }
 
     #[test]

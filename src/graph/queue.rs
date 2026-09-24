@@ -594,21 +594,25 @@ async fn handle_step2_failure(
 /// [`fetch_account_follows`] at `d2_follows_depth` (BC1), saved to SQLite
 /// (`Store::follows_put`) and, only on that save's success, put in the
 /// shared cache (BC4a: a `StoreError` here must never let memory hold a list
-/// SQLite lacks). A `PdsError` fetching one account, or a `StoreError`
-/// reading its freshness or saving its fetch, is logged with no DID (BC14)
-/// and the loop moves to the next account (BC4): that account keeps
-/// whatever entry it had before, stale or none, and no retry job is queued
-/// for it. Once every account has been tried, saves `viewers.state =
-/// 'ready'` best effort (`Store::viewer_set_state_if_exists`; a failure is
-/// logged with no DID and left as-is, BC4b — a restart's
-/// `GraphHandle::from_store` re-enqueues the still-`building_d2` row and
-/// runs step 3 again, skipping every account step 3 already made fresh),
-/// promotes the in-memory circle to `Ready` with a new `circle_version`
-/// (`GraphHandle::mark_ready`, BC5), drops the viewer's cached lists,
-/// completes the job and clears both attempt counts (BC5: step 3 itself has
-/// no retry or give-up count of its own, spec.md `## Defaults taken`, but
-/// clearing here is a no-op unless a stray count from an earlier attempt is
-/// still set).
+/// SQLite lacks) — and, right after that put, `drop_lists` is called for
+/// `viewer` (defect AJ, BC11b): a request that lands while the circle is
+/// still `building_d2` rebuilds its list against every degree-2 entry made
+/// fresh so far, one entry at a time, rather than only once the whole loop
+/// finishes. A `PdsError` fetching one account, or a `StoreError` reading
+/// its freshness or saving its fetch, is logged with no DID (BC14) and the
+/// loop moves to the next account (BC4): that account keeps whatever entry
+/// it had before, stale or none, and no retry job is queued for it, and
+/// `drop_lists` is not called for it either — nothing new was put. Once
+/// every account has been tried, saves `viewers.state = 'ready'` best
+/// effort (`Store::viewer_set_state_if_exists`; a failure is logged with no
+/// DID and left as-is, BC4b — a restart's `GraphHandle::from_store`
+/// re-enqueues the still-`building_d2` row and runs step 3 again, skipping
+/// every account step 3 already made fresh), promotes the in-memory circle
+/// to `Ready` with a new `circle_version` (`GraphHandle::mark_ready`, BC5),
+/// drops the viewer's cached lists once more, completes the job and clears
+/// both attempt counts (BC5: step 3 itself has no retry or give-up count of
+/// its own, spec.md `## Defaults taken`, but clearing here is a no-op
+/// unless a stray count from an earlier attempt is still set).
 #[allow(clippy::too_many_arguments)]
 async fn run_step3<S: GraphSource>(
     viewer: &ViewerDid,
@@ -659,6 +663,14 @@ async fn run_step3<S: GraphSource>(
             continue;
         }
         cache.put(account, now, hashed);
+        // Defect AJ: drop the viewer's cached list after each entry this
+        // loop puts, not only once at the end, so a request that lands
+        // while the circle is still `building_d2` (BC11b) rebuilds against
+        // every degree-2 entry step 3 has made fresh so far, rather than
+        // waiting for the whole loop to finish.
+        if let Some(drop_lists) = drop_lists {
+            drop_lists(&viewer.0);
+        }
     }
 
     if let Err(err) = store.viewer_set_state_if_exists(&viewer.0, CircleState::Ready.as_str()) {
@@ -1631,5 +1643,75 @@ mod tests {
         let circle = handle.get(&viewer).expect("circle still exists");
         assert_eq!(circle.state, CircleState::Ready, "step 3 completes with ready");
         assert!(queue.try_pop().is_none(), "the job completed, nothing re-queued");
+    }
+
+    #[tokio::test]
+    async fn step3_drops_lists_after_each_put_not_only_at_the_end() {
+        // Defect AJ, BC11b: `drop_lists` fires once per successful put (two
+        // accounts fetched here) plus once more when the loop finishes, not
+        // only the final call — a request arriving mid-loop must see a
+        // rebuilt list against every entry made fresh so far.
+        let store = memory_store();
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let mut circle = Circle::new();
+        circle.d2_sample = vec!["did:plc:a".to_string(), "did:plc:b".to_string()];
+        handle.swap_circle(&viewer, circle, CircleState::BuildingD2);
+        let queue = handle.queue();
+
+        let source = Step3Source {
+            follows: HashMap::from([
+                ("did:plc:a".to_string(), vec!["did:plc:fresh-a".to_string()]),
+                ("did:plc:b".to_string(), vec!["did:plc:fresh-b".to_string()]),
+            ]),
+            fail_accounts: HashSet::new(),
+            fetched: StdMutex::new(Vec::new()),
+        };
+
+        let dropped: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let dropped_for_closure = Arc::clone(&dropped);
+        let drop_lists: DropListsFn =
+            Arc::new(move |did: &str| dropped_for_closure.lock().unwrap().push(did.to_string()));
+
+        run_step3(&viewer, &handle, &queue, &store, &source, 100, 24, Some(&drop_lists)).await;
+
+        let calls = dropped.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["did:plc:viewer".to_string(), "did:plc:viewer".to_string(), "did:plc:viewer".to_string()],
+            "one drop per successful put (a, b), plus one more when the loop finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn step3_refetches_a_future_fetched_at() {
+        // Defect AK: `is_fresh` now treats a `fetched_at` later than `now`
+        // as stale, so step 3 fetches that account again instead of
+        // trusting a forward-skewed timestamp.
+        let store = memory_store();
+        let real_now = unix_now();
+        store
+            .follows_put("did:plc:a", real_now + 3_600, &[hash_did("did:plc:old")])
+            .unwrap();
+
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let mut circle = Circle::new();
+        circle.d2_sample = vec!["did:plc:a".to_string()];
+        handle.swap_circle(&viewer, circle, CircleState::BuildingD2);
+        let queue = handle.queue();
+
+        let source = Step3Source {
+            follows: HashMap::from([("did:plc:a".to_string(), vec!["did:plc:new".to_string()])]),
+            fail_accounts: HashSet::new(),
+            fetched: StdMutex::new(Vec::new()),
+        };
+
+        run_step3(&viewer, &handle, &queue, &store, &source, 100, 24, None).await;
+
+        let fetched = source.fetched.lock().unwrap().clone();
+        assert!(fetched.contains(&"did:plc:a".to_string()), "a future fetched_at is refetched");
+        let row = store.follows_get("did:plc:a").unwrap().unwrap();
+        assert_eq!(row.follows, vec![hash_did("did:plc:new")], "the stale future entry is replaced");
     }
 }
