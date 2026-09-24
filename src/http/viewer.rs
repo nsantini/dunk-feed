@@ -19,10 +19,11 @@
 //! still resolve exactly, without holding every list a viewer has ever
 //! seen (BC13).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::auth::ViewerDid;
+use crate::graph::cache::FollowsCache;
 use crate::graph::circle::Circle;
 use crate::graph::filter::{connected_indices, FilterItem};
 use crate::scorer::snapshot::{caps, FeedItem, Snapshot};
@@ -72,15 +73,27 @@ impl ViewerLists {
     /// key, whether it is the viewer's `current` or `previous` entry
     /// (BC13), or a freshly built one otherwise.
     ///
-    /// A fresh build filters `snapshot.items` with `connected_indices`
-    /// over `circle.follows` (BC9, BC12: an empty `follows` or no match
-    /// yields an empty list), then runs `caps::apply` on the kept indices
-    /// alone, in their already rank-ordered position within `snapshot.items`
-    /// (BC10). The result becomes the viewer's new `current` entry,
-    /// displacing the old `current` into `previous` — never displacing an
-    /// already-cached `previous`, so an in-flight page against that older
-    /// entry can still resolve after one rebuild.
-    pub fn list_for(&self, viewer: &ViewerDid, circle: &Circle, snapshot: &Snapshot) -> ViewerList {
+    /// A fresh build (a list-cache miss, story 08 BC11) unions
+    /// `follows_cache.degree2_set(&circle.d2_sample)` — memory only, no
+    /// SQLite read on this request path (BC11a) — into a temporary
+    /// degree-2 set, filters `snapshot.items` with `connected_indices`
+    /// over `circle.follows` and that set (BC7, BC8, BC9, BC12: an empty
+    /// `follows` and an empty degree-2 set yield an empty list), then runs
+    /// `caps::apply` on the kept indices alone, in their already
+    /// rank-ordered position within `snapshot.items` (BC10). The temporary
+    /// set is dropped when this call returns: it is never stored in
+    /// `circle`, `follows_cache`, or this cache (BC11). The result becomes
+    /// the viewer's new `current` entry, displacing the old `current` into
+    /// `previous` — never displacing an already-cached `previous`, so an
+    /// in-flight page against that older entry can still resolve after one
+    /// rebuild.
+    pub fn list_for(
+        &self,
+        viewer: &ViewerDid,
+        circle: &Circle,
+        snapshot: &Snapshot,
+        follows_cache: &FollowsCache,
+    ) -> ViewerList {
         let generation = snapshot.generation;
         let circle_version = circle.circle_version;
 
@@ -96,7 +109,7 @@ impl ViewerLists {
             }
         }
 
-        let fresh = build_list(circle, snapshot, self.follows_me_depth);
+        let fresh = build_list(circle, snapshot, self.follows_me_depth, follows_cache);
         let previous = entries.remove(viewer).map(|entry| entry.current);
         entries.insert(viewer.clone(), ViewerEntry { current: fresh.clone(), previous });
         fresh
@@ -117,23 +130,34 @@ fn matches(list: &ViewerList, generation: u64, circle_version: u64) -> bool {
     list.generation == generation && list.circle_version == circle_version
 }
 
-/// Filters `snapshot.items` to the ones connected to `circle`
-/// (`connected_indices`, BC9, BC12; network-feed story 07 BC5, BC6, BC6a
-/// for the `follows_me_depth` bound on a `follows_me`-only match), then
-/// applies the two page caps to the kept indices alone (BC10).
-/// `snapshot.items` is already rank-ordered (`scorer::snapshot::build`'s
-/// `sort_by_rank`), and `connected_indices` preserves input order, so the
-/// kept indices `caps::apply` receives are still in rank order — the same
-/// precondition `caps::apply` already assumes for the global list.
-fn build_list(circle: &Circle, snapshot: &Snapshot, follows_me_depth: usize) -> ViewerList {
+/// Filters `snapshot.items` to the ones connected to `circle`, or to the
+/// temporary degree-2 set built here from `follows_cache`
+/// (`connected_indices`, BC7, BC8, BC9, BC12; network-feed story 07 BC5,
+/// BC6, BC6a for the `follows_me_depth` bound on a `follows_me`-only
+/// match), then applies the two page caps to the kept indices alone
+/// (BC10). `snapshot.items` is already rank-ordered
+/// (`scorer::snapshot::build`'s `sort_by_rank`), and `connected_indices`
+/// preserves input order, so the kept indices `caps::apply` receives are
+/// still in rank order — the same precondition `caps::apply` already
+/// assumes for the global list, and the reason a degree-2 pair keeps its
+/// global rank order rather than any story-08 bonus or penalty (BC9,
+/// non-goal).
+fn build_list(
+    circle: &Circle,
+    snapshot: &Snapshot,
+    follows_me_depth: usize,
+    follows_cache: &FollowsCache,
+) -> ViewerList {
     let items: &[FeedItem] = snapshot.items.as_slice();
     let filter_items: Vec<FilterItem> = items
         .iter()
         .map(|item| FilterItem { quote_did: item.quote_did, original_did: item.original_did })
         .collect();
 
-    // No degree-2 sample yet (story 08 non-goal, spec.md `## Non-goals`).
-    let d2_set: HashSet<u64> = HashSet::new();
+    // BC11, BC11a: memory-only union over `circle.d2_sample`, built fresh
+    // on every list-cache miss and dropped when this function returns —
+    // never stored in `circle`, `follows_cache`, or `ViewerLists` itself.
+    let d2_set = follows_cache.degree2_set(&circle.d2_sample);
     let kept = connected_indices(&filter_items, circle, &d2_set, follows_me_depth);
     let capped = caps::apply(items, &kept);
 
@@ -195,9 +219,10 @@ mod tests {
         let circle = ready_circle(&[], 1);
         let snap = snapshot(1, vec![item("at://q/1", "cid1", 1, 2, 1_700_000_000, 3.0)]);
         let lists = ViewerLists::new(0);
+        let cache = FollowsCache::new();
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
-        let list = lists.list_for(&viewer, &circle, &snap);
+        let list = lists.list_for(&viewer, &circle, &snap, &cache);
 
         assert!(list.indices.is_empty());
     }
@@ -224,9 +249,10 @@ mod tests {
 
         let circle = ready_circle(&[connected_quoter], 1);
         let lists = ViewerLists::new(0);
+        let cache = FollowsCache::new();
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
-        let list = lists.list_for(&viewer, &circle, &snap);
+        let list = lists.list_for(&viewer, &circle, &snap, &cache);
 
         assert_eq!(list.indices.as_slice(), &[1], "only B, the connected pair, survives");
     }
@@ -258,9 +284,10 @@ mod tests {
         let snap = snapshot(1, items);
         let circle = ready_circle(&[connected], 1);
         let lists = ViewerLists::new(0);
+        let cache = FollowsCache::new();
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
-        let list = lists.list_for(&viewer, &circle, &snap);
+        let list = lists.list_for(&viewer, &circle, &snap, &cache);
 
         assert_eq!(list.indices.as_slice(), &[0], "only the one connected item is served");
     }
@@ -278,20 +305,21 @@ mod tests {
         );
         let circle_v1 = ready_circle(&[connected], 1);
         let lists = ViewerLists::new(0);
+        let cache = FollowsCache::new();
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
-        let first = lists.list_for(&viewer, &circle_v1, &snap);
-        let again = lists.list_for(&viewer, &circle_v1, &snap);
+        let first = lists.list_for(&viewer, &circle_v1, &snap, &cache);
+        let again = lists.list_for(&viewer, &circle_v1, &snap, &cache);
         assert!(Arc::ptr_eq(&first.indices, &again.indices), "same key must hit the cache");
 
         // A new circle_version (the worker swapped in a fresh circle)
         // builds a fresh entry; the old one is still reachable as
         // `previous` at its own key.
         let circle_v2 = ready_circle(&[connected], 2);
-        let second = lists.list_for(&viewer, &circle_v2, &snap);
+        let second = lists.list_for(&viewer, &circle_v2, &snap, &cache);
         assert_eq!(second.circle_version, 2);
 
-        let still_v1 = lists.list_for(&viewer, &circle_v1, &snap);
+        let still_v1 = lists.list_for(&viewer, &circle_v1, &snap, &cache);
         assert!(
             Arc::ptr_eq(&first.indices, &still_v1.indices),
             "the displaced entry must still resolve from `previous`"
@@ -314,9 +342,10 @@ mod tests {
         let snap = snapshot(1, items);
         let circle = circle_with_follows_me(&[], &[author], 1);
         let lists = ViewerLists::new(2);
+        let cache = FollowsCache::new();
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
-        let list = lists.list_for(&viewer, &circle, &snap);
+        let list = lists.list_for(&viewer, &circle, &snap, &cache);
 
         assert_eq!(
             list.indices.as_slice(),
@@ -353,9 +382,10 @@ mod tests {
         let snap = snapshot(1, items);
         let circle = circle_with_follows_me(&[step1_author], &[fm_author], 1);
         let lists = ViewerLists::new(5);
+        let cache = FollowsCache::new();
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
-        let list = lists.list_for(&viewer, &circle, &snap);
+        let list = lists.list_for(&viewer, &circle, &snap, &cache);
 
         assert_eq!(
             list.indices.as_slice(),
@@ -375,15 +405,100 @@ mod tests {
         );
         let circle = ready_circle(&[connected], 1);
         let lists = ViewerLists::new(0);
+        let cache = FollowsCache::new();
         let viewer = ViewerDid("did:plc:viewer".to_string());
 
-        let first = lists.list_for(&viewer, &circle, &snap);
+        let first = lists.list_for(&viewer, &circle, &snap, &cache);
         lists.drop_viewer(&viewer);
-        let after_drop = lists.list_for(&viewer, &circle, &snap);
+        let after_drop = lists.list_for(&viewer, &circle, &snap, &cache);
 
         assert!(
             !Arc::ptr_eq(&first.indices, &after_drop.indices),
             "a dropped viewer must rebuild, not hit a stale cache entry"
+        );
+    }
+
+    /// A circle with `d2_sample` set, on top of `ready_circle`'s `follows`
+    /// (story 08).
+    fn circle_with_d2_sample(follows: &[u64], d2_sample: &[&str], circle_version: u64) -> Circle {
+        let mut circle = ready_circle(follows, circle_version);
+        circle.d2_sample = d2_sample.iter().map(|did| did.to_string()).collect();
+        circle
+    }
+
+    // AC4; BC7, BC9: an author only reachable through a sampled account's
+    // cached follows is kept past `follows_me_depth`, at its own place in
+    // rank order — no bonus or penalty (story 08 non-goal).
+    #[test]
+    fn degree2_kept_same_rank() {
+        let d2_author = hash_did("did:plc:degree2-author");
+        let items = vec![
+            item("at://q/0", "cid0", hash_did("did:plc:other"), hash_did("did:plc:o0"), 1, 30.0),
+            item("at://q/1", "cid1", d2_author, hash_did("did:plc:o1"), 1, 20.0),
+            item("at://q/2", "cid2", hash_did("did:plc:other2"), hash_did("did:plc:o2"), 1, 10.0),
+        ];
+        let snap = snapshot(1, items);
+        let circle = circle_with_d2_sample(&[], &["did:plc:sampled"], 1);
+        let lists = ViewerLists::new(0);
+        let cache = FollowsCache::new();
+        cache.put("did:plc:sampled", 1, vec![d2_author]);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+
+        let list = lists.list_for(&viewer, &circle, &snap, &cache);
+
+        assert_eq!(
+            list.indices.as_slice(),
+            &[1],
+            "only the degree-2 author's item is kept, at its own rank position"
+        );
+    }
+
+    // AC5, BC8: an author who only follows a follower of the viewer, or
+    // only follows the viewer, is not a degree-2 match — `d2_sample` names
+    // the accounts the viewer follows, not the viewer or its followers,
+    // so their cached follows never enter the degree-2 set.
+    #[test]
+    fn no_followers_of_followers() {
+        let unrelated = hash_did("did:plc:unrelated");
+        let items = vec![item("at://q/0", "cid0", unrelated, hash_did("did:plc:o0"), 1, 10.0)];
+        let snap = snapshot(1, items);
+        // "did:plc:follower-of-viewer" is not in `d2_sample`, so caching
+        // its follows (which include `unrelated`) must not matter.
+        let circle = circle_with_d2_sample(&[], &["did:plc:sampled"], 1);
+        let lists = ViewerLists::new(0);
+        let cache = FollowsCache::new();
+        cache.put("did:plc:follower-of-viewer", 1, vec![unrelated]);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+
+        let list = lists.list_for(&viewer, &circle, &snap, &cache);
+
+        assert!(list.indices.is_empty(), "a follower of a follower is not a degree-2 match");
+    }
+
+    // AC6; BC10: everything step 1 and step 2 already kept (`follows`,
+    // `follows_me`) stays kept once step 3 adds degree-2 entries to the
+    // cache.
+    #[test]
+    fn step3_keeps_earlier_items() {
+        let step1_author = hash_did("did:plc:step1-author");
+        let d2_author = hash_did("did:plc:degree2-author");
+        let items = vec![
+            item("at://q/s1", "cid-s1", step1_author, hash_did("did:plc:o-s1"), 1, 30.0),
+            item("at://q/d2", "cid-d2", d2_author, hash_did("did:plc:o-d2"), 1, 20.0),
+        ];
+        let snap = snapshot(1, items);
+        let circle = circle_with_d2_sample(&[step1_author], &["did:plc:sampled"], 1);
+        let lists = ViewerLists::new(0);
+        let cache = FollowsCache::new();
+        cache.put("did:plc:sampled", 1, vec![d2_author]);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+
+        let list = lists.list_for(&viewer, &circle, &snap, &cache);
+
+        assert_eq!(
+            list.indices.as_slice(),
+            &[0, 1],
+            "the step 1 item and the new degree-2 item both survive"
         );
     }
 }

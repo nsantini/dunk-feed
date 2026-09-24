@@ -429,7 +429,7 @@ fn build_personal<'a>(
     // and caps it exactly as it would a `Ready` circle, so this branch
     // needs no special case beyond the `BuildingD1` one above.
 
-    let list = state.viewer_lists.list_for(viewer, &circle, current);
+    let list = state.viewer_lists.list_for(viewer, &circle, current, &graph.follows_cache());
     let items = current.items.as_slice();
 
     let start = resolve_personal_start(&list, items, cursor_value);
@@ -1305,6 +1305,90 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["feed"].as_array().unwrap().len(), 1);
         assert_eq!(json["feed"][0]["post"], "at://q/fm-connected");
+    }
+
+    // AC4; BC11b: a circle in `building_d2` (step 2 done, step 3 not yet
+    // finished) is served like a `building_fm` circle — step 1 and step 2
+    // data, plus whatever degree-2 entries the shared `FollowsCache`
+    // already holds for `d2_sample` at the time of the request.
+    #[tokio::test]
+    async fn building_d2_serves_step1_and_step2_data_plus_cache_so_far() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did = "did:plc:buildingd2vieweraaaaaaaa";
+        let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+        let viewer = crate::auth::ViewerDid(did.to_string());
+
+        let quoter = crate::graph::hash_did("did:plc:building-d2-quoter");
+        let d2_author = crate::graph::hash_did("did:plc:building-d2-degree2-author");
+        let graph = crate::graph::GraphHandle::new(10);
+        let mut circle = crate::graph::Circle::new();
+        circle.follows = [quoter].into_iter().collect();
+        circle.d2_sample = vec!["did:plc:building-d2-sampled".to_string()];
+        graph.swap_circle(&viewer, circle, crate::graph::CircleState::BuildingD2);
+        // Step 3 is mid-run: this one account already has a fresh entry.
+        graph.follows_cache().put("did:plc:building-d2-sampled", now, vec![d2_author]);
+
+        let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph);
+        let step1_item = item_with_authors(
+            "at://q/d2-step1",
+            "cid-d2-step1",
+            quoter,
+            crate::graph::hash_did("did:plc:d2-step1-original"),
+            1_700_000_000,
+            10.0,
+        );
+        let degree2_item = item_with_authors(
+            "at://q/d2-degree2",
+            "cid-d2-degree2",
+            d2_author,
+            crate::graph::hash_did("did:plc:d2-degree2-original"),
+            1_700_000_000,
+            20.0,
+        );
+        let unconnected_item = item_with_authors(
+            "at://q/d2-unconnected",
+            "cid-d2-unconnected",
+            crate::graph::hash_did("did:plc:d2-other-quoter"),
+            crate::graph::hash_did("did:plc:d2-other-original"),
+            1_700_000_000,
+            30.0,
+        );
+        swap_items(&state, vec![unconnected_item, degree2_item, step1_item]);
+
+        let app = router(state);
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let posts: Vec<&str> = json["feed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["post"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            posts,
+            vec!["at://q/d2-degree2", "at://q/d2-step1"],
+            "the step 1 item and the degree-2 item served so far both appear, in rank order"
+        );
     }
 
     // BC6a: at `UPSTAGE_MAX_VIEWERS`, a new viewer's personalised request

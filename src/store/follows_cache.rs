@@ -38,13 +38,10 @@ pub fn encode(follows: &[u64]) -> Vec<u8> {
 /// this binary is the only writer, so a bad length can only be a partial
 /// write from an earlier crash.
 pub fn decode(bytes: &[u8]) -> Result<Vec<u64>, StoreError> {
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return Err(StoreError::MalformedRow { table: "follows_cache", column: "follows" });
     }
-    Ok(bytes
-        .chunks_exact(8)
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes")))
-        .collect())
+    Ok(bytes.as_chunks::<8>().0.iter().map(|chunk| u64::from_le_bytes(*chunk)).collect())
 }
 
 /// Reads the row for `account_did`. `Ok(None)` when there is none. A
