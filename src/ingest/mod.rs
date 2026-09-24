@@ -828,7 +828,9 @@ async fn wait_for_shutdown_signal() {
 /// is dropped the moment it swaps in (BC7). `snapshot` is step 2's source of
 /// candidates (network-feed story 07, BC1) and `follows_me_depth` is
 /// `cfg.follows_me_depth`; both pass straight through to
-/// `graph::run_worker`.
+/// `graph::run_worker`, along with `cfg.d2_follows_depth` and
+/// `cfg.d2_refresh_age_h` (network-feed story 08), step 3's per-account
+/// fetch depth and freshness window.
 fn start_graph_subsystem(
     cfg: &Config,
     viewer_lists: std::sync::Arc<crate::http::viewer::ViewerLists>,
@@ -885,6 +887,9 @@ fn start_graph_subsystem(
     let worker_handle = std::sync::Arc::clone(&graph_handle);
     let worker_store = graph_store.clone();
     let follows_me_depth = cfg.follows_me_depth as usize;
+    // Story 08: step 3's per-account fetch depth and freshness window.
+    let d2_follows_depth = cfg.d2_follows_depth;
+    let d2_refresh_age_h = cfg.d2_refresh_age_h;
     tokio::spawn(crate::graph::run_worker(
         worker_handle,
         worker_store,
@@ -893,6 +898,8 @@ fn start_graph_subsystem(
         Some(drop_lists),
         snapshot,
         follows_me_depth,
+        d2_follows_depth,
+        d2_refresh_age_h,
     ));
 
     let flush_handle = std::sync::Arc::clone(&graph_handle);
