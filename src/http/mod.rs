@@ -11,6 +11,7 @@ pub mod did;
 pub mod health;
 pub mod interactions;
 pub mod skeleton;
+pub mod viewer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
