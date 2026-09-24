@@ -633,8 +633,15 @@ mod tests {
         }
         for i in 4..100u32 {
             let did = format!("did:plc:{i:024}");
-            assert!(!cache.should_send_miss(&did, 0), "a full map of in-flight DIDs drops the new one");
-            assert_eq!(cache.misses.lock().unwrap().len(), 4, "misses must never exceed max_entries");
+            assert!(
+                !cache.should_send_miss(&did, 0),
+                "a full map of in-flight DIDs drops the new one"
+            );
+            assert_eq!(
+                cache.misses.lock().unwrap().len(),
+                4,
+                "misses must never exceed max_entries"
+            );
         }
     }
 
@@ -659,7 +666,10 @@ mod tests {
         cache.miss_fetch_failed(also_cooling, 0);
 
         let fifth = "did:plc:444444444444444444444444";
-        assert!(!cache.should_send_miss(fifth, 1), "no room and nothing prunable: the new DID is dropped");
+        assert!(
+            !cache.should_send_miss(fifth, 1),
+            "no room and nothing prunable: the new DID is dropped"
+        );
         assert_eq!(cache.misses.lock().unwrap().len(), 4, "nothing already tracked is evicted");
 
         // The four original DIDs kept exactly the state they had: the two
@@ -832,10 +842,7 @@ mod tests {
             !cache.should_send_miss(did, now + 1),
             "a keyless document counts as a failed attempt and starts the cooldown"
         );
-        assert!(
-            cache.should_send_miss(did, now + 3601),
-            "the cooldown ends after an hour"
-        );
+        assert!(cache.should_send_miss(did, now + 3601), "the cooldown ends after an hour");
     }
 
     #[test]
