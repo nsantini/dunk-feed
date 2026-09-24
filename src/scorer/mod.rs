@@ -447,13 +447,13 @@ async fn snapshot_step(
 ) -> Result<(), ScorerError> {
     let store_read = store.clone();
     let weights = *weights;
-    let items = blocking(move || {
+    let (items, global) = blocking(move || {
         let rows = store_read.feed_rows()?;
         Ok(snapshot::build(rows, &weights, now, k))
     })
     .await?;
-    counters.snapshot_len = items.len();
-    snapshot.swap(Arc::new(items));
+    counters.snapshot_len = global.len();
+    snapshot.swap(Arc::new(items), Arc::new(global));
 
     let store_meta = store.clone();
     let now_str = now.to_string();
@@ -1280,15 +1280,15 @@ mod tests {
         let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
         let snapshot = SnapshotHandle::new();
 
-        assert!(snapshot.current().is_empty(), "BC41: empty before the first pass");
+        assert!(snapshot.current().items.is_empty(), "BC41: empty before the first pass");
 
         let counters =
             one_pass(&store, &source, &cfg, &evict_tx, now, false, &snapshot).await.unwrap();
 
         assert_eq!(counters.snapshot_len, 1);
         let current = snapshot.current();
-        assert_eq!(current.len(), 1);
-        assert_eq!(current[0].quote_uri, quote_uri);
+        assert_eq!(current.global.len(), 1, "BC10: snapshot_len equals global.len()");
+        assert_eq!(current.items[current.global[0] as usize].quote_uri, quote_uri);
         assert_eq!(store.meta_get("last_scorer_pass").unwrap(), Some(now.to_string()));
     }
 

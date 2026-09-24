@@ -184,21 +184,25 @@ fn filter_item(row: &FeedRow) -> FilterItem {
 
 /// `rows`, reordered to match the current snapshot's ranked order: runs
 /// `scorer::snapshot::build` (the same ranking and capping the served feed
-/// uses, `src/scorer/snapshot.rs`, untouched by this story) and maps each
-/// `FeedItem` it returns back to its own `FeedRow` by `quote_uri` (step 7.5,
-/// review round 1, finding 6; spec.md "Defaults taken" and `## Answers from
-/// the engineer`). `step_follows_me`'s candidates, the connection filter's
-/// `follows_me_depth` check and the circle-pairs window all read "ranked
-/// order" as this order, not `Store::feed_rows`'s own row order — the two
-/// can differ once the snapshot's caps drop or reorder rows. A `quote_uri`
-/// `snapshot::build` returns that no longer matches any input row (it never
-/// invents one) is silently dropped, since the caller only wants the rows
-/// that survived ranking, in that order.
+/// uses, `src/scorer/snapshot.rs`, story 01) and maps each item `global`
+/// names back to its own `FeedRow` by `quote_uri` (step 7.5, review round 1,
+/// finding 6; spec.md "Defaults taken" and `## Answers from the engineer`;
+/// BC11: `global` carries the `01` caps, so this order is unchanged from
+/// before story 01). `step_follows_me`'s candidates, the connection
+/// filter's `follows_me_depth` check and the circle-pairs window all read
+/// "ranked order" as this order, not `Store::feed_rows`'s own row order —
+/// the two can differ once the caps drop or reorder rows. A `quote_uri`
+/// `build` returns that no longer matches any input row (it never invents
+/// one) is silently dropped, since the caller only wants the rows that
+/// survived ranking, in that order.
 fn ranked_order(rows: Vec<FeedRow>, weights: &Weights, now: i64, k: f64) -> Vec<FeedRow> {
     let by_uri: HashMap<String, FeedRow> =
         rows.iter().map(|row| (row.quote_uri.clone(), row.clone())).collect();
-    let items = snapshot::build(rows, weights, now, k);
-    items.into_iter().filter_map(|item| by_uri.get(&item.quote_uri).cloned()).collect()
+    let (items, global) = snapshot::build(rows, weights, now, k);
+    global
+        .into_iter()
+        .filter_map(|idx| by_uri.get(&items[idx as usize].quote_uri).cloned())
+        .collect()
 }
 
 /// On the real `feed` rows, the count of kept items whose `promoted_at` is

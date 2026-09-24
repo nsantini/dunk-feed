@@ -47,9 +47,11 @@ fn body_and_status(
 }
 
 /// `snapshot.current()` is called exactly once per request (BC36).
+/// `snapshot_len` is `global.len()` (BC9), the number of items actually
+/// served, not the uncapped `items.len()`.
 pub async fn handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let now = store::unix_now();
-    let snapshot_len = state.snapshot.current().len();
+    let snapshot_len = state.snapshot.current().global.len();
     let (status, body) = body_and_status(&state.health, &state.cfg, snapshot_len, now);
     (status, Json(body))
 }

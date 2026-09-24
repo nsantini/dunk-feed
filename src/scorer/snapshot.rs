@@ -9,7 +9,9 @@
 //! `swap` only for the atomic pointer replacement (BC33 of story 07,
 //! BC49).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use crate::graph;
@@ -53,10 +55,17 @@ pub struct FeedItem {
 /// (`src/http/cursor.rs`) carries this `generation` alongside an index so a
 /// page can resume from an exact position in a list the handle still holds,
 /// without rescanning (BC48, BC53).
+///
+/// `items` is the full ranked list, uncapped (BC2); `global` is the `01`
+/// caps applied to every index (BC3), the list `getFeedSkeleton` actually
+/// pages over. A cursor index (`src/http/skeleton.rs`) is a position in
+/// `global`, never in `items` directly, so `global[index]` is the step from
+/// a served position back to the `FeedItem` it names.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub generation: u64,
     pub items: Arc<Vec<FeedItem>>,
+    pub global: Arc<Vec<u32>>,
 }
 
 /// The two generations `SnapshotHandle` keeps: `current` is what `current()`
@@ -86,34 +95,39 @@ impl SnapshotHandle {
     pub fn new() -> Self {
         SnapshotHandle {
             inner: Arc::new(RwLock::new(Inner {
-                current: Snapshot { generation: 0, items: Arc::new(Vec::new()) },
+                current: Snapshot {
+                    generation: 0,
+                    items: Arc::new(Vec::new()),
+                    global: Arc::new(Vec::new()),
+                },
                 previous: None,
             })),
         }
     }
 
-    /// The current generation's items. Cloning the returned `Arc` is cheap
-    /// and never blocks a concurrent `swap`. `src/http/skeleton.rs` and
+    /// The current generation, `items` and `global` both. Cloning the
+    /// returned `Snapshot` is cheap (two `Arc` clones and a `u64`) and never
+    /// blocks a concurrent `swap`. `src/http/skeleton.rs` and
     /// `src/http/health.rs` both call this.
-    pub fn current(&self) -> Arc<Vec<FeedItem>> {
-        self.inner.read().expect("snapshot lock poisoned").current.items.clone()
+    pub fn current(&self) -> Snapshot {
+        self.inner.read().expect("snapshot lock poisoned").current.clone()
     }
 
-    /// Replaces the snapshot with `new` under the write lock: the
-    /// generation counter increments by one, the outgoing `current` becomes
-    /// `previous` (displacing whatever `previous` held before), and `new`
-    /// becomes `current` at the incremented generation (BC49). `new` must
-    /// already be fully built: the caller (the scorer's snapshot step) does
-    /// every bit of ranking and capping work outside this call, so the lock
-    /// is held only for the pointer swap and a reader never observes a
-    /// partially built list (BC33 of story 07). The first pass therefore
-    /// produces generation 1.
-    pub fn swap(&self, new: Arc<Vec<FeedItem>>) {
+    /// Replaces the snapshot with `items` and `global` under the write
+    /// lock: the generation counter increments by one, the outgoing
+    /// `current` becomes `previous` (displacing whatever `previous` held
+    /// before), and the new pair becomes `current` at the incremented
+    /// generation (BC49). Both must already be fully built: the caller (the
+    /// scorer's snapshot step) does every bit of ranking and capping work
+    /// outside this call, so the lock is held only for the pointer swap and
+    /// a reader never observes a partially built list (BC33 of story 07).
+    /// The first pass therefore produces generation 1.
+    pub fn swap(&self, items: Arc<Vec<FeedItem>>, global: Arc<Vec<u32>>) {
         let mut guard = self.inner.write().expect("snapshot lock poisoned");
         let next_generation = guard.current.generation + 1;
         let outgoing = std::mem::replace(
             &mut guard.current,
-            Snapshot { generation: next_generation, items: new },
+            Snapshot { generation: next_generation, items, global },
         );
         guard.previous = Some(outgoing);
     }
@@ -194,13 +208,42 @@ fn sort_by_rank(rows: &mut [FeedRow]) {
     rows.sort_by(|a, b| cmp_rank_then_cid((a.rank, &a.quote_cid), (b.rank, &b.quote_cid)));
 }
 
-/// Cap 1: one item per `(original_did, UTC day of quoted_at)`, keeping the
-/// highest rank (BC28). `rows` is already sorted `rank DESC, quote_cid ASC`
-/// on entry, so keeping the first row seen for each key keeps the
-/// highest-rank one and breaks a rank tie on `quote_cid ASC`, matching the
-/// sort. The UTC day is `quoted_at.div_euclid(86_400)`, the day number
-/// since the Unix epoch in UTC; integer division by the day length is exact
-/// for this grouping and needs no calendar library.
+/// Turns one ranked `FeedRow` into its `FeedItem` (BC1), hashing both DIDs
+/// through `graph::hash_did` rather than carrying the strings forward.
+/// `ratios` is `recompute_ranks`'s output, keyed by `quote_cid`, so `build`
+/// can fill `FeedItem.ratio` (BC24) from the `D` this pass recomputed,
+/// without re-deriving it from counts the snapshot does not carry.
+fn to_feed_item(row: FeedRow, ratios: &HashMap<String, f64>) -> FeedItem {
+    // `ratios` is keyed by every row `recompute_ranks` saw this pass, so a
+    // row reaching here always has an entry; `unwrap_or(0.0)` is defence in
+    // depth only, never expected to fire.
+    let ratio = ratios.get(&row.quote_cid).copied().unwrap_or(0.0);
+    let quote_did = graph::hash_did(&row.quote_did);
+    let original_did = graph::hash_did(&row.original_did);
+    FeedItem {
+        quote_uri: row.quote_uri,
+        quote_cid: row.quote_cid,
+        rank: row.rank,
+        ratio,
+        quote_did,
+        original_did,
+        quoted_at: row.quoted_at,
+        promoted_at: row.promoted_at,
+    }
+}
+
+/// Cap 1 (the `01` oracle): one item per `(original_did, UTC day of
+/// quoted_at)`, keeping the highest rank (BC28). `rows` is already sorted
+/// `rank DESC, quote_cid ASC` on entry, so keeping the first row seen for
+/// each key keeps the highest-rank one and breaks a rank tie on `quote_cid
+/// ASC`, matching the sort. The UTC day is `quoted_at.div_euclid(86_400)`,
+/// the day number since the Unix epoch in UTC; integer division by the day
+/// length is exact for this grouping and needs no calendar library.
+///
+/// Kept only as `build_v1_capped_oracle`'s helper (`## Approach`: the old
+/// string-based `build` stays as a test-only oracle) — `caps::apply` is the
+/// production cap 1 now, over `u64` hashes and `u32` indices.
+#[cfg(test)]
 fn apply_cap_one_per_author_per_day(rows: Vec<FeedRow>) -> Vec<FeedRow> {
     let mut seen: HashSet<(String, i64)> = HashSet::with_capacity(rows.len());
     let mut kept = Vec::with_capacity(rows.len());
@@ -215,6 +258,9 @@ fn apply_cap_one_per_author_per_day(rows: Vec<FeedRow>) -> Vec<FeedRow> {
 
 /// Adds `row` to `output`, then records its quoter in the trailing window,
 /// dropping the oldest entry once the window holds more than `window` DIDs.
+/// `build_v1_capped_oracle`'s own helper, mirrored by `caps::push_kept` for
+/// production use over indices.
+#[cfg(test)]
 fn push_kept(
     row: FeedRow,
     output: &mut Vec<FeedItem>,
@@ -274,6 +320,11 @@ fn push_kept(
 /// entry per deferred row, in the order it was deferred — so the row
 /// actually released at each step, and the whole output order, are
 /// identical to the previous scan-based version.
+///
+/// `build_v1_capped_oracle`'s own cap 2, kept only as the `01` oracle
+/// `global_matches_v1` checks against; `caps::apply` is the production cap
+/// 2 now.
+#[cfg(test)]
 fn apply_cap_one_per_quoter_per_50(
     rows: Vec<FeedRow>,
     ratios: &HashMap<String, f64>,
@@ -322,11 +373,42 @@ fn apply_cap_one_per_quoter_per_50(
     output
 }
 
-/// The full snapshot step, TECH-DESIGN section 7.3: recompute rank, sort,
-/// cap 1, cap 2. Pure and synchronous, so the caller can build it outside
-/// the `SnapshotHandle`'s lock (BC33). `k` reaches here from `Config`
-/// (round 2 finding 7, BC50), never a literal.
-pub fn build(mut rows: Vec<FeedRow>, weights: &Weights, now: i64, k: f64) -> Vec<FeedItem> {
+/// The full snapshot step, TECH-DESIGN section 7.3 and section 9.1:
+/// recompute rank, sort, then hash every row into a `FeedItem` with no cap
+/// applied (BC2) — `items` holds every row, dropping none. `global` is
+/// `caps::apply` run over every index in that order (BC3), the `01` caps
+/// this pass produces. Pure and synchronous, so the caller can build it
+/// outside the `SnapshotHandle`'s lock (BC33). `k` reaches here from
+/// `Config` (round 2 finding 7, BC50), never a literal.
+pub fn build(
+    mut rows: Vec<FeedRow>,
+    weights: &Weights,
+    now: i64,
+    k: f64,
+) -> (Vec<FeedItem>, Vec<u32>) {
+    let ratios = recompute_ranks(&mut rows, weights, now, k);
+    sort_by_rank(&mut rows);
+    let items: Vec<FeedItem> = rows.into_iter().map(|row| to_feed_item(row, &ratios)).collect();
+    let indices: Vec<u32> = (0..items.len() as u32).collect();
+    let global = caps::apply(&items, &indices);
+    (items, global)
+}
+
+/// The `01` oracle, TECH-DESIGN section 7.3 as it stood before this story:
+/// recompute rank, sort, cap 1, cap 2 — all over `FeedRow` and DID strings,
+/// producing the capped `Vec<FeedItem>` `build` itself used to return.
+/// `#[cfg(test)]` only: `global_matches_v1` (this module) and
+/// `http::skeleton::tests::global_output_unchanged` both check the new
+/// `build` plus `caps::apply` against this, never the other way around
+/// (`## Approach`: "the old string-based `build` stays as a `#[cfg(test)]`
+/// oracle for the regression test").
+#[cfg(test)]
+pub(crate) fn build_v1_capped_oracle(
+    mut rows: Vec<FeedRow>,
+    weights: &Weights,
+    now: i64,
+    k: f64,
+) -> Vec<FeedItem> {
     let ratios = recompute_ranks(&mut rows, weights, now, k);
     sort_by_rank(&mut rows);
     let capped_by_author = apply_cap_one_per_author_per_day(rows);
@@ -382,7 +464,8 @@ mod tests {
     #[test]
     fn fresh_handle_reads_empty() {
         let handle = SnapshotHandle::new();
-        assert_eq!(*handle.current(), Vec::<FeedItem>::new());
+        assert_eq!(*handle.current().items, Vec::<FeedItem>::new());
+        assert_eq!(*handle.current().global, Vec::<u32>::new());
     }
 
     #[test]
@@ -398,8 +481,10 @@ mod tests {
             quoted_at: 1_700_000_000,
             promoted_at: 1_700_000_000,
         }];
-        handle.swap(Arc::new(items.clone()));
-        assert_eq!(*handle.current(), items);
+        let global = vec![0u32];
+        handle.swap(Arc::new(items.clone()), Arc::new(global.clone()));
+        assert_eq!(*handle.current().items, items);
+        assert_eq!(*handle.current().global, global);
     }
 
     // BC48: a fresh handle's current generation is 0, with no previous.
@@ -429,13 +514,16 @@ mod tests {
             quoted_at: 1_700_000_000,
             promoted_at: 1_700_000_000,
         }];
-        handle.swap(Arc::new(gen1_items.clone()));
+        let gen1_global = vec![0u32];
+        handle.swap(Arc::new(gen1_items.clone()), Arc::new(gen1_global.clone()));
         let (current, previous) = handle.generations();
         assert_eq!(current.generation, 1, "the first pass produces generation 1");
         assert_eq!(*current.items, gen1_items);
+        assert_eq!(*current.global, gen1_global);
         let previous = previous.expect("generation 0 becomes previous, even though it was empty");
         assert_eq!(previous.generation, 0);
         assert!(previous.items.is_empty());
+        assert!(previous.global.is_empty());
 
         let gen2_items = vec![FeedItem {
             quote_uri: "at://did:plc:q/app.bsky.feed.post/2".to_string(),
@@ -447,13 +535,16 @@ mod tests {
             quoted_at: 1_700_000_000,
             promoted_at: 1_700_000_000,
         }];
-        handle.swap(Arc::new(gen2_items.clone()));
+        let gen2_global = vec![0u32];
+        handle.swap(Arc::new(gen2_items.clone()), Arc::new(gen2_global.clone()));
         let (current, previous) = handle.generations();
         assert_eq!(current.generation, 2);
         assert_eq!(*current.items, gen2_items);
+        assert_eq!(*current.global, gen2_global);
         let previous = previous.expect("generation 1 becomes previous");
         assert_eq!(previous.generation, 1);
         assert_eq!(*previous.items, gen1_items);
+        assert_eq!(*previous.global, gen1_global);
     }
 
     // BC50: `generations()` clones both `Arc`s under one read lock, so it
@@ -462,17 +553,20 @@ mod tests {
     #[test]
     fn generations_reads_current_and_previous_together() {
         let handle = SnapshotHandle::new();
-        handle.swap(Arc::new(vec![]));
-        handle.swap(Arc::new(vec![FeedItem {
-            quote_uri: "at://did:plc:q/app.bsky.feed.post/only".to_string(),
-            quote_cid: "cid-only".to_string(),
-            rank: 5.0,
-            ratio: 5.0,
-            quote_did: 1,
-            original_did: 2,
-            quoted_at: 1_700_000_000,
-            promoted_at: 1_700_000_000,
-        }]));
+        handle.swap(Arc::new(vec![]), Arc::new(vec![]));
+        handle.swap(
+            Arc::new(vec![FeedItem {
+                quote_uri: "at://did:plc:q/app.bsky.feed.post/only".to_string(),
+                quote_cid: "cid-only".to_string(),
+                rank: 5.0,
+                ratio: 5.0,
+                quote_did: 1,
+                original_did: 2,
+                quoted_at: 1_700_000_000,
+                promoted_at: 1_700_000_000,
+            }]),
+            Arc::new(vec![0u32]),
+        );
         let (current, previous) = handle.generations();
         assert_eq!(current.generation, 2);
         let previous = previous.expect("second swap leaves a previous generation");
@@ -528,11 +622,12 @@ mod tests {
         r.v_likes_q = 100;
         r.v_likes_o = 20;
 
-        let items = build(vec![r], &weights(), now, 5.0);
+        let (items, global) = build(vec![r], &weights(), now, 5.0);
 
         // D = eq / (eo + k) = 100 / (20 + 5) = 4.0.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].ratio, 4.0);
+        assert_eq!(global, vec![0]);
     }
 
     // AC6, BC28: two items sharing (original_did, UTC day) keep only the
@@ -818,8 +913,60 @@ mod tests {
             ),
         ];
 
-        let items = build(rows, &weights(), now, 5.0);
+        let (items, global) = build(rows, &weights(), now, 5.0);
 
-        assert_eq!(items.len(), 1, "cap 1 drops the second same-author-same-day row");
+        assert_eq!(items.len(), 2, "BC2: items is uncapped, every row survives");
+        assert_eq!(global.len(), 1, "cap 1 drops the second same-author-same-day row from global");
+    }
+
+    /// A fixture wide enough to exercise cap 1's drop, cap 2's deferral, and
+    /// a rank tie all at once: `a` and `b` share `(original_did, day)` at a
+    /// rank tie broken by `quote_cid`, so cap 1 keeps only one; `first` and
+    /// `again` share a quoter within the 49-item window, so cap 2 defers
+    /// `again` behind the filler rows.
+    fn ac1_fixture(now: i64) -> Vec<FeedRow> {
+        let day_start = now.div_euclid(86_400) * 86_400;
+        let mut rows = vec![
+            row("at://did:plc:q/app.bsky.feed.post/a", "did:plc:qa", "did:plc:tie", day_start, 5.0),
+            row("at://did:plc:q/app.bsky.feed.post/b", "did:plc:qb", "did:plc:tie", day_start, 5.0),
+            row(
+                "at://did:plc:q/app.bsky.feed.post/first",
+                "did:plc:same",
+                "did:plc:o1",
+                day_start + 100,
+                10.0,
+            ),
+        ];
+        for i in 0..5 {
+            rows.push(row(
+                &format!("at://did:plc:q/app.bsky.feed.post/filler{i}"),
+                &format!("did:plc:filler{i}"),
+                "did:plc:o2",
+                day_start + 200,
+                9.0 - i as f64 * 0.01,
+            ));
+        }
+        rows.push(row(
+            "at://did:plc:q/app.bsky.feed.post/again",
+            "did:plc:same",
+            "did:plc:o3",
+            day_start + 300,
+            1.0,
+        ));
+        rows
+    }
+
+    // AC1: `global` equals the old capped list, item for item, on a fixture
+    // with a cap-1 drop, a cap-2 deferral and a rank tie.
+    #[test]
+    fn global_matches_v1() {
+        let now: i64 = 1_700_100_000;
+        let rows = ac1_fixture(now);
+
+        let oracle = build_v1_capped_oracle(rows.clone(), &weights(), now, 5.0);
+        let (items, global) = build(rows, &weights(), now, 5.0);
+        let mapped: Vec<FeedItem> = global.iter().map(|&i| items[i as usize].clone()).collect();
+
+        assert_eq!(mapped, oracle);
     }
 }
