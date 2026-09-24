@@ -43,6 +43,16 @@ struct Entry {
     last_refetch_sent: Option<i64>,
 }
 
+/// One DID's outstanding-miss bookkeeping (review round 1, defect B):
+/// whether a `Miss` fetch for it is already queued or running, and when
+/// its last attempt (successful or not) finished. `KeyCache` keeps this
+/// separately from `Entry` because a DID with no cached key at all has
+/// no `Entry` to hold it.
+struct MissState {
+    in_flight: bool,
+    last_attempted: Option<i64>,
+}
+
 /// What a cache lookup found for a DID (BC9, BC14, BC15). `Stale` still
 /// carries the key: design §5 check 6 says a stale entry is used while a
 /// refresh happens in the background.
@@ -57,11 +67,18 @@ pub(super) enum Lookup {
 pub struct KeyCache {
     max_entries: usize,
     entries: Mutex<HashMap<String, Entry>>,
+    /// Review round 1, defect B: outstanding-miss bookkeeping, keyed by
+    /// DID, for [`Self::should_send_miss`] and [`Self::miss_fetch_done`].
+    misses: Mutex<HashMap<String, MissState>>,
 }
 
 impl KeyCache {
     pub fn new(max_entries: usize) -> Self {
-        Self { max_entries, entries: Mutex::new(HashMap::new()) }
+        Self {
+            max_entries,
+            entries: Mutex::new(HashMap::new()),
+            misses: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Looks up `did`'s key as of `now` (BC9, BC14, BC15). An entry past
@@ -98,14 +115,24 @@ impl KeyCache {
                 entries.remove(&oldest_did);
             }
         }
-        entries.insert(did, Entry { key, fetched_at: now, last_refetch_sent: None });
+        // Review round 1, defect A: a refresh (the DID was already
+        // cached) keeps its `last_refetch_sent` rather than resetting it
+        // to `None`. Without this, a resolver fetch that lands while
+        // `should_refetch`'s hourly window is still open would make the
+        // very next call to `should_refetch` look like the window had
+        // never opened, and enqueue a second refetch inside the hour.
+        let last_refetch_sent = entries.get(&did).and_then(|entry| entry.last_refetch_sent);
+        entries.insert(did, Entry { key, fetched_at: now, last_refetch_sent });
     }
 
     /// `true` the first time this is called for `did` within a rolling
     /// hour (BC11): callers in `mod.rs` send a refetch request only when
-    /// this returns `true`. A `did` the cache has never held an entry for
-    /// always returns `true` — that path is BC9's `Miss`, not a refetch,
-    /// but the limiter itself does not need to distinguish the two.
+    /// this returns `true`. Used for a stale cache hit and for a
+    /// signature failure against a cached key — both cases where `did`
+    /// already has an `Entry`. A DID with no cached key at all goes
+    /// through [`Self::should_send_miss`] instead (review round 1, defect
+    /// B), which also tracks whether a fetch for it is already in
+    /// flight, since there is no `Entry` here to hold that state.
     pub(super) fn should_refetch(&self, did: &str, now: i64) -> bool {
         let mut entries = self.entries.lock().expect("KeyCache mutex poisoned");
         let Some(entry) = entries.get_mut(did) else { return true };
@@ -115,6 +142,43 @@ impl KeyCache {
                 entry.last_refetch_sent = Some(now);
                 true
             }
+        }
+    }
+
+    /// `true` the first time this is called for a DID with no cached key,
+    /// while no fetch for it is already in flight, and at least an hour
+    /// since its last attempt finished (review round 1, defect B).
+    /// `verify`'s `Missing` arm (`mod.rs`) sends a `Miss` to the resolver
+    /// only when this returns `true`, so a DID that never resolves — a
+    /// dead PLC entry, a resolver that is down — is retried at most once
+    /// an hour rather than once per request.
+    pub(super) fn should_send_miss(&self, did: &str, now: i64) -> bool {
+        let mut misses = self.misses.lock().expect("KeyCache mutex poisoned");
+        let state = misses
+            .entry(did.to_string())
+            .or_insert(MissState { in_flight: false, last_attempted: None });
+        if state.in_flight {
+            return false;
+        }
+        if let Some(last) = state.last_attempted {
+            if now - last < REFETCH_COOLDOWN_SECS {
+                return false;
+            }
+        }
+        state.in_flight = true;
+        true
+    }
+
+    /// Marks `did`'s outstanding `Miss` fetch as finished, successfully
+    /// or not (review round 1, defect B). [`run_resolver`] calls this for
+    /// every `Miss` request once the fetch for it returns, clearing the
+    /// in-flight mark [`Self::should_send_miss`] checks and starting its
+    /// hourly cooldown.
+    pub(super) fn miss_fetch_done(&self, did: &str, now: i64) {
+        let mut misses = self.misses.lock().expect("KeyCache mutex poisoned");
+        if let Some(state) = misses.get_mut(did) {
+            state.in_flight = false;
+            state.last_attempted = Some(now);
         }
     }
 }
@@ -152,9 +216,29 @@ pub(super) trait DidFetcher: Send + Sync {
     fn fetch(&self, did: &str) -> impl Future<Output = Result<Value, FetchError>> + Send;
 }
 
-/// The real [`DidFetcher`], built on the crate's one `reqwest::Client`
-/// builder ([`crate::appview::http_client`]) so the timeout and TLS
-/// backend are stated once (`appview/mod.rs`'s own doc comment).
+/// [`HttpDidFetcher`]'s own request timeout (review round 1, defect K):
+/// the same 10 seconds `appview::http_client`'s `REQUEST_TIMEOUT` uses.
+/// Not a call to that function, and not a shared constant, because
+/// `REQUEST_TIMEOUT` is private to `appview/mod.rs`, which this slice's
+/// `Files` list does not include; `HttpDidFetcher` also needs its own
+/// `reqwest::Client` regardless, to set the redirect policy below.
+const DID_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A DID document larger than this is never fully buffered (review round
+/// 1, defect L): [`accumulate_capped`] fails it as [`FetchError::Decode`]
+/// once the running total crosses this line, so a hostile or
+/// misbehaving `did:web` host cannot grow the resolver task's memory
+/// without bound. 64 KiB is generous for a handful of verification
+/// methods, the only part of the document [`extract_key`] ever reads.
+const MAX_DID_DOCUMENT_BYTES: usize = 64 * 1024;
+
+/// The real [`DidFetcher`]. Builds its own `reqwest::Client`, distinct
+/// from [`crate::appview::http_client`], with redirects disabled (review
+/// round 1, defect K): a DID document fetch never needs one, and
+/// following a redirect would hand this resolver's request to whatever
+/// second origin a compromised or misconfigured host named, so a 3xx
+/// response is a fetch failure ([`FetchError::Http`]) rather than
+/// something this client chases on its own.
 pub(super) struct HttpDidFetcher {
     http: reqwest::Client,
     /// `UPSTAGE_PLC_URL`, trailing `/` removed. `src/config.rs` (slice
@@ -167,10 +251,47 @@ pub(super) struct HttpDidFetcher {
 impl HttpDidFetcher {
     pub(super) fn new(plc_url: String) -> Self {
         Self {
-            http: crate::appview::http_client(),
+            http: reqwest::Client::builder()
+                .timeout(DID_FETCH_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect(
+                    "reqwest::Client::builder with a timeout and a redirect policy never fails to build",
+                ),
             plc_url: plc_url.trim_end_matches('/').to_string(),
         }
     }
+}
+
+/// A source of raw body chunks, so [`accumulate_capped`] is testable with
+/// canned chunks instead of a real HTTP response (review round 1, defect
+/// L). [`reqwest::Response`] is the only production implementation.
+trait ChunkSource: Send {
+    fn next_chunk(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, FetchError>> + Send;
+}
+
+impl ChunkSource for reqwest::Response {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, FetchError> {
+        self.chunk()
+            .await
+            .map(|opt| opt.map(|bytes| bytes.to_vec()))
+            .map_err(|_err| FetchError::Transport)
+    }
+}
+
+/// Reads `source` to the end, failing as [`FetchError::Decode`] the
+/// moment the running total would exceed [`MAX_DID_DOCUMENT_BYTES`]
+/// (review round 1, defect L), instead of buffering an unbounded body
+/// before ever looking at its size.
+async fn accumulate_capped(mut source: impl ChunkSource) -> Result<Vec<u8>, FetchError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = source.next_chunk().await? {
+        if body.len() + chunk.len() > MAX_DID_DOCUMENT_BYTES {
+            return Err(FetchError::Decode);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// BC17: did:plc goes to `plc_url/<did>`. BC18: did:web:<host> goes to
@@ -192,9 +313,16 @@ impl DidFetcher for HttpDidFetcher {
         let response = self.http.get(&url).send().await.map_err(|_err| FetchError::Transport)?;
         let status = response.status().as_u16();
         if status != 200 {
+            // Review round 1, defect K: with redirects disabled above, a
+            // 3xx lands here as an ordinary non-200 status, so it fails
+            // the same way a 4xx or 5xx does.
             return Err(FetchError::Http(status));
         }
-        response.json::<Value>().await.map_err(|_err| FetchError::Decode)
+        // Review round 1, defect L: the body is read through a capped
+        // accumulator rather than `response.json`, which would buffer
+        // the whole thing regardless of size.
+        let body = accumulate_capped(response).await?;
+        serde_json::from_slice(&body).map_err(|_err| FetchError::Decode)
     }
 }
 
@@ -221,25 +349,33 @@ fn extract_key(document: &Value) -> Option<PublicKey> {
 /// caches nothing; a fetch that succeeds but yields no usable key
 /// ([`extract_key`] returning `None`, BC19) caches nothing and logs
 /// nothing — an absent `#atproto` method is not a transport or server
-/// failure worth a warning on every retry.
+/// failure worth a warning on every retry. For a `Miss`, the fetch's end
+/// — success or failure — is also reported to `cache.miss_fetch_done`
+/// (review round 1, defect B), clearing the in-flight mark
+/// `KeyCache::should_send_miss` checks so the next miss for that DID,
+/// after the hourly cooldown, can enqueue another attempt.
 pub(super) async fn run_resolver<F: DidFetcher>(
     mut requests: mpsc::Receiver<ResolveRequest>,
     fetcher: F,
     cache: Arc<KeyCache>,
 ) {
     while let Some(request) = requests.recv().await {
-        let did = match request {
-            ResolveRequest::Miss(did) | ResolveRequest::Refetch(did) => did,
+        let (did, is_miss) = match request {
+            ResolveRequest::Miss(did) => (did, true),
+            ResolveRequest::Refetch(did) => (did, false),
         };
         match fetcher.fetch(&did).await {
             Ok(document) => {
                 if let Some(key) = extract_key(&document) {
-                    cache.insert(did, key, crate::store::unix_now());
+                    cache.insert(did.clone(), key, crate::store::unix_now());
                 }
             }
             Err(err) => {
                 tracing::warn!(kind = ?err, "auth: did document fetch failed");
             }
+        }
+        if is_miss {
+            cache.miss_fetch_done(&did, crate::store::unix_now());
         }
     }
 }
@@ -331,6 +467,59 @@ mod tests {
     fn refetch_limiter_allows_unknown_did() {
         let cache = KeyCache::new(10);
         assert!(cache.should_refetch("did:plc:unknown0000000000000000", 0));
+    }
+
+    #[test]
+    fn refetch_after_insert_does_not_reset_limiter() {
+        // Review round 1, defect A: a resolver fetch that lands inside the
+        // hourly cooldown (`insert`, the rotation case as much as a plain
+        // refresh) must not reopen the window `should_refetch` is
+        // tracking.
+        let cache = KeyCache::new(10);
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        cache.insert(did.to_string(), any_key(), 0);
+
+        assert!(cache.should_refetch(did, 0));
+        // The resolver refetches and re-inserts at t=10, still inside the
+        // hour since the refetch at t=0.
+        cache.insert(did.to_string(), any_key(), 10);
+        assert!(!cache.should_refetch(did, 20), "insert must not reset last_refetch_sent");
+        assert!(cache.should_refetch(did, 3600));
+    }
+
+    #[test]
+    fn miss_limiter_allows_one_until_marked_done() {
+        // Review round 1, defect B: a DID with no cached key enqueues at
+        // most one outstanding `Miss`, and after that fetch ends, at most
+        // one more per hour.
+        let cache = KeyCache::new(10);
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+
+        assert!(cache.should_send_miss(did, 0));
+        assert!(!cache.should_send_miss(did, 1), "a fetch for this DID is already in flight");
+
+        cache.miss_fetch_done(did, 10);
+        assert!(!cache.should_send_miss(did, 20), "cooldown after a finished attempt");
+        assert!(cache.should_send_miss(did, 3610));
+    }
+
+    #[tokio::test]
+    async fn accumulate_capped_rejects_oversized_body() {
+        // Review round 1, defect L: the running total, not the final
+        // buffer, is what fails once it crosses MAX_DID_DOCUMENT_BYTES,
+        // so an oversized body never gets fully read into memory.
+        struct FixedChunks(Vec<Vec<u8>>);
+        impl ChunkSource for FixedChunks {
+            async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, FetchError> {
+                Ok(if self.0.is_empty() { None } else { Some(self.0.remove(0)) })
+            }
+        }
+
+        let small = FixedChunks(vec![vec![0u8; 10], vec![0u8; 10]]);
+        assert_eq!(accumulate_capped(small).await.unwrap().len(), 20);
+
+        let oversized = FixedChunks(vec![vec![0u8; MAX_DID_DOCUMENT_BYTES], vec![0u8; 1]]);
+        assert!(matches!(accumulate_capped(oversized).await, Err(FetchError::Decode)));
     }
 
     // --- resolver: DidFetcher, extract_key, run_resolver ---------------

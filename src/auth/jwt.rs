@@ -64,19 +64,48 @@ fn strip_fragment(value: &str) -> &str {
     value.split('#').next().unwrap_or(value)
 }
 
-/// Checks BC8: `did` (the part before any `#`) is `did:plc:<...>` or
-/// `did:web:<host>`, and a `did:web` host carries no port (`%3A`, the
-/// percent-encoded `:`) and no path (a further `:` after the host).
+/// `did:plc:<suffix>`'s own alphabet and length (review round 1, defects
+/// D and E): exactly 24 characters, each RFC4648 base32-lowercase
+/// (`a`-`z`, `2`-`7`) — the encoding `did:plc` identifiers are minted
+/// with. A suffix of any other length, or carrying a digit or letter
+/// outside that alphabet (`0`, `1`, `8`, `9`, or uppercase), is not a
+/// `did:plc` this feed could have issued a token for.
+fn is_valid_plc_suffix(suffix: &str) -> bool {
+    suffix.len() == 24 && suffix.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
+}
+
+/// `did:web:<host>`'s own shape (review round 1, defects D and E): ASCII
+/// letters, digits, `-` and `.` only, at least one `.`, and not an IPv4
+/// literal (every dot-separated label all-digits) — a `did:web`
+/// identifier names a domain, not an address. Excluding every other
+/// character rejects `%` (a percent-encoded port, upper or lower case),
+/// `/` (a path), `?` (a query), `@` (userinfo) and `:` (a port or a
+/// `did:web` path segment) in one pass, rather than naming each
+/// separately the way the previous, narrower check did.
+fn is_valid_web_host(host: &str) -> bool {
+    if host.is_empty() || !host.contains('.') {
+        return false;
+    }
+    if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+        return false;
+    }
+    let is_ipv4_literal =
+        host.split('.').all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()));
+    !is_ipv4_literal
+}
+
+/// Checks BC8: `did` (the part before any `#`) is `did:plc:<suffix>`
+/// ([`is_valid_plc_suffix`]) or `did:web:<host>` ([`is_valid_web_host`]).
 fn check_issuer(iss: &str) -> Result<String, AuthError> {
     let did = strip_fragment(iss);
     if let Some(rest) = did.strip_prefix("did:plc:") {
-        if rest.is_empty() {
+        if !is_valid_plc_suffix(rest) {
             return Err(AuthError::Issuer);
         }
         return Ok(did.to_string());
     }
     if let Some(host) = did.strip_prefix("did:web:") {
-        if host.is_empty() || host.contains("%3A") || host.contains(':') {
+        if !is_valid_web_host(host) {
             return Err(AuthError::Issuer);
         }
         return Ok(did.to_string());
@@ -122,8 +151,11 @@ pub(super) fn check(token: &str, now: i64, service_did: &str) -> Result<Verified
     }
 
     // Check 2: exp, missing or more than CLOCK_SKEW_SECS in the past.
+    // `saturating_add` (review round 1, defect F): an attacker-supplied
+    // `exp` near `i64::MAX` must not overflow this addition and wrap
+    // into looking expired, or worse, panic in a debug build.
     match claims.exp {
-        Some(exp) if exp + CLOCK_SKEW_SECS >= now => {}
+        Some(exp) if exp.saturating_add(CLOCK_SKEW_SECS) >= now => {}
         _ => return Err(AuthError::Expired),
     }
 
@@ -238,8 +270,10 @@ mod tests {
     #[test]
     fn accepts_exp_within_skew() {
         let header = r#"{"alg":"ES256K"}"#;
-        let payload =
-            format!(r#"{{"iss":"did:plc:abc","aud":"{SERVICE_DID}","exp":{}}}"#, NOW - 30);
+        let payload = format!(
+            r#"{{"iss":"did:plc:abcdefghijklmnopqrstuvwx","aud":"{SERVICE_DID}","exp":{}}}"#,
+            NOW - 30
+        );
         assert!(check(&token(header, &payload), NOW, SERVICE_DID).is_ok());
     }
 
@@ -279,5 +313,71 @@ mod tests {
         let header = r#"{"alg":"ES256K"}"#;
         let payload = valid_payload("did:web:example.com:users:alice", SERVICE_DID);
         assert_eq!(check(&token(header, &payload), NOW, SERVICE_DID), Err(AuthError::Issuer));
+    }
+
+    #[test]
+    fn rejects_did_web_with_slash_query_or_userinfo() {
+        // Review round 1, defects D and E: `is_valid_web_host` rejects any
+        // character outside its allow-list in one pass.
+        let header = r#"{"alg":"ES256K"}"#;
+        for bad in
+            ["did:web:example.com/path", "did:web:example.com?x=1", "did:web:user@example.com"]
+        {
+            let payload = valid_payload(bad, SERVICE_DID);
+            assert_eq!(
+                check(&token(header, &payload), NOW, SERVICE_DID),
+                Err(AuthError::Issuer),
+                "expected Issuer for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_did_web_with_lowercase_percent_port() {
+        // Review round 1, defects D and E: the old check only matched the
+        // uppercase `%3A` form.
+        let header = r#"{"alg":"ES256K"}"#;
+        let payload = valid_payload("did:web:example.com%3a8080", SERVICE_DID);
+        assert_eq!(check(&token(header, &payload), NOW, SERVICE_DID), Err(AuthError::Issuer));
+    }
+
+    #[test]
+    fn rejects_did_web_ip_literal() {
+        // Review round 1, defects D and E: a `did:web` identifier names a
+        // domain, not an address.
+        let header = r#"{"alg":"ES256K"}"#;
+        let payload = valid_payload("did:web:192.168.0.1", SERVICE_DID);
+        assert_eq!(check(&token(header, &payload), NOW, SERVICE_DID), Err(AuthError::Issuer));
+    }
+
+    #[test]
+    fn rejects_plc_suffix_wrong_length() {
+        // Review round 1, defects D and E: `did:plc` suffixes are exactly
+        // 24 characters.
+        let header = r#"{"alg":"ES256K"}"#;
+        let payload = valid_payload("did:plc:tooshort", SERVICE_DID);
+        assert_eq!(check(&token(header, &payload), NOW, SERVICE_DID), Err(AuthError::Issuer));
+    }
+
+    #[test]
+    fn rejects_plc_suffix_invalid_chars() {
+        // Review round 1, defects D and E: `0`, `1`, `8` and `9` fall
+        // outside base32-lowercase, even at the right length.
+        let header = r#"{"alg":"ES256K"}"#;
+        let payload = valid_payload("did:plc:000000000000000000000000", SERVICE_DID);
+        assert_eq!(check(&token(header, &payload), NOW, SERVICE_DID), Err(AuthError::Issuer));
+    }
+
+    #[test]
+    fn exp_extremes_do_not_overflow() {
+        // Review round 1, defect F: `exp.saturating_add(CLOCK_SKEW_SECS)`
+        // must neither panic nor wrap at either extreme.
+        let header = r#"{"alg":"ES256K"}"#;
+        let iss = "did:plc:abcdefghijklmnopqrstuvwx";
+        let payload_max = format!(r#"{{"iss":"{iss}","aud":"{SERVICE_DID}","exp":{}}}"#, i64::MAX);
+        assert!(check(&token(header, &payload_max), NOW, SERVICE_DID).is_ok());
+
+        let payload_min = format!(r#"{{"iss":"{iss}","aud":"{SERVICE_DID}","exp":{}}}"#, i64::MIN);
+        assert_eq!(check(&token(header, &payload_min), NOW, SERVICE_DID), Err(AuthError::Expired));
     }
 }

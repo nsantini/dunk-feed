@@ -299,6 +299,26 @@ fn pds_url_or_default(
         None => return Ok(default.to_string()),
         Some(value) => value,
     };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::Invalid {
+            name,
+            value: "[redacted]".to_string(),
+            reason: "must be an https URL with a host and no userinfo, query or fragment"
+                .to_string(),
+        });
+    }
+    https_origin(name, trimmed)
+}
+
+/// The https-origin rule [`pds_url_or_default`]'s doc comment describes,
+/// factored out so [`plc_url_or_default`] enforces the same scheme, host,
+/// userinfo, query, fragment and path rules (review round 1, defects H
+/// and I) without duplicating them. Callers differ only in what an empty
+/// value means: `UPSTAGE_PDS_URL` treats it as invalid (BC15), while
+/// `UPSTAGE_PLC_URL` treats it as unset (BC24) — that distinction is
+/// handled before this function is called, not inside it.
+fn https_origin(name: &'static str, trimmed: &str) -> Result<String, ConfigError> {
     let invalid_with = |reason: &str| ConfigError::Invalid {
         name,
         value: "[redacted]".to_string(),
@@ -306,10 +326,6 @@ fn pds_url_or_default(
     };
     let invalid =
         || invalid_with("must be an https URL with a host and no userinfo, query or fragment");
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(invalid());
-    }
     let url = reqwest::Url::parse(trimmed).map_err(|_| invalid())?;
     if url.scheme() != "https" {
         return Err(invalid());
@@ -468,25 +484,28 @@ fn personalise_or_default(
 /// `UPSTAGE_SERVICE_DID` (BC23): unset or empty (after trim) falls back to
 /// `did:web:<hostname>`, `Config::did_web`'s own format. Computed here from
 /// `hostname` directly, since `Config` is not built yet at this point in
-/// `load`.
+/// `load`. The stored value is trimmed (review round 1, defect C): it is
+/// compared byte-for-byte against a token's `aud` claim (BC6, `jwt::check`),
+/// so a value carrying stray surrounding whitespace would never match a
+/// well-formed token's `aud`.
 fn service_did_or_default(
     lookup: &impl Fn(&str) -> Option<String>,
     name: &'static str,
     hostname: &str,
 ) -> String {
     match lookup(name) {
-        Some(value) if !value.trim().is_empty() => value,
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
         _ => format!("did:web:{hostname}"),
     }
 }
 
 /// `UPSTAGE_PLC_URL` (BC24): unset or empty (after trim) falls back to
-/// `default`. Otherwise must start with `https://`, and the stored value
-/// has its trailing `/` removed. Simpler than [`pds_url_or_default`]: this
-/// value is only ever compared against or prepended to a bare `<did>` path
-/// (`auth::did::resolve_url`, BC17), never parsed as a full request URL, so
-/// none of `pds_url_or_default`'s host, userinfo, query, fragment or path
-/// rules apply here.
+/// `default`. Otherwise validated and normalised by the same
+/// [`https_origin`] rule as `UPSTAGE_PDS_URL` (review round 1, defects H
+/// and I): scheme case-insensitively `https`, a host, no userinfo, query,
+/// fragment or path, and a trailing `/` removed. The only difference from
+/// [`pds_url_or_default`] is what an empty value means: unset here, per
+/// BC24, rather than `Invalid`.
 fn plc_url_or_default(
     lookup: &impl Fn(&str) -> Option<String>,
     name: &'static str,
@@ -496,15 +515,7 @@ fn plc_url_or_default(
         Some(value) if !value.trim().is_empty() => value,
         _ => return Ok(default.to_string()),
     };
-    let trimmed = raw.trim();
-    if !trimmed.starts_with("https://") {
-        return Err(ConfigError::Invalid {
-            name,
-            value: raw.clone(),
-            reason: "must be an https URL".to_string(),
-        });
-    }
-    Ok(trimmed.trim_end_matches('/').to_string())
+    https_origin(name, raw.trim())
 }
 
 /// `UPSTAGE_MAX_VIEWERS` (BC25): unset or empty (after trim) falls back to
@@ -1469,6 +1480,30 @@ mod tests {
         pairs.push(("UPSTAGE_PLC_URL", "https://plc.example/"));
         assert_eq!(load(env(&pairs)).unwrap().plc_url, "https://plc.example");
 
+        // Review round 1, defects H and I: UPSTAGE_PLC_URL shares
+        // UPSTAGE_PDS_URL's https-origin rule — a bare scheme, a path,
+        // userinfo, a query or a fragment are all Invalid, and the
+        // scheme check is case-insensitive.
+        for bad in [
+            "https://",
+            "https://plc.example/xrpc",
+            "https://u:p@plc.example",
+            "https://plc.example?x=1",
+            "https://plc.example#x",
+        ] {
+            let mut pairs = required_pair().to_vec();
+            pairs.push(("UPSTAGE_PLC_URL", bad));
+            let err = load(env(&pairs)).unwrap_err();
+            match err {
+                ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_PLC_URL"),
+                other => panic!("expected Invalid for {bad}, got {other:?}"),
+            }
+        }
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PLC_URL", "HTTPS://plc.example"));
+        assert_eq!(load(env(&pairs)).unwrap().plc_url, "https://plc.example");
+
         // BC25: zero and non-numeric are Invalid; a custom value is read.
         for bad in ["0", "soon"] {
             let mut pairs = required_pair().to_vec();
@@ -1483,6 +1518,16 @@ mod tests {
         let mut pairs = required_pair().to_vec();
         pairs.push(("UPSTAGE_MAX_VIEWERS", "500"));
         assert_eq!(load(env(&pairs)).unwrap().max_viewers, 500);
+    }
+
+    #[test]
+    fn service_did_is_trimmed() {
+        // Review round 1, defect C: surrounding whitespace must not
+        // survive into `Config::service_did`, since it is compared
+        // byte-for-byte against a token's `aud` claim (BC6).
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_SERVICE_DID", "  did:web:padded.example  "));
+        assert_eq!(load(env(&pairs)).unwrap().service_did, "did:web:padded.example");
     }
 
     #[test]

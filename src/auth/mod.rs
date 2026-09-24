@@ -170,7 +170,13 @@ pub fn verify(
             key
         }
         did::Lookup::Missing => {
-            let _ = resolver_tx.try_send(ResolveRequest::Miss(checked.viewer_did.clone()));
+            // Review round 1, defect B: `should_send_miss` enqueues a
+            // `Miss` only when one for this DID is not already in flight
+            // and the hourly cooldown since the last attempt has passed
+            // — not on every request for a DID that never resolves.
+            if cache.should_send_miss(&checked.viewer_did, now) {
+                let _ = resolver_tx.try_send(ResolveRequest::Miss(checked.viewer_did.clone()));
+            }
             return Err(AuthError::KeyUnknown);
         }
     };
@@ -426,6 +432,22 @@ mod tests {
         let token = sign_token(did, "ES256K", 60, |_msg| vec![0u8; 64]);
         assert_eq!(verify(&token, NOW, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
         assert_eq!(rx.try_recv(), Ok(ResolveRequest::Miss(did.to_string())));
+    }
+
+    #[test]
+    fn repeated_misses_for_one_did_enqueue_one_fetch() {
+        // Review round 1, defect B: 20 consecutive misses for the same
+        // DID, with the resolver never running to clear the in-flight
+        // mark, must enqueue exactly one `Miss`.
+        let cache = KeyCache::new(10);
+        let (tx, mut rx) = channel();
+        let did = "did:plc:gggggggggggggggggggggggg";
+        let token = sign_token(did, "ES256K", 60, |_msg| vec![0u8; 64]);
+        for _ in 0..20 {
+            assert_eq!(verify(&token, NOW, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
+        }
+        assert_eq!(rx.try_recv(), Ok(ResolveRequest::Miss(did.to_string())));
+        assert!(rx.try_recv().is_err(), "only one Miss should have been enqueued");
     }
 
     #[test]

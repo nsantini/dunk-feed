@@ -291,12 +291,19 @@ fn build<'a>(
 }
 
 /// Reads a bearer token out of `Authorization` (network-feed story 05,
-/// BC2): `None` unless the header is present, the scheme is exactly
-/// `Bearer`, and the token half is non-empty.
+/// BC2): `None` unless the header is present, its scheme matches `Bearer`
+/// case-insensitively (review round 1, defect G — a client that sends
+/// `bearer` per HTTP's case-insensitive scheme convention must not be
+/// treated as sending no token at all), and the token half, trimmed of
+/// surrounding whitespace, is non-empty.
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let raw = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let raw = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
     let (scheme, token) = raw.split_once(' ')?;
-    if scheme != "Bearer" || token.is_empty() {
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
         return None;
     }
     Some(token)
@@ -603,6 +610,34 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["feed"][0]["post"], "at://q/1");
+    }
+
+    #[test]
+    fn bearer_token_case_insensitive_scheme() {
+        // Review round 1, defect G.
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let mut headers = HeaderMap::new();
+            headers
+                .insert(AUTHORIZATION, HeaderValue::from_str(&format!("{scheme} abc123")).unwrap());
+            assert_eq!(bearer_token(&headers), Some("abc123"));
+        }
+    }
+
+    #[test]
+    fn bearer_token_trims_surrounding_whitespace() {
+        // Review round 1, defect G.
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str("  Bearer   abc123  ").unwrap());
+        assert_eq!(bearer_token(&headers), Some("abc123"));
+    }
+
+    #[test]
+    fn bearer_token_empty_after_trim_is_none() {
+        // Review round 1, defect G: an empty token after trimming is no
+        // token, not an empty-string token.
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str("Bearer    ").unwrap());
+        assert_eq!(bearer_token(&headers), None);
     }
 
     // AC7, BC9: a token whose DID the cache has never held returns the
