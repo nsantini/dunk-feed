@@ -94,17 +94,32 @@ pub trait GraphSource {
 /// review round 3, defect O widens the check from "the last cursor sent" to
 /// "any cursor sent so far", so a source whose cursor cycles through more
 /// than one earlier value is still bounded).
+///
+/// `max_pages`, when `Some`, stops the loop after that many pages have been
+/// fetched regardless of whether the source has more (review round 1,
+/// defect Z): a first build's worker caller passes
+/// `graph::queue::FIRST_BUILD_MAX_PAGES` so one viewer with an unusually
+/// large follow list cannot block the queue indefinitely; whatever was
+/// fetched before the cap is kept. `graph_probe::run` passes `None`, since
+/// the probe measures a whole list's real page count (spec.md `## Answers
+/// from the engineer`, Step 7.5, defect Z).
 pub async fn step_follows<S: GraphSource>(
     source: &S,
     viewer: &str,
     d2_sample_size: usize,
     circle: &mut Circle,
+    max_pages: Option<u32>,
 ) -> Result<StepStats, PdsError> {
     let start = Instant::now();
     let mut calls: u32 = 0;
     let mut cursor: Option<String> = None;
     let mut sent_cursors: HashSet<String> = HashSet::new();
     loop {
+        if let Some(cap) = max_pages {
+            if calls >= cap {
+                break;
+            }
+        }
         let sent_cursor = cursor.clone();
         let page = source.get_follows(viewer, 100, cursor.take()).await?;
         calls += 1;
@@ -308,7 +323,7 @@ mod tests {
         };
         let mut circle = Circle::new();
 
-        let stats = step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+        let stats = step_follows(&source, "viewer", 5, &mut circle, None).await.unwrap();
 
         assert_eq!(stats.calls, 3);
         assert_eq!(stats.pages, 3);
@@ -326,7 +341,7 @@ mod tests {
         let source = FakeSource::default();
         let mut circle = Circle::new();
 
-        let stats = step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+        let stats = step_follows(&source, "viewer", 5, &mut circle, None).await.unwrap();
 
         assert_eq!(stats.calls, 1);
         assert_eq!(stats.pages, 1);
@@ -484,7 +499,7 @@ mod tests {
             StuckSource { page: FollowsPage { dids: Vec::new(), cursor: Some("x".to_string()) } };
         let mut circle = Circle::new();
 
-        let stats = step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+        let stats = step_follows(&source, "viewer", 5, &mut circle, None).await.unwrap();
 
         assert_eq!(stats.calls, 1);
         assert!(circle.follows.is_empty());
@@ -499,7 +514,7 @@ mod tests {
             StuckSource { page: FollowsPage { dids: vec![did(1)], cursor: Some("x".to_string()) } };
         let mut circle = Circle::new();
 
-        let stats = step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+        let stats = step_follows(&source, "viewer", 5, &mut circle, None).await.unwrap();
 
         assert_eq!(stats.calls, 2);
         assert_eq!(circle.follows.len(), 1);
@@ -516,7 +531,7 @@ mod tests {
             StuckSource { page: FollowsPage { dids: vec![did(1)], cursor: Some("x".to_string()) } };
         let mut circle = Circle::new();
 
-        step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+        step_follows(&source, "viewer", 5, &mut circle, None).await.unwrap();
 
         assert_eq!(circle.d2_sample, vec![did(1)]);
     }
@@ -532,7 +547,7 @@ mod tests {
         };
         let mut circle = Circle::new();
 
-        step_follows(&source, "viewer", 2, &mut circle).await.unwrap();
+        step_follows(&source, "viewer", 2, &mut circle, None).await.unwrap();
 
         assert_eq!(circle.d2_sample, vec![did(1), did(2)]);
     }
@@ -589,7 +604,7 @@ mod tests {
         let source = CyclingSource { pages: Mutex::new(cycling_pages()) };
         let mut circle = Circle::new();
 
-        let stats = step_follows(&source, "viewer", 5, &mut circle).await.unwrap();
+        let stats = step_follows(&source, "viewer", 5, &mut circle, None).await.unwrap();
 
         assert_eq!(stats.calls, 3);
         assert_eq!(circle.follows.len(), 3);
@@ -642,5 +657,70 @@ mod tests {
         let again = hash_did("did:plc:same");
         assert!(circle.follows.contains(&again));
         assert!(circle.heap_bytes() > 0);
+    }
+
+    /// A `GraphSource` with `follows.len()` follows for `"viewer"`, paged at
+    /// the caller's own `limit`, generated on the fly rather than
+    /// materialised, for [`step_follows_stops_at_the_page_cap`] (review round
+    /// 1, defect Z): 300,000 follows would be an unreasonably large `Vec` to
+    /// build just to throw most of it away.
+    struct HugeFollowsSource {
+        len: usize,
+    }
+
+    impl GraphSource for HugeFollowsSource {
+        async fn get_follows(
+            &self,
+            _actor: &str,
+            limit: u32,
+            cursor: Option<String>,
+        ) -> Result<FollowsPage, PdsError> {
+            let offset: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+            let end = (offset + limit as usize).min(self.len);
+            let dids = (offset..end).map(did).collect();
+            let cursor = if end < self.len { Some(end.to_string()) } else { None };
+            Ok(FollowsPage { dids, cursor })
+        }
+
+        async fn get_relationships(
+            &self,
+            _actor: &str,
+            _others: &[String],
+        ) -> Result<Vec<String>, PdsError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn step_follows_stops_at_the_page_cap() {
+        // Review round 1, defect Z: a viewer who follows far more than
+        // `max_pages * 100` accounts stops at exactly `max_pages` calls,
+        // keeping whatever was fetched rather than paging to the end.
+        let source = HugeFollowsSource { len: 300_000 };
+        let mut circle = Circle::new();
+
+        let stats = step_follows(&source, "viewer", 5, &mut circle, Some(100)).await.unwrap();
+
+        assert_eq!(stats.calls, 100);
+        assert_eq!(stats.pages, 100);
+        assert_eq!(circle.follows.len(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn step_follows_with_no_cap_pages_to_the_end() {
+        // Review round 1, defect Z: `None` is the probe's own case
+        // (`graph_probe::run`) — no cap, so a normal-sized list still pages
+        // all the way to the end as before.
+        let follows: Vec<String> = (0..250).map(did).collect();
+        let source = FakeSource {
+            follows: HashMap::from([("viewer".to_string(), follows.clone())]),
+            ..Default::default()
+        };
+        let mut circle = Circle::new();
+
+        let stats = step_follows(&source, "viewer", 5, &mut circle, None).await.unwrap();
+
+        assert_eq!(stats.calls, 3);
+        assert_eq!(circle.follows.len(), 250);
     }
 }

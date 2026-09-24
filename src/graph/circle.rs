@@ -1,12 +1,12 @@
-//! `Circle`, TECH-DESIGN-network-feed §6.1, without `state` and the two
-//! timestamps: the probe never schedules a refresh and never serves a
-//! request, so it has no `building_*`/`ready` state machine and no
-//! `last_request_at` or `d1_refreshed_at` to hold. Story 06 adds those
-//! fields when the worker owns a `Circle` past its first build.
+//! `Circle`, TECH-DESIGN-network-feed §6.1. Story 06 adds `state`,
+//! `last_request_at` and `d1_refreshed_at` to the plain follows/sample data
+//! the probe (story 03) needed alone: the worker (`graph/queue.rs`) owns a
+//! `Circle` past its first build, and the handler's cache and cursor read
+//! its `circle_version` (`spec.md` `## Approach`).
 
 use std::collections::HashSet;
 
-use super::DidHash;
+use super::{CircleState, DidHash};
 
 /// One viewer's first-build graph. `follows`, `follows_me` and `checked`
 /// hold hashes, never DID strings (BC16); `d2_sample` holds the DID
@@ -19,6 +19,19 @@ pub struct Circle {
     pub follows_me: HashSet<DidHash>,
     pub checked: HashSet<DidHash>,
     pub d2_sample: Vec<String>,
+    /// `building_d1` while the worker's first build is in flight or
+    /// retrying, `ready` once step 1 has saved successfully (BC7).
+    pub state: CircleState,
+    /// The last time a request touched this viewer, unix seconds (BC23).
+    /// `0` until the first request or worker save sets it.
+    pub last_request_at: i64,
+    /// When step 1 last saved successfully, unix seconds (BC7). `None`
+    /// until the first successful save.
+    pub d1_refreshed_at: Option<i64>,
+    /// Incremented by one every time the worker swaps in a freshly built
+    /// circle (BC7); the personalised cache and cursor key on this so a
+    /// circle change never serves a stale or mismatched list (`## Approach`).
+    pub circle_version: u64,
 }
 
 impl Circle {

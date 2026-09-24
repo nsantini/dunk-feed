@@ -23,7 +23,10 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::auth::ViewerDid;
+use crate::graph::CircleState;
 use crate::http::cursor::{self, CursorError};
+use crate::http::viewer::ViewerList;
 use crate::http::AppState;
 use crate::scorer::snapshot::{cmp_rank_then_cid, FeedItem, Snapshot};
 
@@ -111,6 +114,20 @@ fn resolve_cursor(raw: Option<&str>) -> Result<Option<(u64, usize, f64, String)>
     match raw {
         None | Some("") => Ok(None),
         Some(s) => Ok(Some(cursor::decode(s)?)),
+    }
+}
+
+/// The personalised path's counterpart to `resolve_cursor` (BC17a, BC17b):
+/// `None` or an empty string is absent (the page starts at index 0 of the
+/// viewer's list); anything else must decode through `cursor::decode_personal`
+/// (accepting either the four- or the five-field shape) or the request is
+/// `InvalidRequest`.
+fn resolve_personal_cursor(
+    raw: Option<&str>,
+) -> Result<Option<cursor::PersonalCursor>, SkeletonError> {
+    match raw {
+        None | Some("") => Ok(None),
+        Some(s) => Ok(Some(cursor::decode_personal(s)?)),
     }
 }
 
@@ -234,6 +251,59 @@ fn resolve_start<'a>(
     (current, start)
 }
 
+/// The personalised path's counterpart to `resolve_start` (BC14 to BC17):
+/// given the viewer's current list (`http::viewer::ViewerLists::list_for`,
+/// always the requester's own — foreign items never enter `list.indices`,
+/// so a cursor naming another viewer's item can never resolve to one,
+/// BC15) and the decoded cursor, the index `list.indices` resumes at.
+///
+/// Path 1 (BC14): the cursor carries a `circle_version` (the five-field
+/// shape, `cursor::encode_personal`'s own output) that matches `list`'s
+/// own `(generation, circle_version)` exactly, and `index` names a
+/// position in `list.indices` whose item has the same `quote_cid` — an
+/// exact O(1) resume at `index + 1`, the same shape as the global path's
+/// own path 1 (`resolve_start`). A `circle_version` of `None` (BC17a: a
+/// plain four-field cursor accepted on this path) or a mismatch on
+/// either field skips straight to path 2, since there is no "held list"
+/// to trust an index into.
+///
+/// Path 2 (BC17): one scan of `list.indices` for the cursor's `quote_cid`;
+/// found, the page starts just after it.
+///
+/// Path 3 (BC17): neither applied. `page_start`'s rank/cid scan over
+/// `list.indices` — the same helper the global path's own path 3 uses,
+/// since both scans are the identical `(rank DESC, cid ASC)` walk over an
+/// index list into `items`, just a different index list.
+fn resolve_personal_start(
+    list: &ViewerList,
+    items: &[FeedItem],
+    cursor_value: Option<cursor::PersonalCursor>,
+) -> usize {
+    let Some((cursor_generation, cursor_circle_version, cursor_index, cursor_rank, cursor_cid)) =
+        cursor_value
+    else {
+        return 0;
+    };
+
+    if let Some(circle_version) = cursor_circle_version {
+        if list.generation == cursor_generation && list.circle_version == circle_version {
+            if let Some(&idx) = list.indices.get(cursor_index) {
+                if items[idx as usize].quote_cid == cursor_cid {
+                    return cursor_index + 1;
+                }
+            }
+        }
+    }
+
+    if let Some(pos) =
+        list.indices.iter().position(|&idx| items[idx as usize].quote_cid == cursor_cid)
+    {
+        return pos + 1;
+    }
+
+    page_start(items, Some((cursor_rank, cursor_cid)), &list.indices)
+}
+
 /// The route's pure core: given `state`, the two generations
 /// `SnapshotHandle::generations` returned (already read once by the caller,
 /// BC50, AC5) and the raw query params, builds the response body or a
@@ -290,6 +360,108 @@ fn build<'a>(
     Ok(SkeletonResponse { feed, cursor })
 }
 
+/// BC2, BC13: the page every unauthenticated or rejected request gets, and
+/// what `build_personal` returns for every case that carries no items —
+/// no graph (`state.graph.is_none()`), no circle yet (BC4), or a circle
+/// still `building_d1` (BC5, BC6a). Distinct from `empty_page` (which
+/// builds the whole `Response`): this is the response *body*, since
+/// `build_personal`'s caller still needs to wrap it in `Json` alongside
+/// the feed's own `Cache-Control` header logic `handler` already owns.
+fn empty_response<'a>() -> SkeletonResponse<'a> {
+    SkeletonResponse { feed: Vec::new(), cursor: None }
+}
+
+/// The personalised route's pure core (BC4 to BC17, BC23's in-memory
+/// touch), `build`'s counterpart once a viewer is verified. `current` is
+/// the current generation `SnapshotHandle::generations()` returned,
+/// already read once by the caller and kept alive for as long as the
+/// response's borrowed items need it (round 2 finding 7, same reasoning
+/// `build` itself follows). Unlike `build`, this never reads `previous`:
+/// `http::viewer::ViewerLists::list_for` builds and caches every viewer's
+/// list off the current generation alone (`## Approach`'s "Rejected:
+/// filtering `global`" note has no bearing here — a viewer's own list is
+/// never the already-capped `global`).
+fn build_personal<'a>(
+    state: &AppState,
+    viewer: &ViewerDid,
+    now: i64,
+    current: &'a Snapshot,
+    params: &HashMap<String, String>,
+) -> Result<SkeletonResponse<'a>, SkeletonError> {
+    let expected = expected_feed_uri(state);
+    match params.get("feed") {
+        Some(feed) if feed == expected => {}
+        _ => return Err(SkeletonError::UnknownFeed),
+    }
+
+    let limit = resolve_limit(params.get("limit").map(String::as_str))?;
+    let cursor_value = resolve_personal_cursor(params.get("cursor").map(String::as_str))?;
+
+    // BC4, BC5, BC6a: no graph subsystem, no circle yet, or still building
+    // all serve the empty page. `enqueue_first_build` is itself a no-op
+    // for a viewer that already has a circle (building or ready) or once
+    // `UPSTAGE_MAX_VIEWERS` is reached (BC6a), so calling it here never
+    // risks a second job.
+    let Some(graph) = &state.graph else {
+        return Ok(empty_response());
+    };
+    let circle = match graph.get(viewer) {
+        Some(circle) => circle,
+        None => {
+            graph.enqueue_first_build(viewer.clone(), now);
+            return Ok(empty_response());
+        }
+    };
+
+    // BC23 (in-memory part): every personalised request that reaches a
+    // circle — building or ready — touches it; `graph::run_touch_flush`
+    // (already running, story 06 slice 2.0) is what writes this through to
+    // SQLite, at most once a minute, off this same in-memory record.
+    graph.record_touch(viewer, now);
+
+    if circle.state != CircleState::Ready {
+        // BC5: still building_d1 (story 06 ships no other non-ready state).
+        return Ok(empty_response());
+    }
+
+    let list = state.viewer_lists.list_for(viewer, &circle, current);
+    let items = current.items.as_slice();
+
+    let start = resolve_personal_start(&list, items, cursor_value);
+    // BC11: a short list is served as-is; `.get(start..)` never reads past
+    // `list.indices`'s own end, so a start beyond it just yields no items.
+    let tail: &[u32] = list.indices.get(start..).unwrap_or(&[]);
+    let page: Vec<&FeedItem> = tail.iter().take(limit).map(|&idx| &items[idx as usize]).collect();
+
+    // BC11: omitted once the page reaches the end of the viewer's own
+    // list; otherwise pins `list`'s `(generation, circle_version)` so the
+    // next page resumes in this same list (BC14).
+    let cursor = if start + page.len() < list.indices.len() {
+        let last_index = start + page.len() - 1;
+        page.last().map(|item| {
+            cursor::encode_personal(
+                list.generation,
+                list.circle_version,
+                last_index,
+                item.rank,
+                &item.quote_cid,
+            )
+        })
+    } else {
+        None
+    };
+
+    let feed = page
+        .into_iter()
+        .map(|item| SkeletonItem {
+            post: item.quote_uri.as_str(),
+            feed_context: format!("r={:.1}", item.ratio),
+        })
+        .collect();
+
+    Ok(SkeletonResponse { feed, cursor })
+}
+
 /// Reads a bearer token out of `Authorization` (network-feed story 05,
 /// BC2): `None` unless the header is present, its scheme matches `Bearer`
 /// case-insensitively (a client that sends `bearer` per HTTP's
@@ -322,19 +494,19 @@ fn empty_page() -> Response {
 }
 
 /// BC2, BC9, BC12, BC26: runs `auth::verify` when the switch is `true`.
-/// `Ok(())` once a viewer is verified (story 05's `## Non-goals`: the feed
-/// itself is never filtered on the resulting `ViewerDid`, so `build` below
-/// still runs exactly as it does when the switch is off). `Err(())` for
-/// every rejection — no `Authorization` header, the wrong scheme, an empty
-/// token (BC2), or any `AuthError` `verify` returns (BC26, logged at
-/// `debug` with only the variant name, never the DID or the token, per
-/// `auth`'s own BC21).
-fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
+/// `Ok(viewer)` once a viewer is verified — network-feed story 06's
+/// personalised branch (`build_personal`) is what actually reads `viewer`;
+/// story 05's own `## Non-goals` (the global `build` never filters on it)
+/// still holds for the switch-off path. `Err(())` for every rejection — no
+/// `Authorization` header, the wrong scheme, an empty token (BC2), or any
+/// `AuthError` `verify` returns (BC26, logged at `debug` with only the
+/// variant name, never the DID or the token, per `auth`'s own BC21).
+fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<ViewerDid, ()> {
     let auth = state.cfg.auth.as_ref().ok_or(())?;
     let token = bearer_token(headers).ok_or(())?;
     let now = crate::store::unix_now();
     match crate::auth::verify(token, now, &auth.cache, &auth.cfg, &auth.resolver_tx) {
-        Ok(_viewer) => Ok(()),
+        Ok(viewer) => Ok(viewer),
         Err(err) => {
             tracing::debug!(error = ?err, "auth: request rejected");
             Err(())
@@ -343,13 +515,15 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
 }
 
 /// BC1: switch off, no `Authorization` read, output byte-identical to
-/// story 01. BC2, BC12, BC13, BC13a, BC26: switch on, `authenticate` runs
-/// before `build`, so an unauthenticated or rejected request never reaches
+/// story 01 (AC10). BC2, BC12, BC13, BC13a, BC26: switch on, `authenticate`
+/// runs first, so an unauthenticated or rejected request never reaches
 /// request validation and always gets the empty page; a verified request
-/// still runs `build` exactly as the switch-off path does, so a bad
-/// `feed`, `limit` or `cursor` still gets its usual 400 body. Either way,
-/// `Cache-Control` is set once at the end, on every response: `public,
-/// max-age=30` off, `private, no-store` on (BC11, BC13, BC13a, BC33).
+/// runs `build_personal` (network-feed story 06, slice 4.0) instead of the
+/// global `build` — BC4 to BC17, BC20 hold there, and a bad `feed`, `limit`
+/// or `cursor` still gets the same 400 body shape (`SkeletonError`'s shared
+/// `IntoResponse`). Either way, `Cache-Control` is set once at the end, on
+/// every response: `public, max-age=30` off, `private, no-store` on (BC11,
+/// BC13, BC13a, BC33).
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -357,8 +531,21 @@ pub async fn handler(
 ) -> Response {
     let personalise = state.cfg.personalise;
 
-    let mut response = if personalise && authenticate(&state, &headers).is_err() {
-        empty_page()
+    let mut response = if personalise {
+        match authenticate(&state, &headers) {
+            Err(()) => empty_page(),
+            Ok(viewer) => {
+                let now = crate::store::unix_now();
+                // BC50, AC5: the current generation is read exactly once
+                // per request, kept alive here for as long as
+                // `build_personal`'s borrowed response needs it.
+                let (current, _previous) = state.snapshot.generations();
+                match build_personal(&state, &viewer, now, &current, &params) {
+                    Ok(body) => Json(body).into_response(),
+                    Err(err) => err.into_response(),
+                }
+            }
+        }
     } else {
         // BC50, AC5: both generations are read exactly once per request,
         // under a single read lock, kept alive here for as long as
@@ -397,6 +584,30 @@ mod tests {
             original_did: 2,
             quoted_at: 1_700_000_000,
             promoted_at: 1_700_000_000,
+        }
+    }
+
+    /// Like [`item`], but with caller-chosen author hashes and `quoted_at`,
+    /// for the personalised-path tests (network-feed story 06, slice 4.0)
+    /// that need a fixture item connected — or not — to a specific
+    /// viewer's `circle.follows`.
+    fn item_with_authors(
+        quote_uri: &str,
+        quote_cid: &str,
+        quote_did: u64,
+        original_did: u64,
+        quoted_at: i64,
+        rank: f64,
+    ) -> FeedItem {
+        FeedItem {
+            quote_uri: quote_uri.to_string(),
+            quote_cid: quote_cid.to_string(),
+            rank,
+            ratio: 1.0,
+            quote_did,
+            original_did,
+            quoted_at,
+            promoted_at: quoted_at,
         }
     }
 
@@ -699,7 +910,7 @@ mod tests {
         assert!(json.get("cursor").is_none());
         assert_eq!(
             rx.try_recv(),
-            Ok(crate::auth::ResolveRequest::Miss(did.to_string())),
+            Ok(crate::auth::ResolveRequest::Miss { did: did.to_string(), token: token.clone() }),
             "a cache miss must enqueue a Miss for the resolver"
         );
     }
@@ -720,13 +931,24 @@ mod tests {
         let now = crate::store::unix_now();
         let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
         let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+        let viewer = crate::auth::ViewerDid(did.to_string());
 
-        let state = crate::http::tests::test_state_with_auth(cfg.clone(), auth);
+        // A ready circle following the fixture item's quoter (`item`'s own
+        // `quote_did: 1`), so the verified request below is served the
+        // real, filtered feed (BC9) rather than the empty page (BC5) a
+        // viewer with no ready circle would get.
+        let graph = crate::graph::GraphHandle::new(10);
+        graph.enqueue_first_build(viewer.clone(), now);
+        let mut circle = crate::graph::Circle::new();
+        circle.follows = [1u64].into_iter().collect();
+        graph.insert_ready(&viewer, circle);
+
+        let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph);
         swap_items(&state, vec![item("at://q/1", "cid1", 3.0, 4.5)]);
         let app = router(state);
         let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
 
-        // Verified: success, private, no-store, the real feed (BC12).
+        // Verified: success, private, no-store, the real feed (BC9).
         let response = app
             .clone()
             .oneshot(
@@ -753,6 +975,429 @@ mod tests {
         let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
         let json2: Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(json2["feed"].as_array().unwrap().len(), 0);
+    }
+
+    // AC3, BC4: a verified viewer with no circle yet gets the empty page
+    // well under the 300 ms bound, with exactly one circle created in
+    // memory in `building_d1` and (implicitly, via `GraphHandle`'s own
+    // de-duplicated queue, `graph::tests::enqueue_first_build_creates_a_
+    // building_circle_and_one_job`) one `FirstBuild` job queued.
+    #[tokio::test]
+    async fn first_open_empty_fast() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did = "did:plc:firstopenaaaaaaaaaaaaaaa";
+        let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+
+        let graph = crate::graph::GraphHandle::new(10);
+        let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph.clone());
+        let app = router(state);
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+
+        let start = std::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(elapsed < std::time::Duration::from_millis(300), "took {elapsed:?}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["feed"].as_array().unwrap().len(), 0);
+        assert!(json.get("cursor").is_none());
+
+        let viewer = crate::auth::ViewerDid(did.to_string());
+        let circle = graph.get(&viewer).expect("a circle must be created in memory");
+        assert_eq!(circle.state, crate::graph::CircleState::BuildingD1);
+    }
+
+    // AC7, BC15: a cursor naming another viewer's own item and index never
+    // resolves to an item outside the requester's own circle-filtered
+    // list, regardless of which resolution path it falls through to.
+    #[tokio::test]
+    async fn foreign_cursor() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did_b = "did:plc:viewerbaaaaaaaaaaaaaaaaa";
+        let token_b = crate::auth::seed_and_sign_for_test(&cache, did_b, &cfg.service_did, now);
+
+        let quoter_a = crate::graph::hash_did("did:plc:quoter-a");
+        let quoter_b = crate::graph::hash_did("did:plc:quoter-b");
+        let store = crate::store::Store::open_memory().unwrap();
+        let follows_a: std::collections::HashSet<u64> = [quoter_a].into_iter().collect();
+        let follows_b: std::collections::HashSet<u64> = [quoter_b].into_iter().collect();
+        store
+            .viewer_save_circle(
+                "did:plc:vieweraaaaaaaaaaaaaaaaaa",
+                "ready",
+                now,
+                now,
+                &[],
+                &follows_a,
+            )
+            .unwrap();
+        store.viewer_save_circle(did_b, "ready", now, now, &[], &follows_b).unwrap();
+        let graph = crate::graph::GraphHandle::from_store(&store, 10).unwrap();
+
+        let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph);
+        let item_a = item_with_authors(
+            "at://q/a",
+            "cid-a",
+            quoter_a,
+            crate::graph::hash_did("did:plc:orig-a"),
+            1_700_000_000,
+            10.0,
+        );
+        let item_b = item_with_authors(
+            "at://q/b",
+            "cid-b",
+            quoter_b,
+            crate::graph::hash_did("did:plc:orig-b"),
+            1_700_000_000,
+            5.0,
+        );
+        swap_items(&state, vec![item_a, item_b]);
+        let app = router(state);
+
+        // A cursor that names viewer A's own item, at viewer A's own
+        // (generation, circle_version) — but sent as viewer B.
+        let cursor_a = cursor::encode_personal(1, 1, 0, 10.0, "cid-a");
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&cursor={cursor_a}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token_b}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let served: Vec<&str> =
+            json["feed"].as_array().unwrap().iter().map(|f| f["post"].as_str().unwrap()).collect();
+        assert!(
+            !served.contains(&"at://q/a"),
+            "an item outside the requester's own list must never be served"
+        );
+    }
+
+    // AC8, BC16: the circle changes (the worker swaps in a fresh circle,
+    // simulated here through `GraphHandle::insert_ready`, story 06's own
+    // Non-goals having no live refresh trigger yet) between two page
+    // requests at the same snapshot generation. The item already served on
+    // page 1 must not repeat, and the item newly visible after the change
+    // must not be skipped (no early end).
+    #[tokio::test]
+    async fn circle_change_mid_scroll() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did = "did:plc:scrollvieweraaaaaaaaaaaa";
+        let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+        let viewer = crate::auth::ViewerDid(did.to_string());
+
+        let quoter1 = crate::graph::hash_did("did:plc:quoter-1");
+        let quoter2 = crate::graph::hash_did("did:plc:quoter-2");
+        // Distinct original authors: cap 1 (one item per (original_did,
+        // day)) would otherwise drop item2 outright, which would test cap
+        // 1, not BC16's cursor-resolution question this test is about.
+        let original1 = crate::graph::hash_did("did:plc:original-1");
+        let original2 = crate::graph::hash_did("did:plc:original-2");
+
+        let graph = crate::graph::GraphHandle::new(10);
+        graph.enqueue_first_build(viewer.clone(), now);
+        let mut circle1 = crate::graph::Circle::new();
+        circle1.follows = [quoter1].into_iter().collect();
+        graph.insert_ready(&viewer, circle1);
+
+        let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph.clone());
+        let item1 = item_with_authors("at://q/1", "cid1", quoter1, original1, 1_700_000_000, 10.0);
+        let item2 = item_with_authors("at://q/2", "cid2", quoter2, original2, 1_700_000_000, 5.0);
+        swap_items(&state, vec![item1, item2]);
+        let app = router(state);
+
+        // A cursor as if the client had already been served `cid1`, at the
+        // circle's version when only `quoter1` was followed.
+        let cursor_page1 = cursor::encode_personal(1, 1, 0, 10.0, "cid1");
+
+        // The circle changes mid-scroll: a fresh save now also follows
+        // `quoter2`, bumping `circle_version` to 2 at the same snapshot
+        // generation (BC16's premise).
+        let mut circle2 = crate::graph::Circle::new();
+        circle2.follows = [quoter1, quoter2].into_iter().collect();
+        graph.insert_ready(&viewer, circle2);
+
+        let uri =
+            format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&cursor={cursor_page1}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let served: Vec<&str> =
+            json["feed"].as_array().unwrap().iter().map(|f| f["post"].as_str().unwrap()).collect();
+
+        assert!(!served.contains(&"at://q/1"), "must not repeat an already-served item");
+        assert_eq!(served, vec!["at://q/2"], "must not skip the newly-visible item either");
+    }
+
+    // BC5: a viewer whose circle already exists, still `building_d1`, gets
+    // the empty page and no second job — the handler's "no circle" branch
+    // (the only one that ever calls `enqueue_first_build`) never runs once
+    // `graph.get` already returns a circle.
+    #[tokio::test]
+    async fn building_circle_gets_empty_page_with_no_second_job() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did = "did:plc:buildingvieweraaaaaaaaaa";
+        let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+        let viewer = crate::auth::ViewerDid(did.to_string());
+
+        let graph = crate::graph::GraphHandle::new(10);
+        graph.enqueue_first_build(viewer.clone(), now);
+        let queue = graph.queue();
+        assert_eq!(queue.try_pop(), Some(viewer.clone()), "the one job from enqueue_first_build");
+        // Re-push it, as `run_worker` would leave it while a real attempt
+        // is in flight (the outstanding mark, not the FIFO position, is
+        // what de-duplicates).
+        queue.retry(viewer.clone());
+
+        let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph.clone());
+        let app = router(state);
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["feed"].as_array().unwrap().len(), 0);
+
+        assert_eq!(
+            graph.get(&viewer).map(|c| c.state),
+            Some(crate::graph::CircleState::BuildingD1),
+            "the circle is untouched"
+        );
+        assert_eq!(
+            queue.try_pop(),
+            Some(viewer),
+            "still exactly the one job the retry re-queued, no second job added"
+        );
+        assert!(queue.try_pop().is_none(), "no second job");
+    }
+
+    // BC6a: at `UPSTAGE_MAX_VIEWERS`, a new viewer's personalised request
+    // still gets the empty page (the cap itself, and its one-per-minute
+    // warning, are `graph::GraphHandle::enqueue_first_build`'s own
+    // contract, proven directly in `graph::tests`).
+    #[tokio::test]
+    async fn at_cap_new_viewer_gets_empty_page() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did = "did:plc:capvieweraaaaaaaaaaaaaaa";
+        let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+
+        // A handle at its cap of one, already holding a different viewer's
+        // circle.
+        let graph = crate::graph::GraphHandle::new(1);
+        graph.enqueue_first_build(crate::auth::ViewerDid("did:plc:someoneelse".to_string()), now);
+
+        let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph);
+        let app = router(state);
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["feed"].as_array().unwrap().len(), 0);
+    }
+
+    // BC11, BC14, BC17b: a viewer's list shorter than `limit` is served
+    // as-is with no `cursor` (BC11); the cursor that page would have
+    // carried, had one been requested at `limit=1`, resumes exactly via
+    // path 1 (BC14); and a malformed cursor on this path is the same 400
+    // `InvalidRequest` shape the global path already returns (BC17b).
+    #[tokio::test]
+    async fn short_list_resume_and_malformed_cursor() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did = "did:plc:shortlistvieweraaaaaaaaa";
+        let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+        let viewer = crate::auth::ViewerDid(did.to_string());
+
+        let quoter = crate::graph::hash_did("did:plc:only-quoter");
+        let graph = crate::graph::GraphHandle::new(10);
+        graph.enqueue_first_build(viewer.clone(), now);
+        let mut circle = crate::graph::Circle::new();
+        circle.follows = [quoter].into_iter().collect();
+        graph.insert_ready(&viewer, circle);
+
+        let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph);
+        let connected_item = item_with_authors(
+            "at://q/only",
+            "cid-only",
+            quoter,
+            crate::graph::hash_did("did:plc:original-only"),
+            1_700_000_000,
+            10.0,
+        );
+        let mut others = vec![connected_item];
+        for i in 0..5 {
+            others.push(item_with_authors(
+                &format!("at://q/other-{i}"),
+                &format!("cid-other-{i}"),
+                crate::graph::hash_did(&format!("did:plc:other-quoter-{i}")),
+                crate::graph::hash_did(&format!("did:plc:other-original-{i}")),
+                1_700_000_000,
+                5.0 - i as f64,
+            ));
+        }
+        swap_items(&state, others);
+        let app = router(state);
+
+        // BC11: the viewer's list holds one item; it is served in full,
+        // with no `cursor`, even though 5 other, unconnected items exist
+        // in the snapshot.
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["feed"].as_array().unwrap().len(), 1);
+        assert_eq!(json["feed"][0]["post"], "at://q/only");
+        assert!(json.get("cursor").is_none(), "a short list carries no cursor");
+
+        // BC14: a five-field cursor pinned exactly at this list's own
+        // (generation, circle_version) and index resolves through path 1.
+        // Nothing follows the one connected item, so the next page is
+        // empty, not an error and not a repeat.
+        let resume_cursor = cursor::encode_personal(1, 1, 0, 10.0, "cid-only");
+        let uri2 =
+            format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&cursor={resume_cursor}");
+        let response2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri2)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
+        let json2: Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(json2["feed"].as_array().unwrap().len(), 0, "nothing follows the one item");
+
+        // BC17b: a malformed cursor is the same 400 `InvalidRequest` shape
+        // the global path already returns.
+        let uri3 =
+            format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&cursor=not-valid!!!");
+        let response3 = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri3)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response3.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response3.headers().get(CACHE_CONTROL).unwrap(),
+            "private, no-store",
+            "the personalised Cache-Control still applies to a 400"
+        );
+        let body3 = axum::body::to_bytes(response3.into_body(), usize::MAX).await.unwrap();
+        let json3: Value = serde_json::from_slice(&body3).unwrap();
+        assert_eq!(json3["error"], "InvalidRequest");
     }
 
     // BC7, BC32: page_start behaviour, unit-tested directly.

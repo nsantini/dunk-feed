@@ -22,7 +22,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::keys::PublicKey;
-use super::ResolveRequest;
+use super::{AuthConfig, FirstBuildHook, ResolveRequest};
 
 /// An entry older than this is stale (BC14): still used, but a refresh
 /// should be enqueued.
@@ -419,22 +419,36 @@ fn extract_key(document: &Value) -> Option<PublicKey> {
 /// only a fetch that both succeeds and yields a usable key clears the
 /// miss state entirely ([`KeyCache::miss_fetch_succeeded`]); every other
 /// outcome starts the hourly cooldown ([`KeyCache::miss_fetch_failed`]).
+///
+/// BC22: once a `Miss`'s key is cached, its carried token is re-verified
+/// (`super::verify_no_resolve`, which never touches this channel), and only
+/// on `Ok` does `first_build_hook` — when set — run with the verified
+/// `ViewerDid`. Any verify error, or no hook set, enqueues nothing.
 pub(super) async fn run_resolver<F: DidFetcher>(
     mut requests: mpsc::Receiver<ResolveRequest>,
     fetcher: F,
     cache: Arc<KeyCache>,
+    auth_cfg: AuthConfig,
+    first_build_hook: Option<FirstBuildHook>,
 ) {
     while let Some(request) = requests.recv().await {
-        let (did, is_miss) = match request {
-            ResolveRequest::Miss(did) => (did, true),
-            ResolveRequest::Refetch(did) => (did, false),
+        let (did, is_miss, token) = match request {
+            ResolveRequest::Miss { did, token } => (did, true, Some(token)),
+            ResolveRequest::Refetch(did) => (did, false, None),
         };
         match fetcher.fetch(&did).await {
             Ok(document) => match extract_key(&document) {
                 Some(key) => {
-                    cache.insert(did.clone(), key, crate::store::unix_now());
+                    let now = crate::store::unix_now();
+                    cache.insert(did.clone(), key, now);
                     if is_miss {
                         cache.miss_fetch_succeeded(&did);
+                    }
+                    if let (Some(token), Some(hook)) = (&token, &first_build_hook) {
+                        if let Ok(viewer) = super::verify_no_resolve(token, now, &cache, &auth_cfg)
+                        {
+                            hook(viewer);
+                        }
                     }
                 }
                 None => {
@@ -760,12 +774,14 @@ mod tests {
     }
 
     /// Runs `run_resolver` to completion over a channel that already
-    /// holds `request`, then closes the channel so the task returns.
+    /// holds `request`, then closes the channel so the task returns. No
+    /// `FirstBuildHook`: BC22 has its own tests below.
     async fn resolve_one(request: ResolveRequest, fetcher: FakeFetcher, cache: Arc<KeyCache>) {
         let (tx, rx) = mpsc::channel(8);
         tx.try_send(request).expect("channel just built, has room for one");
         drop(tx);
-        run_resolver(rx, fetcher, cache).await;
+        let cfg = AuthConfig { service_did: "did:web:unused.example".to_string() };
+        run_resolver(rx, fetcher, cache, cfg, None).await;
     }
 
     #[tokio::test]
@@ -776,7 +792,7 @@ mod tests {
         let doc = did_document(plc_did, &k256_multibase(k256_sk.verifying_key()));
         let cache = Arc::new(KeyCache::new(10));
         resolve_one(
-            ResolveRequest::Miss(plc_did.to_string()),
+            ResolveRequest::Miss { did: plc_did.to_string(), token: "unused".to_string() },
             FakeFetcher::once(Ok(doc)),
             Arc::clone(&cache),
         )
@@ -788,7 +804,7 @@ mod tests {
         let doc = did_document(web_did, &p256_multibase(p256_sk.verifying_key()));
         let cache = Arc::new(KeyCache::new(10));
         resolve_one(
-            ResolveRequest::Miss(web_did.to_string()),
+            ResolveRequest::Miss { did: web_did.to_string(), token: "unused".to_string() },
             FakeFetcher::once(Ok(doc)),
             Arc::clone(&cache),
         )
@@ -805,7 +821,7 @@ mod tests {
         let did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
         let cache = Arc::new(KeyCache::new(10));
         resolve_one(
-            ResolveRequest::Miss(did.to_string()),
+            ResolveRequest::Miss { did: did.to_string(), token: "unused".to_string() },
             FakeFetcher::once(Err(FetchError::Http(500))),
             Arc::clone(&cache),
         )
@@ -831,7 +847,7 @@ mod tests {
 
         assert!(cache.should_send_miss(did, now), "first miss for this DID enqueues a fetch");
         resolve_one(
-            ResolveRequest::Miss(did.to_string()),
+            ResolveRequest::Miss { did: did.to_string(), token: "unused".to_string() },
             FakeFetcher::once(Ok(doc)),
             Arc::clone(&cache),
         )
@@ -948,10 +964,91 @@ mod tests {
         // below processes it and returns rather than waiting forever.
         drop(tx);
         let doc = did_document(did, &k256_multibase(new_sk.verifying_key()));
-        run_resolver(rx, FakeFetcher::once(Ok(doc)), Arc::clone(&cache)).await;
+        run_resolver(rx, FakeFetcher::once(Ok(doc)), Arc::clone(&cache), cfg.clone(), None).await;
 
         // The same token verifies now that the cache holds the new key.
         let (tx2, _rx2) = mpsc::channel(8);
         assert_eq!(verify(&token, now, &cache, &cfg, &tx2), Ok(ViewerDid(did.to_string())));
+    }
+
+    #[tokio::test]
+    async fn miss_success_reverifies_token_and_calls_the_hook() {
+        // BC22: once a `Miss`'s key is cached, the carried token is
+        // re-verified, and `Ok` calls the hook with the verified
+        // `ViewerDid`.
+        const SERVICE_DID: &str = "did:web:feed.example";
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let sk = k256::ecdsa::SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let now = crate::store::unix_now();
+        let token = sign_es256k(&sk, did, SERVICE_DID, now);
+
+        let doc = did_document(did, &k256_multibase(sk.verifying_key()));
+        let cache = Arc::new(KeyCache::new(10));
+        let cfg = AuthConfig { service_did: SERVICE_DID.to_string() };
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(ResolveRequest::Miss { did: did.to_string(), token: token.clone() }).unwrap();
+        drop(tx);
+
+        let called_with: Arc<Mutex<Option<ViewerDid>>> = Arc::new(Mutex::new(None));
+        let hook_called_with = Arc::clone(&called_with);
+        let hook: FirstBuildHook = Arc::new(move |viewer| {
+            *hook_called_with.lock().unwrap() = Some(viewer);
+        });
+
+        run_resolver(rx, FakeFetcher::once(Ok(doc)), Arc::clone(&cache), cfg, Some(hook)).await;
+
+        assert_eq!(*called_with.lock().unwrap(), Some(ViewerDid(did.to_string())));
+    }
+
+    #[tokio::test]
+    async fn miss_success_with_a_bad_token_never_calls_the_hook() {
+        // BC22: a document that resolves fine but whose carried token does
+        // not verify (wrong audience here) calls no hook.
+        const SERVICE_DID: &str = "did:web:feed.example";
+        let did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        let sk = k256::ecdsa::SigningKey::from_slice(&[6u8; 32]).unwrap();
+        let now = crate::store::unix_now();
+        // Signed for a different audience, so `verify_no_resolve` fails it.
+        let bad_token = sign_es256k(&sk, did, "did:web:wrong.example", now);
+
+        let doc = did_document(did, &k256_multibase(sk.verifying_key()));
+        let cache = Arc::new(KeyCache::new(10));
+        let cfg = AuthConfig { service_did: SERVICE_DID.to_string() };
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(ResolveRequest::Miss { did: did.to_string(), token: bad_token }).unwrap();
+        drop(tx);
+
+        let called: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let hook_called = Arc::clone(&called);
+        let hook: FirstBuildHook = Arc::new(move |_viewer| {
+            *hook_called.lock().unwrap() = true;
+        });
+
+        run_resolver(rx, FakeFetcher::once(Ok(doc)), Arc::clone(&cache), cfg, Some(hook)).await;
+
+        assert!(!*called.lock().unwrap(), "a token that fails to re-verify must not call the hook");
+    }
+
+    #[tokio::test]
+    async fn miss_success_with_no_hook_set_does_nothing() {
+        // BC22: "no hook set: nothing happens" — a `Miss` whose token
+        // re-verifies fine, but with no hook, must not panic or otherwise
+        // misbehave.
+        const SERVICE_DID: &str = "did:web:feed.example";
+        let did = "did:plc:cccccccccccccccccccccccc";
+        let sk = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let now = crate::store::unix_now();
+        let token = sign_es256k(&sk, did, SERVICE_DID, now);
+
+        let doc = did_document(did, &k256_multibase(sk.verifying_key()));
+        let cache = Arc::new(KeyCache::new(10));
+        let cfg = AuthConfig { service_did: SERVICE_DID.to_string() };
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(ResolveRequest::Miss { did: did.to_string(), token }).unwrap();
+        drop(tx);
+
+        run_resolver(rx, FakeFetcher::once(Ok(doc)), Arc::clone(&cache), cfg, None).await;
+
+        assert!(matches!(cache.get(did, now), Lookup::Fresh(_)));
     }
 }

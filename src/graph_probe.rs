@@ -522,9 +522,10 @@ async fn run_one_handle(
     let did = client.resolve_handle(handle).await.map_err(|err| fail("resolve_handle", err))?;
 
     let mut circle = Circle::new();
-    let follows_stats = step_follows(client, &did, cfg.d2_follows_sample as usize, &mut circle)
-        .await
-        .map_err(|err| fail("step_follows", err))?;
+    let follows_stats =
+        step_follows(client, &did, cfg.d2_follows_sample as usize, &mut circle, None)
+            .await
+            .map_err(|err| fail("step_follows", err))?;
 
     let follows_me_stats =
         step_follows_me(client, &did, ranked, cfg.follows_me_depth as usize, &mut circle)

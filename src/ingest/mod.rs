@@ -813,6 +813,93 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+/// Starts the graph subsystem — a second `Store` connection, the
+/// `GraphHandle` loaded from it (BC19), the worker task and the touch-flush
+/// task (network-feed story 06) — when `cfg.bsky_handle` and
+/// `cfg.bsky_app_password` are both set. Returns the loaded `GraphHandle`
+/// (slice 4.0: `run` attaches it to `AppState::graph`, BC4) alongside the
+/// hook `run` wires into the resolver so a verified viewer with no circle
+/// gets a first build (BC22). Returns `None`, logging one `error` line,
+/// when either credential is missing (BC18) or any step here fails: `run`
+/// itself never fails over this, since a verified viewer just keeps
+/// getting empty pages either way (BC4's "no graph" case).
+/// `viewer_lists` is cloned into the worker's drop-lists callback
+/// (`graph::queue::DropListsFn`), so a freshly built circle's cached list
+/// is dropped the moment it swaps in (BC7).
+fn start_graph_subsystem(
+    cfg: &Config,
+    viewer_lists: std::sync::Arc<crate::http::viewer::ViewerLists>,
+) -> Option<(std::sync::Arc<crate::graph::GraphHandle>, crate::auth::FirstBuildHook)> {
+    let (handle, app_password) = match (&cfg.bsky_handle, &cfg.bsky_app_password) {
+        (Some(handle), Some(app_password)) => (handle.clone(), app_password.clone()),
+        _ => {
+            tracing::error!(
+                "ingest: UPSTAGE_PERSONALISE is true but BSKY_HANDLE or BSKY_APP_PASSWORD \
+                 is not set; the graph worker will not start and verified viewers get empty pages"
+            );
+            return None;
+        }
+    };
+
+    let graph_store = match crate::store::Store::open(cfg) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::error!(error = %err, "ingest: could not open the graph worker's store connection");
+            return None;
+        }
+    };
+
+    let graph_handle =
+        match crate::graph::GraphHandle::from_store(&graph_store, cfg.max_viewers as usize) {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::error!(error = %err, "ingest: could not load circles from the store");
+                return None;
+            }
+        };
+
+    let credentials = crate::appview::pds::Credentials { handle, app_password };
+    let pds_client = match crate::appview::pds::PdsClient::from_config(cfg, credentials) {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::error!(error = %err, "ingest: could not build the graph worker's PDS client");
+            return None;
+        }
+    };
+
+    let d2_sample_size = cfg.d2_follows_sample as usize;
+    // BC7: dropping a viewer's cached lists the moment the worker swaps in
+    // a fresh circle, so the next request rebuilds against it rather than
+    // serving a list filtered against the one it just replaced.
+    let drop_lists: crate::graph::DropListsFn = {
+        let viewer_lists = std::sync::Arc::clone(&viewer_lists);
+        std::sync::Arc::new(move |viewer_did: &str| {
+            viewer_lists.drop_viewer(&crate::auth::ViewerDid(viewer_did.to_string()));
+        })
+    };
+
+    let worker_handle = std::sync::Arc::clone(&graph_handle);
+    let worker_store = graph_store.clone();
+    tokio::spawn(crate::graph::run_worker(
+        worker_handle,
+        worker_store,
+        pds_client,
+        d2_sample_size,
+        Some(drop_lists),
+    ));
+
+    let flush_handle = std::sync::Arc::clone(&graph_handle);
+    let flush_store = graph_store.clone();
+    tokio::spawn(crate::graph::run_touch_flush(flush_handle, flush_store));
+
+    let hook_handle = std::sync::Arc::clone(&graph_handle);
+    let hook: crate::auth::FirstBuildHook =
+        std::sync::Arc::new(move |viewer: crate::auth::ViewerDid| {
+            hook_handle.enqueue_first_build(viewer, crate::store::unix_now());
+        });
+    Some((graph_handle, hook))
+}
+
 /// `upstage run`'s entry point, TECH-DESIGN section 5.1 end to end: opens
 /// `cfg.db_path` (BC35), starts the writer wired to the eviction channel
 /// (round 1 finding 2), rebuilds the hot set from `pairs` and logs its size
@@ -923,20 +1010,39 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
     // carries `None` otherwise, and `skeleton::handler` never reads
     // `Authorization` in that case either.
     let mut http_config = crate::http::HttpConfig::from(cfg);
+    // network-feed story 06, slice 4.0: the per-viewer list cache is built
+    // unconditionally (cheap, empty until a request or a worker save
+    // touches it) so `AppState::viewer_lists` always has one to hand out,
+    // whether or not the graph subsystem below ever starts.
+    let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+    let mut graph_handle: Option<std::sync::Arc<crate::graph::GraphHandle>> = None;
     if cfg.personalise {
-        let (resolver_tx, cache) =
-            crate::auth::spawn_resolver(cfg.plc_url.clone(), cfg.max_viewers as usize * 2);
-        http_config.auth = Some(crate::http::AuthHandle {
-            cache,
-            resolver_tx,
-            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
-        });
+        let auth_cfg = crate::auth::AuthConfig { service_did: cfg.service_did.clone() };
+        // network-feed story 06: the graph subsystem (a second `Store`
+        // connection, the in-memory `GraphHandle`, the worker and the
+        // touch-flush task) starts only when credentials exist too (BC18);
+        // `first_build_hook` stays `None` otherwise, so the resolver task
+        // below runs the same either way, and `graph_handle` stays `None`
+        // (BC4's "no graph" case: verified viewers get empty pages).
+        let subsystem = start_graph_subsystem(cfg, std::sync::Arc::clone(&viewer_lists));
+        let first_build_hook = subsystem.as_ref().map(|(_, hook)| std::sync::Arc::clone(hook));
+        graph_handle = subsystem.map(|(handle, _)| handle);
+
+        let (resolver_tx, cache) = crate::auth::spawn_resolver(
+            cfg.plc_url.clone(),
+            cfg.max_viewers as usize * 2,
+            auth_cfg.clone(),
+            first_build_hook,
+        );
+        http_config.auth = Some(crate::http::AuthHandle { cache, resolver_tx, cfg: auth_cfg });
     }
     let http_state = std::sync::Arc::new(crate::http::AppState {
         snapshot,
         writer: writer.clone(),
         health: liveness,
         cfg: http_config,
+        graph: graph_handle,
+        viewer_lists,
     });
     let http_handle: tokio::task::JoinHandle<Result<(), IngestError>> = tokio::spawn(async move {
         crate::http::serve(&http_cfg, http_state, http_shutdown_rx).await.map_err(IngestError::Http)
@@ -2590,5 +2696,89 @@ mod tests {
             .expect("the run_ingest task should not panic");
 
         assert!(result.is_ok(), "a live run should not error: {result:?}");
+    }
+
+    // --- start_graph_subsystem ------------------------------------------
+
+    /// A unique, real file path under the OS temp dir, so a `Store::open`
+    /// in these tests never collides with another test run's database.
+    fn temp_db_path(name: &str) -> String {
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir()
+            .join(format!("upstage-ingest-{name}-{nanos}.sqlite3"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A `Config` with `BSKY_HANDLE` and `BSKY_APP_PASSWORD` set, and
+    /// `UPSTAGE_DB_PATH` pointed at a fresh temp file, for
+    /// `start_graph_subsystem_with_credentials_starts_the_worker`.
+    fn test_config_with_graph(db_path: &str) -> Config {
+        let db_path = db_path.to_string();
+        let lookup = move |name: &str| match name {
+            "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
+            "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
+            "UPSTAGE_DB_PATH" => Some(db_path.clone()),
+            "BSKY_HANDLE" => Some("upstage.bsky.social".to_string()),
+            "BSKY_APP_PASSWORD" => Some("secret".to_string()),
+            _ => None,
+        };
+        crate::config::load(lookup).expect("test config should load")
+    }
+
+    #[test]
+    fn start_graph_subsystem_without_credentials_returns_none() {
+        // BC18: the switch is on (implicitly, by calling this at all — the
+        // caller in `run` only calls it inside `if cfg.personalise`) but
+        // `BSKY_HANDLE`/`BSKY_APP_PASSWORD` are missing: no worker starts,
+        // and the caller gets no hook to wire into the resolver.
+        let cfg = test_config();
+        assert!(cfg.bsky_handle.is_none());
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+        assert!(start_graph_subsystem(&cfg, viewer_lists).is_none());
+    }
+
+    #[tokio::test]
+    async fn start_graph_subsystem_with_credentials_starts_the_worker() {
+        // BC19 (the load half): with credentials present, the graph store
+        // opens, the (empty) circle index loads without error, and a hook
+        // comes back for the caller to wire into the resolver.
+        let path = temp_db_path("start-graph");
+        let cfg = test_config_with_graph(&path);
+
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+        let subsystem = start_graph_subsystem(&cfg, viewer_lists);
+        assert!(subsystem.is_some(), "credentials present: a graph handle and hook must come back");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[tokio::test]
+    async fn start_graph_subsystem_reenqueues_a_building_d1_row() {
+        // BC19: a `building_d1` row already in the database at startup
+        // means the hook's underlying `GraphHandle` re-enqueued it, the
+        // same load `graph::tests::restart_loads_circles` exercises
+        // directly on `GraphHandle::from_store`. This test drives it
+        // through `start_graph_subsystem` instead, so the `run`-level
+        // wiring is covered too.
+        let path = temp_db_path("start-graph-reenqueue");
+        {
+            let seed = crate::store::Store::open_path(&path).unwrap();
+            seed.viewer_save_state("did:plc:building", "building_d1", crate::store::unix_now())
+                .unwrap();
+        }
+        let cfg = test_config_with_graph(&path);
+
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+        let subsystem = start_graph_subsystem(&cfg, viewer_lists);
+        assert!(subsystem.is_some());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 }
