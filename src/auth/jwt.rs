@@ -74,24 +74,41 @@ fn is_valid_plc_suffix(suffix: &str) -> bool {
     suffix.len() == 24 && suffix.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
 }
 
-/// `did:web:<host>`'s own shape (review round 1, defects D and E): ASCII
-/// letters, digits, `-` and `.` only, at least one `.`, and not an IPv4
-/// literal (every dot-separated label all-digits) — a `did:web`
-/// identifier names a domain, not an address. Excluding every other
-/// character rejects `%` (a percent-encoded port, upper or lower case),
-/// `/` (a path), `?` (a query), `@` (userinfo) and `:` (a port or a
-/// `did:web` path segment) in one pass, rather than naming each
-/// separately the way the previous, narrower check did.
+/// `did:web:<host>`'s own shape (BC8): lower-case ASCII only, dot-separated
+/// labels of 1 to 63 characters each from `[a-z0-9-]`, each starting and
+/// ending with a letter or digit, the whole host at most 253 characters,
+/// at least two labels, and no trailing dot. A WHATWG URL parser (the one
+/// `reqwest`, and so the resolver, uses to build the fetch URL) still
+/// reads a form like `0x7f.0.0.1` or a trailing dot as an IPv4 address
+/// even though it fails a plain "every label is all-digits" check, so
+/// this also requires the last label to be letters only, or an
+/// internationalized-domain `xn--` label — no numeric or hex TLD ever
+/// passes, so no IPv4 form the URL parser recognizes can pass either.
+/// Rejecting upper case outright, rather than folding it, also means one
+/// host can never produce two different cache or miss-limiter keys.
 fn is_valid_web_host(host: &str) -> bool {
-    if host.is_empty() || !host.contains('.') {
+    if host.is_empty() || host.len() > 253 || host.ends_with('.') {
         return false;
     }
-    if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
         return false;
     }
-    let is_ipv4_literal =
-        host.split('.').all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()));
-    !is_ipv4_literal
+    for label in &labels {
+        let bytes = label.as_bytes();
+        if bytes.is_empty() || bytes.len() > 63 {
+            return false;
+        }
+        if !label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            return false;
+        }
+        let is_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+        if !is_alnum(bytes[0]) || !is_alnum(bytes[bytes.len() - 1]) {
+            return false;
+        }
+    }
+    let last_label = labels[labels.len() - 1];
+    last_label.chars().all(|c| c.is_ascii_lowercase()) || last_label.starts_with("xn--")
 }
 
 /// Checks BC8: `did` (the part before any `#`) is `did:plc:<suffix>`
@@ -348,6 +365,56 @@ mod tests {
         let header = r#"{"alg":"ES256K"}"#;
         let payload = valid_payload("did:web:192.168.0.1", SERVICE_DID);
         assert_eq!(check(&token(header, &payload), NOW, SERVICE_DID), Err(AuthError::Issuer));
+    }
+
+    #[test]
+    fn rejects_did_web_hex_or_short_ipv4_forms() {
+        // BC8: a WHATWG URL parser still reads these as IPv4 addresses,
+        // even though no label is all-digits.
+        let header = r#"{"alg":"ES256K"}"#;
+        for bad in ["did:web:0x7f.0.0.1", "did:web:0x7f.1"] {
+            let payload = valid_payload(bad, SERVICE_DID);
+            assert_eq!(
+                check(&token(header, &payload), NOW, SERVICE_DID),
+                Err(AuthError::Issuer),
+                "expected Issuer for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_did_web_trailing_dot() {
+        // BC8: a trailing dot gives an empty last label, which a URL
+        // parser still resolves as the bare host.
+        let header = r#"{"alg":"ES256K"}"#;
+        let payload = valid_payload("did:web:127.0.0.1.", SERVICE_DID);
+        assert_eq!(check(&token(header, &payload), NOW, SERVICE_DID), Err(AuthError::Issuer));
+        let payload = valid_payload("did:web:example.com.", SERVICE_DID);
+        assert_eq!(check(&token(header, &payload), NOW, SERVICE_DID), Err(AuthError::Issuer));
+    }
+
+    #[test]
+    fn rejects_did_web_upper_case() {
+        // BC8: upper case is rejected outright (not folded), so one host
+        // can never yield two cache keys.
+        let header = r#"{"alg":"ES256K"}"#;
+        let payload = valid_payload("did:web:Example.COM", SERVICE_DID);
+        assert_eq!(check(&token(header, &payload), NOW, SERVICE_DID), Err(AuthError::Issuer));
+    }
+
+    #[test]
+    fn rejects_did_web_empty_or_edge_hyphen_labels() {
+        // BC8: empty labels and a label starting with a hyphen are not
+        // valid domain labels.
+        let header = r#"{"alg":"ES256K"}"#;
+        for bad in ["did:web:..", "did:web:-a.com", "did:web:a..b"] {
+            let payload = valid_payload(bad, SERVICE_DID);
+            assert_eq!(
+                check(&token(header, &payload), NOW, SERVICE_DID),
+                Err(AuthError::Issuer),
+                "expected Issuer for {bad}"
+            );
+        }
     }
 
     #[test]

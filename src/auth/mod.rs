@@ -82,7 +82,11 @@ pub enum AuthError {
 /// The resolver task's bounded channel capacity (spec `## Approach`,
 /// `## Defaults taken`): generous enough that a burst of cache misses
 /// never blocks a request on `try_send`; a full channel just drops the
-/// send, since the next request for the same DID enqueues it again (BC9).
+/// send (BC9). `verify`'s `Missing` arm clears the DID's in-flight mark
+/// whenever that `try_send` fails, so a later request for the same DID
+/// still enqueues it again rather than waiting out `should_send_miss`'s
+/// hourly cooldown for an attempt that never actually reached the
+/// resolver.
 const RESOLVER_CHANNEL_CAPACITY: usize = 1024;
 
 /// Builds the DID key cache and starts the resolver task draining it,
@@ -170,12 +174,18 @@ pub fn verify(
             key
         }
         did::Lookup::Missing => {
-            // Review round 1, defect B: `should_send_miss` enqueues a
-            // `Miss` only when one for this DID is not already in flight
-            // and the hourly cooldown since the last attempt has passed
-            // — not on every request for a DID that never resolves.
-            if cache.should_send_miss(&checked.viewer_did, now) {
-                let _ = resolver_tx.try_send(ResolveRequest::Miss(checked.viewer_did.clone()));
+            // BC9: `should_send_miss` enqueues a `Miss` only when one for
+            // this DID is not already in flight and the hourly cooldown
+            // since the last attempt has passed — not on every request
+            // for a DID that never resolves. When the channel is full,
+            // `try_send` drops the message; `miss_send_dropped` clears
+            // the in-flight mark `should_send_miss` just set, so a
+            // dropped send does not lock the DID out until the cooldown
+            // would otherwise allow another attempt.
+            if cache.should_send_miss(&checked.viewer_did, now)
+                && resolver_tx.try_send(ResolveRequest::Miss(checked.viewer_did.clone())).is_err()
+            {
+                cache.miss_send_dropped(&checked.viewer_did);
             }
             return Err(AuthError::KeyUnknown);
         }
@@ -431,6 +441,34 @@ mod tests {
         let did = "did:plc:dddddddddddddddddddddddd";
         let token = sign_token(did, "ES256K", 60, |_msg| vec![0u8; 64]);
         assert_eq!(verify(&token, NOW, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
+        assert_eq!(rx.try_recv(), Ok(ResolveRequest::Miss(did.to_string())));
+    }
+
+    #[test]
+    fn dropped_miss_send_reenqueues_once_the_channel_drains() {
+        // BC9: a full resolver channel drops the `Miss` send; the DID must
+        // not be locked out until the hourly cooldown — the very next
+        // request, once the channel has room, enqueues it again.
+        let cache = KeyCache::new(10);
+        let did = "did:plc:hhhhhhhhhhhhhhhhhhhhhhhh";
+        let token = sign_token(did, "ES256K", 60, |_msg| vec![0u8; 64]);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        // Fill the channel so the next `try_send` fails with `Full`.
+        tx.try_send(ResolveRequest::Miss("did:plc:filler0000000000000".to_string())).unwrap();
+
+        assert_eq!(verify(&token, NOW, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
+        // The filler was the only thing enqueued; our DID's send was
+        // dropped because the channel was full.
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ResolveRequest::Miss("did:plc:filler0000000000000".to_string()))
+        );
+        assert!(rx.try_recv().is_err(), "the dropped Miss must not have been queued");
+
+        // The channel now has room. A later request for the same DID must
+        // enqueue it again at once, not wait out the hourly cooldown.
+        assert_eq!(verify(&token, NOW + 1, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
         assert_eq!(rx.try_recv(), Ok(ResolveRequest::Miss(did.to_string())));
     }
 

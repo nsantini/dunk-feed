@@ -292,13 +292,16 @@ fn build<'a>(
 
 /// Reads a bearer token out of `Authorization` (network-feed story 05,
 /// BC2): `None` unless the header is present, its scheme matches `Bearer`
-/// case-insensitively (review round 1, defect G — a client that sends
-/// `bearer` per HTTP's case-insensitive scheme convention must not be
-/// treated as sending no token at all), and the token half, trimmed of
-/// surrounding whitespace, is non-empty.
+/// case-insensitively (a client that sends `bearer` per HTTP's
+/// case-insensitive scheme convention must not be treated as sending no
+/// token at all), and the token half, trimmed of surrounding whitespace,
+/// is non-empty. The scheme and the token are split on the first ASCII
+/// whitespace character, not only a space (BC2), so a tab or another
+/// linear whitespace byte between them still counts.
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let raw = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
-    let (scheme, token) = raw.split_once(' ')?;
+    let split_at = raw.find(|c: char| c.is_ascii_whitespace())?;
+    let (scheme, token) = raw.split_at(split_at);
     if !scheme.eq_ignore_ascii_case("Bearer") {
         return None;
     }
@@ -638,6 +641,15 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_str("Bearer    ").unwrap());
         assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn bearer_token_splits_on_a_tab() {
+        // BC2: the scheme and the token split on any ASCII whitespace, not
+        // only a space.
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str("Bearer\tabc123").unwrap());
+        assert_eq!(bearer_token(&headers), Some("abc123"));
     }
 
     // AC7, BC9: a token whose DID the cache has never held returns the
