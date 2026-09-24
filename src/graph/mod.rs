@@ -17,9 +17,11 @@ pub use crate::auth::ViewerDid;
 use crate::store::{Store, StoreError};
 
 pub mod build;
+pub mod cache;
 pub mod circle;
 pub mod filter;
 
+pub use cache::FollowsCache;
 pub use circle::Circle;
 pub use queue::{run_touch_flush, run_worker, DropListsFn, JobQueue};
 
@@ -126,6 +128,11 @@ pub struct GraphHandle {
     /// The unix second [`Self::warn_at_cap`] last logged its one-per-minute
     /// warning at (BC6a). `None` until the first time the cap is hit.
     cap_warned_at: Mutex<Option<i64>>,
+    /// The one `FollowsCache` every viewer's degree-2 lookups share (story
+    /// 08 spec.md `## Approach`). Step 3 (`graph::queue::run_step3`, slice
+    /// 2.0) writes it; `http::viewer::build_list` (slice 3.0) reads it
+    /// through [`Self::follows_cache`].
+    follows_cache: Arc<FollowsCache>,
 }
 
 /// The cap warning's cooldown (BC6a): "at most once per minute".
@@ -141,6 +148,7 @@ impl GraphHandle {
             max_viewers,
             touches: Mutex::new(HashMap::new()),
             cap_warned_at: Mutex::new(None),
+            follows_cache: Arc::new(FollowsCache::new()),
         })
     }
 
@@ -160,9 +168,11 @@ impl GraphHandle {
     pub fn from_store(store: &Store, max_viewers: usize) -> Result<Arc<Self>, StoreError> {
         let handle = Self::new(max_viewers);
         let rows = store.viewer_load_all()?;
+        let mut d2_accounts: std::collections::HashSet<String> = std::collections::HashSet::new();
         for row in rows {
             let viewer = ViewerDid(row.viewer_did);
             let state = CircleState::from_store_str(&row.state);
+            d2_accounts.extend(row.d2_sample.iter().cloned());
             let mut circle = Circle::new();
             circle.follows = row.follows;
             circle.checked = row.checked;
@@ -183,6 +193,11 @@ impl GraphHandle {
                 handle.queue.push(viewer);
             }
         }
+        // BC12: preload every follows_cache row a loaded circle's
+        // d2_sample names, so the first request after a restart has
+        // degree-2 items with no new fetch. A missing or malformed row is
+        // skipped by `FollowsCache::preload` itself, logged with no DID.
+        handle.follows_cache.preload(store, d2_accounts.iter().map(String::as_str))?;
         Ok(handle)
     }
 
@@ -191,6 +206,16 @@ impl GraphHandle {
     /// lifetime.
     pub fn queue(&self) -> Arc<JobQueue> {
         Arc::clone(&self.queue)
+    }
+
+    /// The [`FollowsCache`] every viewer's degree-2 lookups share.
+    /// `Arc`-shared so the worker task and the HTTP handler each hold a
+    /// clone independent of this handle's own lifetime, the same pattern
+    /// [`Self::queue`] uses. No production caller yet: slice 2.0's worker
+    /// and slice 3.0's `http::viewer` are the first.
+    #[allow(dead_code)]
+    pub fn follows_cache(&self) -> Arc<FollowsCache> {
+        Arc::clone(&self.follows_cache)
     }
 
     /// The current circle for `viewer`, if one has been created — `None`

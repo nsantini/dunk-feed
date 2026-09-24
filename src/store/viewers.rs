@@ -1,7 +1,11 @@
 //! `viewers`, `viewer_follows` and `viewer_checks` table access,
 //! TECH-DESIGN-network-feed §8. Story 07 adds the `viewer_checks` reader and
-//! writer this module lacked (`follows_cache` still has none; story 08 adds
-//! it). Every function takes and returns plain types — the viewer DID as
+//! writer this module lacked. Story 08 gives `follows_cache` its own reader
+//! and writer too, `follows_get`/`follows_put` in the sibling
+//! `src/store/follows_cache.rs` module rather than here, since a
+//! `follows_cache` row keys on an account DID, not a viewer one, and holds
+//! no reference to any `viewers` row. Every function takes and returns
+//! plain types — the viewer DID as
 //! `&str`, the circle state as a `&str`/`String`, `d2_sample` as a
 //! JSON-backed `Vec<String>`, and follows/checked/follows_me as
 //! `HashSet<u64>` `DidHash` values — rather than `crate::graph` types, so
