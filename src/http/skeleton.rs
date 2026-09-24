@@ -419,10 +419,15 @@ fn build_personal<'a>(
     // SQLite, at most once a minute, off this same in-memory record.
     graph.record_touch(viewer, now);
 
-    if circle.state != CircleState::Ready {
-        // BC5: still building_d1 (story 06 ships no other non-ready state).
+    if circle.state == CircleState::BuildingD1 {
+        // BC5, BC8a: no step 1 circle yet, so there is nothing to filter
+        // against.
         return Ok(empty_response());
     }
+    // BC8: a `BuildingFm` circle is step 1's `follows` with an
+    // empty `follows_me` and step 1's `circle_version` — `list_for` filters
+    // and caps it exactly as it would a `Ready` circle, so this branch
+    // needs no special case beyond the `BuildingD1` one above.
 
     let list = state.viewer_lists.list_for(viewer, &circle, current);
     let items = current.items.as_slice();
@@ -1237,6 +1242,69 @@ mod tests {
             "still exactly the one job the retry re-queued, no second job added"
         );
         assert!(queue.try_pop().is_none(), "no second job");
+    }
+
+    // AC6, BC8: a circle in `building_fm` (step 1 done, step 2 not yet)
+    // serves the same list a `Ready` circle with the same `follows` would —
+    // filtered and capped against step 1's `follows` and `circle_version`,
+    // with an empty `follows_me` never adding or removing anything.
+    #[tokio::test]
+    async fn building_fm_serves_step1_list() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did = "did:plc:buildingfmvieweraaaaaaaa";
+        let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+        let viewer = crate::auth::ViewerDid(did.to_string());
+
+        let quoter = crate::graph::hash_did("did:plc:building-fm-quoter");
+        let graph = crate::graph::GraphHandle::new(10);
+        let mut circle = crate::graph::Circle::new();
+        circle.follows = [quoter].into_iter().collect();
+        graph.swap_circle(&viewer, circle, crate::graph::CircleState::BuildingFm);
+
+        let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph);
+        let connected_item = item_with_authors(
+            "at://q/fm-connected",
+            "cid-fm-connected",
+            quoter,
+            crate::graph::hash_did("did:plc:fm-original"),
+            1_700_000_000,
+            10.0,
+        );
+        let unconnected_item = item_with_authors(
+            "at://q/fm-unconnected",
+            "cid-fm-unconnected",
+            crate::graph::hash_did("did:plc:other-quoter"),
+            crate::graph::hash_did("did:plc:other-original"),
+            1_700_000_000,
+            20.0,
+        );
+        swap_items(&state, vec![unconnected_item, connected_item]);
+
+        let app = router(state);
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["feed"].as_array().unwrap().len(), 1);
+        assert_eq!(json["feed"][0]["post"], "at://q/fm-connected");
     }
 
     // BC6a: at `UPSTAGE_MAX_VIEWERS`, a new viewer's personalised request

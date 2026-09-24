@@ -1021,7 +1021,8 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
     // unconditionally (cheap, empty until a request or a worker save
     // touches it) so `AppState::viewer_lists` always has one to hand out,
     // whether or not the graph subsystem below ever starts.
-    let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+    let viewer_lists =
+        std::sync::Arc::new(crate::http::viewer::ViewerLists::new(cfg.follows_me_depth as usize));
     let mut graph_handle: Option<std::sync::Arc<crate::graph::GraphHandle>> = None;
     if cfg.personalise {
         let auth_cfg = crate::auth::AuthConfig { service_did: cfg.service_did.clone() };
@@ -2744,7 +2745,9 @@ mod tests {
         // and the caller gets no hook to wire into the resolver.
         let cfg = test_config();
         assert!(cfg.bsky_handle.is_none());
-        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new(
+            cfg.follows_me_depth as usize,
+        ));
         assert!(start_graph_subsystem(
             &cfg,
             viewer_lists,
@@ -2761,7 +2764,9 @@ mod tests {
         let path = temp_db_path("start-graph");
         let cfg = test_config_with_graph(&path);
 
-        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new(
+            cfg.follows_me_depth as usize,
+        ));
         let subsystem = start_graph_subsystem(
             &cfg,
             viewer_lists,
@@ -2790,7 +2795,9 @@ mod tests {
         }
         let cfg = test_config_with_graph(&path);
 
-        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new());
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new(
+            cfg.follows_me_depth as usize,
+        ));
         let subsystem = start_graph_subsystem(
             &cfg,
             viewer_lists,

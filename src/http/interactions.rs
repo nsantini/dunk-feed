@@ -211,7 +211,9 @@ mod tests {
             health: crate::health::HealthState::new(),
             cfg: crate::http::HttpConfig::from(&cfg),
             graph: None,
-            viewer_lists: std::sync::Arc::new(crate::http::viewer::ViewerLists::new()),
+            viewer_lists: std::sync::Arc::new(crate::http::viewer::ViewerLists::new(
+                cfg.follows_me_depth as usize,
+            )),
         });
         let app = router(state);
 
@@ -263,7 +265,9 @@ mod tests {
             health: crate::health::HealthState::new(),
             cfg: crate::http::HttpConfig::from(&cfg),
             graph: None,
-            viewer_lists: std::sync::Arc::new(crate::http::viewer::ViewerLists::new()),
+            viewer_lists: std::sync::Arc::new(crate::http::viewer::ViewerLists::new(
+                cfg.follows_me_depth as usize,
+            )),
         });
         let app = router(state);
 
