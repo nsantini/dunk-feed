@@ -24,6 +24,7 @@ pub mod pairs;
 pub mod schema;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod viewers;
 pub mod writer;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -476,6 +477,70 @@ impl Store {
         meta::meta_set(&conn, key, value)
     }
 
+    /// Every `viewers` row with its `viewer_follows` hashes, for
+    /// `graph::mod.rs`'s startup load (BC19). No production caller yet:
+    /// slice 2.0's restart load is the first.
+    #[allow(dead_code)] // First caller is `graph/mod.rs`'s startup load, slice 2.0.
+    pub fn viewer_load_all(&self) -> Result<Vec<viewers::ViewerRow>, StoreError> {
+        let conn = self.read_lock()?;
+        viewers::viewer_load_all(&conn)
+    }
+
+    /// Inserts or updates a `viewers` row's `state` (BC7a). No production
+    /// caller yet: the worker (`graph/queue.rs`, slice 2.0) is the first.
+    #[allow(dead_code)]
+    pub fn viewer_save_state(
+        &self,
+        viewer_did: &str,
+        state: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        viewers::viewer_save_state(&conn, viewer_did, state, now)
+    }
+
+    /// Saves a completed circle build: the `viewers` row and a full replace
+    /// of `viewer_follows`, in one transaction (BC7). No production caller
+    /// yet: the worker (`graph/queue.rs`, slice 2.0) is the first.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn viewer_save_circle(
+        &self,
+        viewer_did: &str,
+        state: &str,
+        now: i64,
+        d1_refreshed_at: i64,
+        d2_sample: &[String],
+        follows: &std::collections::HashSet<u64>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        viewers::viewer_save_circle(
+            &conn,
+            viewer_did,
+            state,
+            now,
+            d1_refreshed_at,
+            d2_sample,
+            follows,
+        )
+    }
+
+    /// Updates `last_request_at` only (BC23). No production caller yet: the
+    /// worker's touch flush (`graph/queue.rs`, slice 2.0) is the first.
+    #[allow(dead_code)]
+    pub fn viewer_touch(&self, viewer_did: &str, last_request_at: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        viewers::viewer_touch(&conn, viewer_did, last_request_at)
+    }
+
+    /// Deletes a viewer's `viewers`, `viewer_follows` and `viewer_checks`
+    /// rows. No caller until story 09's eviction.
+    #[allow(dead_code)]
+    pub fn viewer_delete(&self, viewer_did: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        viewers::viewer_delete(&conn, viewer_did)
+    }
+
     /// Starts the one writer thread with `WriterConfig::default()`
     /// (BC42). No production caller: `upstage run` always uses
     /// `writer_evicting` instead, so eviction is wired in from the start.
@@ -526,7 +591,10 @@ mod tests {
     #[test]
     fn open_memory_migrates_to_current_version() {
         let store = Store::open_memory().unwrap();
-        assert_eq!(schema::schema_version(&store.lock().unwrap()).unwrap(), Some(1));
+        assert_eq!(
+            schema::schema_version(&store.lock().unwrap()).unwrap(),
+            Some(schema::CURRENT_VERSION)
+        );
     }
 
     #[test]
