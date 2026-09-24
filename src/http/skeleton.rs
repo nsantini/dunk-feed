@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::header::CACHE_CONTROL;
-use axum::http::HeaderValue;
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL};
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
 use thiserror::Error;
@@ -290,23 +290,88 @@ fn build<'a>(
     Ok(SkeletonResponse { feed, cursor })
 }
 
-/// BC10: no auth required; a present service JWT (in the `Authorization`
-/// header) is never read here, so it is accepted without validation by
-/// omission.
+/// Reads a bearer token out of `Authorization` (network-feed story 05,
+/// BC2): `None` unless the header is present, its scheme matches `Bearer`
+/// case-insensitively (a client that sends `bearer` per HTTP's
+/// case-insensitive scheme convention must not be treated as sending no
+/// token at all), and the token half, trimmed of surrounding whitespace,
+/// is non-empty. The scheme and the token are split on the first ASCII
+/// whitespace character, not only a space (BC2), so a tab or another
+/// linear whitespace byte between them still counts.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
+    let split_at = raw.find(|c: char| c.is_ascii_whitespace())?;
+    let (scheme, token) = raw.split_at(split_at);
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token)
+}
+
+/// BC2, BC13: the page every unauthenticated or rejected request gets when
+/// the switch is `true` — 200, `{"feed":[]}`, no `cursor`. The lifetime
+/// parameter is unconstrained (`feed` is always empty), so `'static`
+/// stands in for it.
+fn empty_page() -> Response {
+    let body: SkeletonResponse<'static> = SkeletonResponse { feed: Vec::new(), cursor: None };
+    Json(body).into_response()
+}
+
+/// BC2, BC9, BC12, BC26: runs `auth::verify` when the switch is `true`.
+/// `Ok(())` once a viewer is verified (story 05's `## Non-goals`: the feed
+/// itself is never filtered on the resulting `ViewerDid`, so `build` below
+/// still runs exactly as it does when the switch is off). `Err(())` for
+/// every rejection — no `Authorization` header, the wrong scheme, an empty
+/// token (BC2), or any `AuthError` `verify` returns (BC26, logged at
+/// `debug` with only the variant name, never the DID or the token, per
+/// `auth`'s own BC21).
+fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
+    let auth = state.cfg.auth.as_ref().ok_or(())?;
+    let token = bearer_token(headers).ok_or(())?;
+    let now = crate::store::unix_now();
+    match crate::auth::verify(token, now, &auth.cache, &auth.cfg, &auth.resolver_tx) {
+        Ok(_viewer) => Ok(()),
+        Err(err) => {
+            tracing::debug!(error = ?err, "auth: request rejected");
+            Err(())
+        }
+    }
+}
+
+/// BC1: switch off, no `Authorization` read, output byte-identical to
+/// story 01. BC2, BC12, BC13, BC13a, BC26: switch on, `authenticate` runs
+/// before `build`, so an unauthenticated or rejected request never reaches
+/// request validation and always gets the empty page; a verified request
+/// still runs `build` exactly as the switch-off path does, so a bad
+/// `feed`, `limit` or `cursor` still gets its usual 400 body. Either way,
+/// `Cache-Control` is set once at the end, on every response: `public,
+/// max-age=30` off, `private, no-store` on (BC11, BC13, BC13a, BC33).
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Response {
-    // BC50, AC5: both generations are read exactly once per request, under
-    // a single read lock, kept alive here for as long as `build`'s
-    // borrowed response needs them.
-    let (current, previous) = state.snapshot.generations();
-    let mut response = match build(&state, &current, &previous, &params) {
-        Ok(body) => Json(body).into_response(),
-        Err(err) => err.into_response(),
+    let personalise = state.cfg.personalise;
+
+    let mut response = if personalise && authenticate(&state, &headers).is_err() {
+        empty_page()
+    } else {
+        // BC50, AC5: both generations are read exactly once per request,
+        // under a single read lock, kept alive here for as long as
+        // `build`'s borrowed response needs them.
+        let (current, previous) = state.snapshot.generations();
+        match build(&state, &current, &previous, &params) {
+            Ok(body) => Json(body).into_response(),
+            Err(err) => err.into_response(),
+        }
     };
-    // BC11, BC33: set on every response, success or 400 alike.
-    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("public, max-age=30"));
+
+    let cache_control = if personalise { "private, no-store" } else { "public, max-age=30" };
+    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
     response
 }
 
@@ -508,6 +573,186 @@ mod tests {
     fn swap_items(state: &Arc<AppState>, items: Vec<FeedItem>) {
         let global = ids(&items);
         state.snapshot.swap(Arc::new(items), Arc::new(global));
+    }
+
+    /// Config with `UPSTAGE_PERSONALISE=true`, network-feed story 05's
+    /// slice 3.0 tests. `service_did` still falls back to its
+    /// `did:web:feed.example.com` default (BC23); tests read it off the
+    /// returned `Config` rather than hard-coding it a second time.
+    fn test_config_personalised(http_addr: &str) -> crate::config::Config {
+        let mut pairs: HashMap<String, String> = HashMap::new();
+        pairs.insert("UPSTAGE_HOSTNAME".to_string(), "feed.example.com".to_string());
+        pairs.insert("UPSTAGE_PUBLISHER_DID".to_string(), "did:plc:abc".to_string());
+        pairs.insert("UPSTAGE_HTTP_ADDR".to_string(), http_addr.to_string());
+        pairs.insert("UPSTAGE_PERSONALISE".to_string(), "true".to_string());
+        crate::config::load(move |name| pairs.get(name).cloned())
+            .expect("test config must be valid")
+    }
+
+    // BC1, AC9: switch off — `Authorization` is never read (a garbage
+    // value is still accepted), and the header is always the story 01
+    // `public, max-age=30`, never `private, no-store`.
+    #[tokio::test]
+    async fn switch_off_unchanged() {
+        let items = vec![item("at://q/1", "cid1", 3.0, 4.5)];
+        let state = state_with_items(items);
+        let app = router(state);
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", "Bearer not-even-read")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "public, max-age=30");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["feed"][0]["post"], "at://q/1");
+    }
+
+    #[test]
+    fn bearer_token_case_insensitive_scheme() {
+        // Review round 1, defect G.
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let mut headers = HeaderMap::new();
+            headers
+                .insert(AUTHORIZATION, HeaderValue::from_str(&format!("{scheme} abc123")).unwrap());
+            assert_eq!(bearer_token(&headers), Some("abc123"));
+        }
+    }
+
+    #[test]
+    fn bearer_token_trims_surrounding_whitespace() {
+        // Review round 1, defect G.
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str("  Bearer   abc123  ").unwrap());
+        assert_eq!(bearer_token(&headers), Some("abc123"));
+    }
+
+    #[test]
+    fn bearer_token_empty_after_trim_is_none() {
+        // Review round 1, defect G: an empty token after trimming is no
+        // token, not an empty-string token.
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str("Bearer    ").unwrap());
+        assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn bearer_token_splits_on_a_tab() {
+        // BC2: the scheme and the token split on any ASCII whitespace, not
+        // only a space.
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str("Bearer\tabc123").unwrap());
+        assert_eq!(bearer_token(&headers), Some("abc123"));
+    }
+
+    // AC7, BC9: a token whose DID the cache has never held returns the
+    // empty page at once, and enqueues exactly one `Miss` — no network
+    // call is possible on this path, since `auth::verify` only ever does a
+    // `try_send`.
+    #[tokio::test]
+    async fn unknown_key_empty_page() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::new(crate::auth::KeyCache::new(10)),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let state = crate::http::tests::test_state_with_auth(cfg.clone(), auth);
+        let app = router(state);
+
+        let now = crate::store::unix_now();
+        let did = "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz";
+        // Seeded into a throwaway cache, never the one `state` reads: the
+        // token is structurally valid and signs correctly, but its DID is
+        // unknown to the cache the handler actually consults.
+        let token = crate::auth::seed_and_sign_for_test(
+            &crate::auth::KeyCache::new(1),
+            did,
+            &cfg.service_did,
+            now,
+        );
+
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "private, no-store");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["feed"].as_array().unwrap().len(), 0);
+        assert!(json.get("cursor").is_none());
+        assert_eq!(
+            rx.try_recv(),
+            Ok(crate::auth::ResolveRequest::Miss(did.to_string())),
+            "a cache miss must enqueue a Miss for the resolver"
+        );
+    }
+
+    // AC8: with the switch true, every response sends `private, no-store`
+    // — a verified success, serving the real feed, and a rejected request,
+    // serving the empty page, alike.
+    #[tokio::test]
+    async fn personalised_headers() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+
+        let state = crate::http::tests::test_state_with_auth(cfg.clone(), auth);
+        swap_items(&state, vec![item("at://q/1", "cid1", 3.0, 4.5)]);
+        let app = router(state);
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+
+        // Verified: success, private, no-store, the real feed (BC12).
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "private, no-store");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["feed"][0]["post"], "at://q/1");
+
+        // Rejected: no `Authorization` at all, still private, no-store,
+        // empty (BC13).
+        let response2 =
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response2.status(), StatusCode::OK);
+        assert_eq!(response2.headers().get(CACHE_CONTROL).unwrap(), "private, no-store");
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
+        let json2: Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(json2["feed"].as_array().unwrap().len(), 0);
     }
 
     // BC7, BC32: page_start behaviour, unit-tested directly.

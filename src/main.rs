@@ -3,6 +3,7 @@
 //! `anyhow`; every other module returns its own `thiserror` type.
 
 mod appview;
+mod auth;
 mod cli;
 mod config;
 mod csv;
