@@ -111,6 +111,24 @@ pub struct Config {
     /// for each degree-2 account (`UPSTAGE_D2_FOLLOWS_DEPTH`, story 03
     /// spec.md BC4).
     pub d2_follows_depth: u32,
+    /// `UPSTAGE_PERSONALISE` (network-feed story 05, BC22): `false` by
+    /// default (story 05's `## Non-goals`; story 11 flips the default).
+    /// `getFeedSkeleton` (`src/http/skeleton.rs`) reads `Authorization` and
+    /// calls `auth::verify` only when this is `true`; `run`
+    /// (`src/ingest/mod.rs`) builds the DID key cache and starts the
+    /// resolver task only then too.
+    pub personalise: bool,
+    /// `UPSTAGE_SERVICE_DID` (story 05, BC23): the `aud` a viewer's service
+    /// JWT must name (`AuthConfig::service_did`, `src/auth/mod.rs`).
+    /// Defaults to `did:web:<UPSTAGE_HOSTNAME>`, `Config::did_web`'s own
+    /// format.
+    pub service_did: String,
+    /// `UPSTAGE_PLC_URL` (story 05, BC24): the base URL
+    /// `auth::did::resolve_url` fetches a `did:plc` document from.
+    pub plc_url: String,
+    /// `UPSTAGE_MAX_VIEWERS` (story 05, BC25): `auth::KeyCache`'s cap is
+    /// `2 * max_viewers` (`run`, `src/ingest/mod.rs`).
+    pub max_viewers: u32,
 }
 
 impl Config {
@@ -424,14 +442,112 @@ fn drop_labels(
         .collect())
 }
 
+/// Parses `UPSTAGE_PERSONALISE` (BC22): after trim, exactly `true` or
+/// `false`, case-sensitive. Unset or empty (after trim) is `default`
+/// (`false`); anything else is `Invalid`.
+fn personalise_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match lookup(name) {
+        None => Ok(default),
+        Some(value) if value.trim().is_empty() => Ok(default),
+        Some(value) => match value.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(ConfigError::Invalid {
+                name,
+                value: value.clone(),
+                reason: "must be true or false".to_string(),
+            }),
+        },
+    }
+}
+
+/// `UPSTAGE_SERVICE_DID` (BC23): unset or empty (after trim) falls back to
+/// `did:web:<hostname>`, `Config::did_web`'s own format. Computed here from
+/// `hostname` directly, since `Config` is not built yet at this point in
+/// `load`.
+fn service_did_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    hostname: &str,
+) -> String {
+    match lookup(name) {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => format!("did:web:{hostname}"),
+    }
+}
+
+/// `UPSTAGE_PLC_URL` (BC24): unset or empty (after trim) falls back to
+/// `default`. Otherwise must start with `https://`, and the stored value
+/// has its trailing `/` removed. Simpler than [`pds_url_or_default`]: this
+/// value is only ever compared against or prepended to a bare `<did>` path
+/// (`auth::did::resolve_url`, BC17), never parsed as a full request URL, so
+/// none of `pds_url_or_default`'s host, userinfo, query, fragment or path
+/// rules apply here.
+fn plc_url_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: &str,
+) -> Result<String, ConfigError> {
+    let raw = match lookup(name) {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => return Ok(default.to_string()),
+    };
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("https://") {
+        return Err(ConfigError::Invalid {
+            name,
+            value: raw.clone(),
+            reason: "must be an https URL".to_string(),
+        });
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+/// `UPSTAGE_MAX_VIEWERS` (BC25): unset or empty (after trim) falls back to
+/// `default` (1000). Zero, or a value that does not parse as a `u32`, is
+/// `Invalid`.
+fn max_viewers_or_default(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    let raw = match lookup(name) {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => return Ok(default),
+    };
+    let parsed: u32 = raw.trim().parse().map_err(|err: std::num::ParseIntError| {
+        ConfigError::Invalid { name, value: raw.clone(), reason: err.to_string() }
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::Invalid {
+            name,
+            value: raw.clone(),
+            reason: "must be greater than zero".to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
 /// Loads the config from `lookup`, a variable-name-to-value function. Tests
 /// inject a closure over a fixed map; `main.rs` passes `std::env::var` turned
 /// into an `Option`, so no test touches the process environment.
 pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigError> {
+    // Read once, ahead of the struct literal: BC23's default reads
+    // `hostname` directly, before `Config::did_web` exists to call.
+    let hostname = required(&lookup, "UPSTAGE_HOSTNAME")?;
+    let personalise = personalise_or_default(&lookup, "UPSTAGE_PERSONALISE", false)?;
+    let service_did = service_did_or_default(&lookup, "UPSTAGE_SERVICE_DID", &hostname);
+    let plc_url = plc_url_or_default(&lookup, "UPSTAGE_PLC_URL", "https://plc.directory")?;
+    let max_viewers = max_viewers_or_default(&lookup, "UPSTAGE_MAX_VIEWERS", 1000)?;
+
     Ok(Config {
         db_path: string_or_default(&lookup, "UPSTAGE_DB_PATH", "/data/upstage.db"),
         http_addr: string_or_default(&lookup, "UPSTAGE_HTTP_ADDR", "0.0.0.0:3000"),
-        hostname: required(&lookup, "UPSTAGE_HOSTNAME")?,
+        hostname,
         publisher_did: required(&lookup, "UPSTAGE_PUBLISHER_DID")?,
         feed_rkey: string_or_default(&lookup, "UPSTAGE_FEED_RKEY", "upstaged"),
         jetstream_urls: jetstream_urls(
@@ -477,6 +593,10 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         follows_me_depth: positive_u32_or_default(&lookup, "UPSTAGE_FOLLOWS_ME_DEPTH", 1000)?,
         d2_follows_sample: positive_u32_or_default(&lookup, "UPSTAGE_D2_FOLLOWS_SAMPLE", 100)?,
         d2_follows_depth: positive_u32_or_default(&lookup, "UPSTAGE_D2_FOLLOWS_DEPTH", 100)?,
+        personalise,
+        service_did,
+        plc_url,
+        max_viewers,
     })
 }
 
@@ -1296,6 +1416,73 @@ mod tests {
                 other => panic!("expected Invalid for {bad}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn personalise() {
+        // BC22 to BC25: defaults.
+        let config = load(env(&required_pair())).unwrap();
+        assert!(!config.personalise);
+        assert_eq!(config.service_did, "did:web:feed.example.com");
+        assert_eq!(config.plc_url, "https://plc.directory");
+        assert_eq!(config.max_viewers, 1000);
+
+        // BC22: exactly "true" or "false" after trim.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PERSONALISE", "true"));
+        assert!(load(env(&pairs)).unwrap().personalise);
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PERSONALISE", "false"));
+        assert!(!load(env(&pairs)).unwrap().personalise);
+
+        // Whitespace-only is unset, not Invalid.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PERSONALISE", "  "));
+        assert!(!load(env(&pairs)).unwrap().personalise);
+
+        for bad in ["True", "FALSE", "yes", "1"] {
+            let mut pairs = required_pair().to_vec();
+            pairs.push(("UPSTAGE_PERSONALISE", bad));
+            let err = load(env(&pairs)).unwrap_err();
+            match err {
+                ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_PERSONALISE"),
+                other => panic!("expected Invalid for {bad}, got {other:?}"),
+            }
+        }
+
+        // BC23: an explicit value overrides the did:web default.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_SERVICE_DID", "did:web:override.example"));
+        assert_eq!(load(env(&pairs)).unwrap().service_did, "did:web:override.example");
+
+        // BC24: must be https://, and a trailing slash is removed.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PLC_URL", "http://plc.example"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_PLC_URL"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PLC_URL", "https://plc.example/"));
+        assert_eq!(load(env(&pairs)).unwrap().plc_url, "https://plc.example");
+
+        // BC25: zero and non-numeric are Invalid; a custom value is read.
+        for bad in ["0", "soon"] {
+            let mut pairs = required_pair().to_vec();
+            pairs.push(("UPSTAGE_MAX_VIEWERS", bad));
+            let err = load(env(&pairs)).unwrap_err();
+            match err {
+                ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_MAX_VIEWERS"),
+                other => panic!("expected Invalid for {bad}, got {other:?}"),
+            }
+        }
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_MAX_VIEWERS", "500"));
+        assert_eq!(load(env(&pairs)).unwrap().max_viewers, 500);
     }
 
     #[test]

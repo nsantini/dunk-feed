@@ -25,6 +25,7 @@ A test run over zero tests is red.
 
 - One crate, one binary. Modules live under `src/`. No workspace until a second binary exists.
 - The ingest path talks to Jetstream only. It never calls the App View or any other HTTP API. Only `appview/` talks to the App View, and its callers are the scorer (`verify`, `guards`), `validate`, `publish`, `graph/` and `graph_probe`.
+- `auth/` is the only module that calls the DID resolvers (`UPSTAGE_PLC_URL`, `did:web` hosts).
 - Every constant from the PRD's score table lives in `src/config.rs` and is loaded from environment variables with the PRD default.
 - SQLite is the only store. Access it through `src/store/`. No raw SQL outside that module.
 - Local counters are an index, not the truth. A pair is promoted only on App View counts.

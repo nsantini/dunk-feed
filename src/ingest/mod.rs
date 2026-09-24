@@ -918,11 +918,25 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
     // own (each is moved into its own `tokio::spawn`), and `shutdown_rx`
     // itself is already moved into the ingest task above.
     let http_shutdown_rx = shutdown_tx.subscribe();
+    // network-feed story 05, BC1: the DID key cache and the resolver task
+    // are built only when the switch is on; `AppState`'s `HttpConfig`
+    // carries `None` otherwise, and `skeleton::handler` never reads
+    // `Authorization` in that case either.
+    let mut http_config = crate::http::HttpConfig::from(cfg);
+    if cfg.personalise {
+        let (resolver_tx, cache) =
+            crate::auth::spawn_resolver(cfg.plc_url.clone(), cfg.max_viewers as usize * 2);
+        http_config.auth = Some(crate::http::AuthHandle {
+            cache,
+            resolver_tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        });
+    }
     let http_state = std::sync::Arc::new(crate::http::AppState {
         snapshot,
         writer: writer.clone(),
         health: liveness,
-        cfg: crate::http::HttpConfig::from(cfg),
+        cfg: http_config,
     });
     let http_handle: tokio::task::JoinHandle<Result<(), IngestError>> = tokio::spawn(async move {
         crate::http::serve(&http_cfg, http_state, http_shutdown_rx).await.map_err(IngestError::Http)

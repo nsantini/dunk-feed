@@ -10,10 +10,16 @@
 //! `auth/` is the only module that calls the DID resolvers
 //! (`UPSTAGE_PLC_URL`, `did:web` hosts) — see `AGENTS.md`.
 //!
-//! First callers are `src/ingest/mod.rs` (which builds the `KeyCache` and
-//! starts the resolver task) and `src/http/skeleton.rs` (which calls
-//! `verify`), both slice 3.0. Slice 2.0 adds the resolver task itself in
-//! `did.rs`. Until then nothing in the binary calls into this module.
+//! `run` (`src/ingest/mod.rs`) calls [`spawn_resolver`] to build the
+//! `KeyCache` and start the resolver task, only when the switch is `true`
+//! (slice 3.0); `src/http/skeleton.rs` calls `verify` on every request once
+//! it is.
+//!
+//! `FetchError::Http`'s status code (`did.rs`) is read only through its
+//! derived `Debug` impl (BC20's warning line), which rustc's dead-code
+//! analysis does not count as a read; the module keeps `allow(dead_code)`
+//! for that one field rather than dropping information a real incident
+//! would want.
 #![allow(dead_code)]
 
 mod did;
@@ -71,6 +77,73 @@ pub enum AuthError {
     KeyUnknown,
     #[error("signature did not verify")]
     Signature,
+}
+
+/// The resolver task's bounded channel capacity (spec `## Approach`,
+/// `## Defaults taken`): generous enough that a burst of cache misses
+/// never blocks a request on `try_send`; a full channel just drops the
+/// send, since the next request for the same DID enqueues it again (BC9).
+const RESOLVER_CHANNEL_CAPACITY: usize = 1024;
+
+/// Builds the DID key cache and starts the resolver task draining it,
+/// spawned on its own (unsupervised) task: `run` (`src/ingest/mod.rs`)
+/// calls this only when `UPSTAGE_PERSONALISE` is `true` (BC1), and never
+/// again for the life of the process. `max_entries` is `2 *
+/// UPSTAGE_MAX_VIEWERS` (BC16), computed by the caller. The returned
+/// `Sender` and `KeyCache` go into `http::AuthHandle`.
+pub fn spawn_resolver(
+    plc_url: String,
+    max_entries: usize,
+) -> (mpsc::Sender<ResolveRequest>, std::sync::Arc<KeyCache>) {
+    let cache = std::sync::Arc::new(KeyCache::new(max_entries));
+    let (tx, rx) = mpsc::channel(RESOLVER_CHANNEL_CAPACITY);
+    let fetcher = did::HttpDidFetcher::new(plc_url);
+    let resolver_cache = std::sync::Arc::clone(&cache);
+    tokio::spawn(did::run_resolver(rx, fetcher, resolver_cache));
+    (tx, cache)
+}
+
+/// Test-only seam for `http::skeleton::tests::personalised_headers` (AC8,
+/// spec `## Answers from the engineer`, step 7): generates a fixed k256
+/// key, seeds `cache` with it for `did` (through `did::insert_for_test`,
+/// since [`KeyCache::insert`] is `pub(super)`), and returns a token for
+/// `did` signed by the matching private key, valid against `service_did`
+/// at `now`. Kept in `auth/`, not duplicated in `http/`, so the JWT and
+/// multibase encoding this needs stay in one place.
+#[cfg(test)]
+pub(crate) fn seed_and_sign_for_test(
+    cache: &KeyCache,
+    did_value: &str,
+    service_did: &str,
+    now: i64,
+) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use k256::ecdsa::signature::Signer as _;
+
+    const SCALAR: [u8; 32] = [
+        0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f,
+        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e,
+        0x6f, 0x70,
+    ];
+    let signing_key = k256::ecdsa::SigningKey::from_slice(&SCALAR)
+        .expect("fixed test scalar is a valid k256 key");
+    let point = signing_key.verifying_key().to_sec1_point(true);
+    let mut key_bytes = vec![0xE7, 0x01];
+    key_bytes.extend_from_slice(point.as_bytes());
+    let multibase = format!("z{}", bs58::encode(key_bytes).into_string());
+    let key = keys::decode_multibase(&multibase).expect("test key must decode");
+    did::insert_for_test(cache, did_value.to_string(), key, now);
+
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"ES256K"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(format!(
+        r#"{{"iss":"{did_value}","aud":"{service_did}","exp":{},"lxm":"app.bsky.feed.getFeedSkeleton"}}"#,
+        now + 60
+    ));
+    let signing_input = format!("{header}.{payload}");
+    let signature: k256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    format!("{signing_input}.{sig_b64}")
 }
 
 /// Runs design §5's checks 1 to 7 in order (BC3 to BC12). `now` is the

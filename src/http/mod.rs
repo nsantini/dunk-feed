@@ -49,12 +49,27 @@ pub struct HttpConfig {
     pub feed_uri: String,
     pub did_web: String,
     pub health_max_lag_s: u32,
+    /// `UPSTAGE_PERSONALISE` (network-feed story 05, BC1, BC2, BC12,
+    /// BC13): `skeleton::handler` reads `Authorization` and calls
+    /// `auth::verify` only when this is `true`.
+    pub personalise: bool,
+    /// The DID key cache, resolver sender and `AuthConfig` `auth::verify`
+    /// needs, present only when `personalise` is `true`. `HttpConfig::from`
+    /// always sets this to `None`; `run` (`src/ingest/mod.rs`) attaches the
+    /// real handle afterwards, only when `cfg.personalise` is `true`, so
+    /// that construction never runs a DID resolver task the switch is off
+    /// for. Kept on `HttpConfig` rather than as a fifth field directly on
+    /// `AppState`: every existing `AppState` construction outside this
+    /// slice's files (`src/http/interactions.rs`'s two hand-built states)
+    /// calls `HttpConfig::from`, so adding a field here, defaulted inside
+    /// that one constructor, never touches those call sites.
+    pub auth: Option<AuthHandle>,
 }
 
 impl HttpConfig {
     /// The one constructor: reads `cfg` once at startup. `run`
     /// (`src/ingest/mod.rs`) calls this to build the `AppState` the HTTP
-    /// task serves from.
+    /// task serves from, then attaches `auth` itself when the switch is on.
     pub fn from(cfg: &Config) -> Self {
         HttpConfig {
             hostname: cfg.hostname.clone(),
@@ -63,7 +78,31 @@ impl HttpConfig {
             feed_uri: cfg.feed_uri(),
             did_web: cfg.did_web(),
             health_max_lag_s: cfg.health_max_lag_s,
+            personalise: cfg.personalise,
+            auth: None,
         }
+    }
+}
+
+/// Everything `skeleton::handler` needs to call `auth::verify` when the
+/// switch is `true`: the DID key cache, the resolver task's channel
+/// sender, and the config `verify` reads (`crate::auth::AuthConfig`).
+/// `run` (`src/ingest/mod.rs`) builds one and attaches it to
+/// `HttpConfig::auth` only when `UPSTAGE_PERSONALISE` is `true`.
+#[derive(Clone)]
+pub struct AuthHandle {
+    pub cache: std::sync::Arc<crate::auth::KeyCache>,
+    pub resolver_tx: tokio::sync::mpsc::Sender<crate::auth::ResolveRequest>,
+    pub cfg: crate::auth::AuthConfig,
+}
+
+/// A manual, content-free `Debug`: `KeyCache` and the `mpsc::Sender` carry
+/// no data worth printing (and the cache's keys are exactly the sort of
+/// thing `auth`'s own BC21 keeps out of a log line), so this never widens
+/// what a `tracing::info!(?state)`-style line could leak.
+impl std::fmt::Debug for AuthHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthHandle").finish_non_exhaustive()
     }
 }
 
@@ -197,6 +236,25 @@ mod tests {
             writer,
             health: HealthState::new(),
             cfg: HttpConfig::from(&cfg),
+        })
+    }
+
+    /// Like [`test_state`], but with `auth` attached to `cfg`'s
+    /// `HttpConfig` (`skeleton::tests::unknown_key_empty_page` and
+    /// `personalised_headers`, AC7, AC8): `cfg.personalise` must already be
+    /// `true` for `auth` to matter, matching how `run`
+    /// (`src/ingest/mod.rs`) only ever attaches one under the same
+    /// condition.
+    pub(crate) fn test_state_with_auth(cfg: Config, auth: AuthHandle) -> Arc<AppState> {
+        let store = crate::store::Store::open_memory().expect("in-memory store must open");
+        let writer = store.writer().expect("writer thread must start");
+        let mut http_cfg = HttpConfig::from(&cfg);
+        http_cfg.auth = Some(auth);
+        Arc::new(AppState {
+            snapshot: SnapshotHandle::new(),
+            writer,
+            health: HealthState::new(),
+            cfg: http_cfg,
         })
     }
 

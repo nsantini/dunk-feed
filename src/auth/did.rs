@@ -119,6 +119,17 @@ impl KeyCache {
     }
 }
 
+/// Test-only seam for `auth::seed_and_sign_for_test` (`mod.rs`), which
+/// `http::skeleton::tests::personalised_headers` calls (AC8, spec
+/// `## Answers from the engineer`, step 7): [`KeyCache::insert`] above is
+/// `pub(super)`, reachable only inside `auth/`, so a cross-module test
+/// outside it seeds a cache through this `pub(crate)` wrapper instead of
+/// widening `insert` itself.
+#[cfg(test)]
+pub(crate) fn insert_for_test(cache: &KeyCache, did: String, key: PublicKey, now: i64) {
+    cache.insert(did, key, now);
+}
+
 /// Why a DID document fetch produced nothing usable (BC20). Carries only
 /// the kind of failure, never the DID or the body, so the one warning
 /// `run_resolver` logs on this can never carry a DID or a token (BC21).
