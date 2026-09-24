@@ -1,12 +1,13 @@
-//! `viewers` and `viewer_follows` table access, TECH-DESIGN-network-feed
-//! §8. Story 06's Non-goals leave `viewer_checks` and `follows_cache`
-//! without a reader or writer here; stories 07 and 08 add them. Every
-//! function takes and returns plain types — the viewer DID as `&str`, the
-//! circle state as a `&str`/`String`, `d2_sample` as a JSON-backed
-//! `Vec<String>`, and follows as `HashSet<u64>` `DidHash` values — rather
-//! than `crate::graph` types, so this module has no dependency on
-//! `graph::Circle` or `graph::CircleState` (slice 2.0's concern) and
-//! `graph::mod.rs` maps this module's rows onto its own types instead.
+//! `viewers`, `viewer_follows` and `viewer_checks` table access,
+//! TECH-DESIGN-network-feed §8. Story 07 adds the `viewer_checks` reader and
+//! writer this module lacked (`follows_cache` still has none; story 08 adds
+//! it). Every function takes and returns plain types — the viewer DID as
+//! `&str`, the circle state as a `&str`/`String`, `d2_sample` as a
+//! JSON-backed `Vec<String>`, and follows/checked/follows_me as
+//! `HashSet<u64>` `DidHash` values — rather than `crate::graph` types, so
+//! this module has no dependency on `graph::Circle` or `graph::CircleState`
+//! (slice 2.0's concern) and `graph::mod.rs` maps this module's rows onto
+//! its own types instead.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,10 +15,11 @@ use rusqlite::Connection;
 
 use crate::store::StoreError;
 
-/// One `viewers` row, joined with its `viewer_follows` hashes. `follows` is
-/// loaded as a `HashSet<u64>`: the same shape `graph::Circle::follows`
-/// holds, so `graph::mod.rs`'s restart load (slice 2.0) has no set to build
-/// itself.
+/// One `viewers` row, joined with its `viewer_follows` and `viewer_checks`
+/// hashes. `follows`, `checked` and `follows_me` are loaded as
+/// `HashSet<u64>`: the same shape `graph::Circle` holds each of these in, so
+/// `graph::mod.rs`'s restart load (slice 2.0, BC9) has no set to build
+/// itself. `follows_me` is always a subset of `checked` (BC10).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewerRow {
     pub viewer_did: String,
@@ -27,6 +29,8 @@ pub struct ViewerRow {
     pub state: String,
     pub d2_sample: Vec<String>,
     pub follows: HashSet<u64>,
+    pub checked: HashSet<u64>,
+    pub follows_me: HashSet<u64>,
 }
 
 /// Reinterprets a `DidHash` (`u64`) as SQLite's signed 64-bit `INTEGER`
@@ -59,11 +63,11 @@ fn parse_d2_sample(text: &str) -> Result<Vec<String>, StoreError> {
         .map_err(|_| StoreError::MalformedRow { table: "viewers", column: "d2_sample" })
 }
 
-/// Loads every `viewers` row with its `viewer_follows` hashes, for
-/// `graph::mod.rs`'s startup load (BC19, `restart_loads_circles`). Two
-/// queries rather than a join, so a viewer with zero follows still gets a
-/// row with an empty `follows` set instead of being silently dropped by an
-/// inner join.
+/// Loads every `viewers` row with its `viewer_follows` and `viewer_checks`
+/// hashes, for `graph::mod.rs`'s startup load (BC19, `restart_loads_circles`;
+/// BC9, `restart_loads_checks`). Three queries rather than a join, so a
+/// viewer with zero follows or zero checks still gets a row with empty sets
+/// instead of being silently dropped by an inner join.
 ///
 /// A row whose `d2_sample` fails to parse is skipped rather than failing the
 /// whole load (review round 1, defect Y): this binary is the only writer, so
@@ -80,6 +84,26 @@ pub fn viewer_load_all(conn: &Connection) -> Result<Vec<ViewerRow>, StoreError> 
             let viewer_did: String = row.get(0)?;
             let subject_hash: i64 = row.get(1)?;
             follows_by_viewer.entry(viewer_did).or_default().insert(i64_as_hash(subject_hash));
+        }
+    }
+
+    // `checked` holds every hash the viewer has an entry for; `follows_me`
+    // holds the subset whose `follows_me` flag is set (BC10).
+    let mut checked_by_viewer: HashMap<String, HashSet<u64>> = HashMap::new();
+    let mut follows_me_by_viewer: HashMap<String, HashSet<u64>> = HashMap::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT viewer_did, author_hash, follows_me FROM viewer_checks")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let viewer_did: String = row.get(0)?;
+            let author_hash: i64 = row.get(1)?;
+            let follows_me: i64 = row.get(2)?;
+            let hash = i64_as_hash(author_hash);
+            checked_by_viewer.entry(viewer_did.clone()).or_default().insert(hash);
+            if follows_me != 0 {
+                follows_me_by_viewer.entry(viewer_did).or_default().insert(hash);
+            }
         }
     }
 
@@ -108,6 +132,8 @@ pub fn viewer_load_all(conn: &Connection) -> Result<Vec<ViewerRow>, StoreError> 
             }
         };
         let follows = follows_by_viewer.remove(&viewer_did).unwrap_or_default();
+        let checked = checked_by_viewer.remove(&viewer_did).unwrap_or_default();
+        let follows_me = follows_me_by_viewer.remove(&viewer_did).unwrap_or_default();
         out.push(ViewerRow {
             viewer_did,
             first_seen_at,
@@ -116,6 +142,8 @@ pub fn viewer_load_all(conn: &Connection) -> Result<Vec<ViewerRow>, StoreError> 
             state,
             d2_sample,
             follows,
+            checked,
+            follows_me,
         });
     }
     Ok(out)
@@ -175,6 +203,46 @@ pub fn viewer_save_circle(
         )?;
         for hash in follows {
             stmt.execute(rusqlite::params![viewer_did, hash_as_i64(*hash)])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Saves step 2's result in one transaction (BC3, BC3a): the `viewers` row's
+/// `state`, plus a full replace of `viewer_checks` for `viewer_did` — one row
+/// per hash in `checked`, with `follows_me` set to 1 for a hash also in
+/// `follows_me` and 0 otherwise (BC10). Only `UPDATE`s the `viewers` row
+/// rather than upserting it, unlike `viewer_save_circle`: step 2 always runs
+/// after step 1 has already inserted the row (`viewer_save_state` or
+/// `viewer_save_circle`), so there is never a `viewer_did` this call needs to
+/// create. A `viewer_did` with no `viewers` row updates zero rows and still
+/// writes its `viewer_checks` rows — not an error, the same no-op-on-missing
+/// rule `viewer_touch` follows, since the flush can race a concurrent
+/// eviction (BC10a covers the row then being deleted afterwards).
+#[allow(dead_code)] // First caller is the worker (`graph/queue.rs`, slice 2.0).
+pub fn viewer_save_checks(
+    conn: &Connection,
+    viewer_did: &str,
+    state: &str,
+    now: i64,
+    checked: &HashSet<u64>,
+    follows_me: &HashSet<u64>,
+) -> Result<(), StoreError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE viewers SET state = ?2 WHERE viewer_did = ?1",
+        rusqlite::params![viewer_did, state],
+    )?;
+    tx.execute("DELETE FROM viewer_checks WHERE viewer_did = ?1", [viewer_did])?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO viewer_checks (viewer_did, author_hash, follows_me, checked_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for hash in checked {
+            let follows_me_flag = i64::from(follows_me.contains(hash));
+            stmt.execute(rusqlite::params![viewer_did, hash_as_i64(*hash), follows_me_flag, now])?;
         }
     }
     tx.commit()?;
@@ -341,6 +409,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(follows_left, 0);
+    }
+
+    // BC10a: `viewer_delete` removes `viewer_checks` rows too, the same as
+    // `viewer_follows`.
+    #[test]
+    fn viewer_delete_removes_viewer_checks_rows() {
+        let conn = migrated_conn();
+        viewer_save_circle(&conn, "did:plc:a", "building_fm", 1, 1, &[], &HashSet::new()).unwrap();
+        let checked: HashSet<u64> = [10_u64, 20].into_iter().collect();
+        let follows_me: HashSet<u64> = [10_u64].into_iter().collect();
+        viewer_save_checks(&conn, "did:plc:a", "ready", 2, &checked, &follows_me).unwrap();
+
+        viewer_delete(&conn, "did:plc:a").unwrap();
+
+        let checks_left: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM viewer_checks WHERE viewer_did = 'did:plc:a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checks_left, 0);
+    }
+
+    // AC5: `viewer_save_checks` writes `state`, `checked` and `follows_me` in
+    // one call, and `viewer_load_all` reads all three back — `follows_me` as
+    // the subset of `checked` whose flag was set (BC10).
+    #[test]
+    fn checks_round_trip() {
+        let conn = migrated_conn();
+        viewer_save_circle(&conn, "did:plc:a", "building_fm", 1, 1, &[], &HashSet::new()).unwrap();
+        let checked: HashSet<u64> = [10_u64, 20, 30].into_iter().collect();
+        let follows_me: HashSet<u64> = [10_u64, 20].into_iter().collect();
+
+        viewer_save_checks(&conn, "did:plc:a", "ready", 1_700_000_200, &checked, &follows_me)
+            .unwrap();
+
+        let rows = viewer_load_all(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "ready");
+        assert_eq!(rows[0].checked, checked);
+        assert_eq!(rows[0].follows_me, follows_me);
+    }
+
+    // BC10: a second `viewer_save_checks` call fully replaces the prior
+    // `viewer_checks` rows rather than merging with them.
+    #[test]
+    fn checks_round_trip_replaces_a_prior_save() {
+        let conn = migrated_conn();
+        viewer_save_circle(&conn, "did:plc:a", "building_fm", 1, 1, &[], &HashSet::new()).unwrap();
+        let first: HashSet<u64> = [10_u64].into_iter().collect();
+        viewer_save_checks(&conn, "did:plc:a", "ready", 1, &first, &first).unwrap();
+
+        let second: HashSet<u64> = [20_u64, 30].into_iter().collect();
+        let second_follows_me: HashSet<u64> = [30_u64].into_iter().collect();
+        viewer_save_checks(&conn, "did:plc:a", "ready", 2, &second, &second_follows_me).unwrap();
+
+        let rows = viewer_load_all(&conn).unwrap();
+        assert_eq!(rows[0].checked, second);
+        assert_eq!(rows[0].follows_me, second_follows_me);
     }
 
     // A hash near `u64::MAX` round-trips through the `i64` reinterpret cast

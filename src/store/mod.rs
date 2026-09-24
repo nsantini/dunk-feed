@@ -541,6 +541,35 @@ impl Store {
         viewers::viewer_delete(&conn, viewer_did)
     }
 
+    /// Saves step 2's result: `state` and a full replace of `viewer_checks`,
+    /// in one transaction (BC3, BC3a, BC10). No production caller yet: the
+    /// worker (`graph/queue.rs`, slice 2.0) is the first.
+    #[allow(dead_code)]
+    pub fn viewer_save_checks(
+        &self,
+        viewer_did: &str,
+        state: &str,
+        now: i64,
+        checked: &std::collections::HashSet<u64>,
+        follows_me: &std::collections::HashSet<u64>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        viewers::viewer_save_checks(&conn, viewer_did, state, now, checked, follows_me)
+    }
+
+    /// Reads `feed`'s quoter and original DIDs for the `quote_uri` values in
+    /// `quote_uris`, skipping any that no longer have a row (BC1a). No
+    /// production caller yet: the worker (`graph/queue.rs`, slice 2.0) is the
+    /// first.
+    #[allow(dead_code)]
+    pub fn feed_authors_by_quote_uri(
+        &self,
+        quote_uris: &[&str],
+    ) -> Result<Vec<feed::FeedAuthors>, StoreError> {
+        let conn = self.read_lock()?;
+        feed::feed_authors_by_quote_uri(&conn, quote_uris)
+    }
+
     /// Starts the one writer thread with `WriterConfig::default()`
     /// (BC42). No production caller: `upstage run` always uses
     /// `writer_evicting` instead, so eviction is wired in from the start.
