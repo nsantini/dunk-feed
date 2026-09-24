@@ -47,9 +47,11 @@ struct Entry {
 /// for it is already queued or running, when its last failed attempt
 /// finished, and when this state was first created. `KeyCache` keeps this
 /// separately from `Entry` because a DID with no cached key at all has no
-/// `Entry` to hold it. `first_seen` orders eviction the same way `Entry`'s
-/// `fetched_at` does for the key cache itself (BC16), so the `misses` map
-/// can be bounded the same way.
+/// `Entry` to hold it. `first_seen` orders pruning the same way `Entry`'s
+/// `fetched_at` orders eviction for the key cache itself (BC16), but once
+/// every tracked DID is in flight or cooling down there is nothing left to
+/// prune, and [`KeyCache::should_send_miss`] then drops the new DID instead
+/// of evicting one that is still doing useful work.
 struct MissState {
     in_flight: bool,
     last_attempted: Option<i64>,
@@ -157,22 +159,17 @@ impl KeyCache {
     /// than once per request. Bounds `misses` at [`Self::max_entries`]
     /// (BC16's own cap, reused here): a DID not already tracked, arriving
     /// once the map is full, first prunes entries whose cooldown has
-    /// passed and that are not in flight; if that frees no room, the
-    /// entry with the oldest [`MissState::first_seen`] is dropped
-    /// unconditionally, so an attacker minting a fresh DID on every
-    /// request can never grow this map past the cap.
+    /// passed and that are not in flight. When pruning frees no room —
+    /// every tracked DID is still in flight or inside its cooldown, so
+    /// all of them are doing useful work — this DID's `Miss` is dropped
+    /// instead, the same way a full resolver channel drops one (BC9):
+    /// nothing already tracked is evicted to make room for it.
     pub(super) fn should_send_miss(&self, did: &str, now: i64) -> bool {
         let mut misses = self.misses.lock().expect("KeyCache mutex poisoned");
         if !misses.contains_key(did) && misses.len() >= self.max_entries {
             Self::prune_misses(&mut misses, now);
             if misses.len() >= self.max_entries {
-                if let Some(oldest) = misses
-                    .iter()
-                    .min_by_key(|(_, state)| state.first_seen)
-                    .map(|(did, _)| did.clone())
-                {
-                    misses.remove(&oldest);
-                }
+                return false;
             }
         }
         let state = misses.entry(did.to_string()).or_insert(MissState {
@@ -195,9 +192,9 @@ impl KeyCache {
     /// Removes every entry whose cooldown has already passed and that is
     /// not in flight (BC16-style bound on `misses`): such an entry would
     /// let the very next `should_send_miss` call for it return `true`
-    /// anyway, so dropping it first, before falling back to an
-    /// unconditional oldest-entry eviction, never removes bookkeeping a
-    /// caller still needed.
+    /// anyway, so dropping it first, before `should_send_miss` falls back
+    /// to refusing the new DID, never removes bookkeeping a caller still
+    /// needed.
     fn prune_misses(misses: &mut HashMap<String, MissState>, now: i64) {
         misses.retain(|_, state| {
             state.in_flight
@@ -408,17 +405,20 @@ fn extract_key(document: &Value) -> Option<PublicKey> {
 /// Runs until the channel closes (the sender side lives in `AppState`,
 /// `src/ingest/mod.rs` slice 3.0, which outlives every request). A `Miss`
 /// and a `Refetch` are fetched the same way: either way the current key,
-/// if any, might be stale, so the document is fetched fresh. A fetch
-/// failure logs one warning naming only the failure kind (BC20, BC21) and
-/// caches nothing; a fetch that succeeds but yields no usable key
-/// ([`extract_key`] returning `None`, BC19) caches nothing and logs
-/// nothing — an absent `#atproto` method is not a transport or server
-/// failure worth a warning on every retry. For a `Miss`, the fetch's end
-/// is also reported to `cache`: a successful fetch (BC19's "no usable
-/// key" included) clears the miss state entirely
-/// ([`KeyCache::miss_fetch_succeeded`]), and a failed one starts the
-/// hourly cooldown ([`KeyCache::miss_fetch_failed`]) — only a failure
-/// should make the next miss for that DID wait.
+/// if any, might be stale, so the document is fetched fresh. A transport
+/// or HTTP fetch failure logs one warning naming only the failure kind
+/// (BC20, BC21) and caches nothing. A fetch that succeeds but yields no
+/// usable key ([`extract_key`] returning `None`, BC19) also caches
+/// nothing, and logs no warning of its own — an absent `#atproto` method
+/// is not a transport or server failure worth a warning on every retry —
+/// but for a `Miss` it is treated the same way a fetch error is (BC9,
+/// BC19): the DID's outstanding miss ends unsuccessfully
+/// ([`KeyCache::miss_fetch_failed`]), so a document that never carries a
+/// usable key is retried at most once an hour rather than on every
+/// request. For a `Miss`, the fetch's end is always reported to `cache`:
+/// only a fetch that both succeeds and yields a usable key clears the
+/// miss state entirely ([`KeyCache::miss_fetch_succeeded`]); every other
+/// outcome starts the hourly cooldown ([`KeyCache::miss_fetch_failed`]).
 pub(super) async fn run_resolver<F: DidFetcher>(
     mut requests: mpsc::Receiver<ResolveRequest>,
     fetcher: F,
@@ -430,14 +430,23 @@ pub(super) async fn run_resolver<F: DidFetcher>(
             ResolveRequest::Refetch(did) => (did, false),
         };
         match fetcher.fetch(&did).await {
-            Ok(document) => {
-                if let Some(key) = extract_key(&document) {
+            Ok(document) => match extract_key(&document) {
+                Some(key) => {
                     cache.insert(did.clone(), key, crate::store::unix_now());
+                    if is_miss {
+                        cache.miss_fetch_succeeded(&did);
+                    }
                 }
-                if is_miss {
-                    cache.miss_fetch_succeeded(&did);
+                None => {
+                    // BC19: a document with no usable key caches nothing.
+                    // BC9: for a `Miss`, this is a failed attempt like any
+                    // other, so it starts the hourly cooldown rather than
+                    // leaving the DID retryable on every request.
+                    if is_miss {
+                        cache.miss_fetch_failed(&did, crate::store::unix_now());
+                    }
                 }
-            }
+            },
             Err(err) => {
                 tracing::warn!(kind = ?err, "auth: did document fetch failed");
                 if is_miss {
@@ -606,20 +615,60 @@ mod tests {
     #[test]
     fn misses_map_stays_bounded_at_the_cache_cap() {
         // BC16: an attacker sending a fresh, well-formed DID on every
-        // request must not grow `misses` past `max_entries`, even though
-        // every one of those DIDs stays in flight (the resolver is never
-        // run in this test, so nothing naturally clears them).
+        // request must not grow `misses` past `max_entries`. The first
+        // `max_entries` DIDs each get their one outstanding `Miss` (the
+        // resolver is never run in this test, so nothing naturally clears
+        // them); once the map is full and every entry is in flight,
+        // pruning frees no room, so every further DID's `Miss` is dropped
+        // (BC9) rather than evicting one of the four still in flight.
         let cache = KeyCache::new(4);
-        for i in 0..100u32 {
+        for i in 0..4u32 {
             let did = format!("did:plc:{i:024}");
             assert!(cache.should_send_miss(&did, 0));
             assert_eq!(
                 cache.misses.lock().unwrap().len(),
-                (i as usize + 1).min(4),
+                i as usize + 1,
                 "misses must never exceed max_entries"
             );
         }
-        assert_eq!(cache.misses.lock().unwrap().len(), 4);
+        for i in 4..100u32 {
+            let did = format!("did:plc:{i:024}");
+            assert!(!cache.should_send_miss(&did, 0), "a full map of in-flight DIDs drops the new one");
+            assert_eq!(cache.misses.lock().unwrap().len(), 4, "misses must never exceed max_entries");
+        }
+    }
+
+    #[test]
+    fn misses_map_full_of_in_flight_or_cooling_drops_new_did_without_evicting() {
+        // BC9, BC16: cap 4, all four tracked DIDs are either still in
+        // flight or inside their hourly cooldown, so pruning frees no
+        // room. A fifth DID's `Miss` must be dropped, and the first four
+        // must keep exactly the state they had before the fifth DID ever
+        // arrived.
+        let cache = KeyCache::new(4);
+        let in_flight = "did:plc:000000000000000000000000";
+        let cooling = "did:plc:111111111111111111111111";
+        let also_in_flight = "did:plc:222222222222222222222222";
+        let also_cooling = "did:plc:333333333333333333333333";
+
+        assert!(cache.should_send_miss(in_flight, 0));
+        assert!(cache.should_send_miss(also_in_flight, 0));
+        assert!(cache.should_send_miss(cooling, 0));
+        cache.miss_fetch_failed(cooling, 0);
+        assert!(cache.should_send_miss(also_cooling, 0));
+        cache.miss_fetch_failed(also_cooling, 0);
+
+        let fifth = "did:plc:444444444444444444444444";
+        assert!(!cache.should_send_miss(fifth, 1), "no room and nothing prunable: the new DID is dropped");
+        assert_eq!(cache.misses.lock().unwrap().len(), 4, "nothing already tracked is evicted");
+
+        // The four original DIDs kept exactly the state they had: the two
+        // in flight still block a second send, and the two cooling down
+        // are still inside their hour.
+        assert!(!cache.should_send_miss(in_flight, 1), "still in flight");
+        assert!(!cache.should_send_miss(also_in_flight, 1), "still in flight");
+        assert!(!cache.should_send_miss(cooling, 1), "still cooling down");
+        assert!(!cache.should_send_miss(also_cooling, 1), "still cooling down");
     }
 
     #[tokio::test]
@@ -752,6 +801,41 @@ mod tests {
         )
         .await;
         assert!(matches!(cache.get(did, 0), Lookup::Missing));
+    }
+
+    #[tokio::test]
+    async fn miss_fetch_with_no_usable_key_starts_the_hourly_cooldown() {
+        // BC9, BC19: a fetch that succeeds but whose document has no
+        // usable `#atproto` key must be treated as a failed `Miss`
+        // attempt, not a successful one, so it does not leave the DID
+        // retryable on every request.
+        //
+        // `run_resolver` stamps the failed attempt with the real clock
+        // (`store::unix_now()`, this file's own doc comment on
+        // `run_resolver`), so this test judges the cooldown against that
+        // same clock rather than an arbitrary fixed epoch.
+        let did = "did:plc:ffffffffffffffffffffffff";
+        let doc = json!({ "id": did, "verificationMethod": [] });
+        let cache = Arc::new(KeyCache::new(10));
+        let now = crate::store::unix_now();
+
+        assert!(cache.should_send_miss(did, now), "first miss for this DID enqueues a fetch");
+        resolve_one(
+            ResolveRequest::Miss(did.to_string()),
+            FakeFetcher::once(Ok(doc)),
+            Arc::clone(&cache),
+        )
+        .await;
+
+        assert!(matches!(cache.get(did, now), Lookup::Missing), "no usable key was ever cached");
+        assert!(
+            !cache.should_send_miss(did, now + 1),
+            "a keyless document counts as a failed attempt and starts the cooldown"
+        );
+        assert!(
+            cache.should_send_miss(did, now + 3601),
+            "the cooldown ends after an hour"
+        );
     }
 
     #[test]
