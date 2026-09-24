@@ -216,10 +216,12 @@ pub fn viewer_save_circle(
 /// rather than upserting it, unlike `viewer_save_circle`: step 2 always runs
 /// after step 1 has already inserted the row (`viewer_save_state` or
 /// `viewer_save_circle`), so there is never a `viewer_did` this call needs to
-/// create. A `viewer_did` with no `viewers` row updates zero rows and still
-/// writes its `viewer_checks` rows — not an error, the same no-op-on-missing
-/// rule `viewer_touch` follows, since the flush can race a concurrent
-/// eviction (BC10a covers the row then being deleted afterwards).
+/// create. A `viewer_did` with no `viewers` row updates zero rows, and then
+/// fails on the `viewer_checks` insert with a foreign key `StoreError` —
+/// `viewer_checks.viewer_did` references `viewers(viewer_did)` and
+/// `foreign_keys` is on (review round 1, defect AG) — rather than the no-op
+/// `viewer_touch` follows: `run_step2` (`graph/queue.rs`) routes that `Err`
+/// to `handle_step2_failure` (BC4c) the same as any other save failure.
 #[allow(dead_code)] // First caller is the worker (`graph/queue.rs`, slice 2.0).
 pub fn viewer_save_checks(
     conn: &Connection,
@@ -469,6 +471,20 @@ mod tests {
         let rows = viewer_load_all(&conn).unwrap();
         assert_eq!(rows[0].checked, second);
         assert_eq!(rows[0].follows_me, second_follows_me);
+    }
+
+    // Review round 1, defect AG: a `viewer_did` with no `viewers` row fails
+    // the `viewer_checks` insert with a foreign key `StoreError`, rather
+    // than the no-op the doc used to promise.
+    #[test]
+    fn checks_save_with_no_viewer_row_fails() {
+        let conn = migrated_conn();
+        let checked: HashSet<u64> = [10_u64].into_iter().collect();
+
+        let result =
+            viewer_save_checks(&conn, "did:plc:none", "ready", 1, &checked, &HashSet::new());
+
+        assert!(result.is_err());
     }
 
     // A hash near `u64::MAX` round-trips through the `i64` reinterpret cast
