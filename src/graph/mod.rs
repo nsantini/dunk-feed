@@ -83,24 +83,38 @@ struct TouchEntry {
     last_flushed_at: i64,
 }
 
+/// [`GraphHandle`]'s circle map and cooldown map, held behind one lock
+/// (review round 2, defect AB): `enqueue_first_build`'s cooldown check and
+/// circle insert, and `remove_after_giving_up`'s circle removal and
+/// cooldown insert, each need to happen as a single atomic step, or a
+/// request racing the worker's give-up can observe a circle during its own
+/// cooldown, or a cooldown with no circle and no job. Two separate locks
+/// (a `circles` `RwLock` and a `cooldowns` `Mutex`, as story 06 first
+/// shipped) cannot give that guarantee: a step between them is a window a
+/// concurrent caller can land in.
+#[derive(Default)]
+struct GraphState {
+    circles: HashMap<ViewerDid, Arc<Circle>>,
+    /// A viewer the worker gave up on (review round 1, defect W), mapped to
+    /// the unix second [`GraphHandle::enqueue_first_build`] may start a new
+    /// first build for it again. A viewer with no entry here has never been
+    /// given up on.
+    cooldowns: HashMap<ViewerDid, i64>,
+}
+
 /// The graph index the handler reads without an await (spec `## Approach`):
-/// a `RwLock<HashMap<ViewerDid, Arc<Circle>>>`, plus the de-duplicated
-/// queue `enqueue_first_build` sends into and the worker drains. Cloning
-/// this handle (through its `Arc`) is how the worker task, the touch-flush
-/// task and the HTTP handler (slice 4.0) all share the one index.
+/// a `RwLock<GraphState>`, plus the de-duplicated queue
+/// `enqueue_first_build` sends into and the worker drains. Cloning this
+/// handle (through its `Arc`) is how the worker task, the touch-flush task
+/// and the HTTP handler (slice 4.0) all share the one index.
 pub struct GraphHandle {
-    circles: RwLock<HashMap<ViewerDid, Arc<Circle>>>,
+    state: RwLock<GraphState>,
     queue: Arc<JobQueue>,
     max_viewers: usize,
     touches: Mutex<HashMap<ViewerDid, TouchEntry>>,
     /// The unix second [`Self::warn_at_cap`] last logged its one-per-minute
     /// warning at (BC6a). `None` until the first time the cap is hit.
     cap_warned_at: Mutex<Option<i64>>,
-    /// A viewer the worker gave up on (review round 1, defect W), mapped to
-    /// the unix second [`Self::enqueue_first_build`] may start a new first
-    /// build for it again. A viewer with no entry here has never been given
-    /// up on.
-    cooldowns: Mutex<HashMap<ViewerDid, i64>>,
 }
 
 /// The cap warning's cooldown (BC6a): "at most once per minute".
@@ -111,12 +125,11 @@ impl GraphHandle {
     /// `max_viewers` circles held at once (BC6a).
     pub fn new(max_viewers: usize) -> Arc<Self> {
         Arc::new(GraphHandle {
-            circles: RwLock::new(HashMap::new()),
+            state: RwLock::new(GraphState::default()),
             queue: JobQueue::new(),
             max_viewers,
             touches: Mutex::new(HashMap::new()),
             cap_warned_at: Mutex::new(None),
-            cooldowns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -142,9 +155,10 @@ impl GraphHandle {
             circle.circle_version = if state == CircleState::Ready { 1 } else { 0 };
 
             handle
-                .circles
+                .state
                 .write()
-                .expect("GraphHandle circles mutex poisoned")
+                .expect("GraphHandle state lock poisoned")
+                .circles
                 .insert(viewer.clone(), Arc::new(circle));
             if state == CircleState::BuildingD1 {
                 handle.queue.push(viewer);
@@ -167,38 +181,38 @@ impl GraphHandle {
     /// (slice 3.0) is the first.
     #[allow(dead_code)]
     pub fn get(&self, viewer: &ViewerDid) -> Option<Arc<Circle>> {
-        self.circles.read().expect("GraphHandle circles mutex poisoned").get(viewer).cloned()
+        self.state.read().expect("GraphHandle state lock poisoned").circles.get(viewer).cloned()
     }
 
     /// Enqueues a `FirstBuild` job for `viewer` unless one is already
-    /// queued or running (BC4, BC5, BC6) or the handle already holds
-    /// `max_viewers` circles (BC6a). `now` is the unix second the request
-    /// arrived, used only to rate-limit the cap warning.
+    /// queued or running (BC4, BC5, BC6), the handle already holds
+    /// `max_viewers` circles (BC6a), or `viewer` is still cooling down after
+    /// a give-up (defect W). `now` is the unix second the request arrived,
+    /// used only to rate-limit the cap warning. The cooldown check and the
+    /// circle insert happen under one write lock (review round 2, defect
+    /// AB), the same lock [`Self::remove_after_giving_up`] takes: a
+    /// concurrent give-up is fully applied or not started at all when this
+    /// runs, so this either sees the viewer's old circle (BC5, no new job
+    /// needed) or its cooldown (no circle created), never neither.
     pub fn enqueue_first_build(&self, viewer: ViewerDid, now: i64) {
-        {
-            // Defect W: a viewer the worker gave up on gets no new circle
-            // and no job until its cooldown has passed, even though it has
-            // no entry in `circles` any more.
-            let cooldowns = self.cooldowns.lock().expect("GraphHandle cooldowns mutex poisoned");
-            if let Some(&not_before) = cooldowns.get(&viewer) {
-                if now < not_before {
-                    return;
-                }
+        let mut state = self.state.write().expect("GraphHandle state lock poisoned");
+        if let Some(&not_before) = state.cooldowns.get(&viewer) {
+            if now < not_before {
+                return;
             }
         }
-        let mut circles = self.circles.write().expect("GraphHandle circles mutex poisoned");
-        if circles.contains_key(&viewer) {
+        if state.circles.contains_key(&viewer) {
             // BC5: a circle already exists — building or ready — so no
             // second job is queued.
             return;
         }
-        if circles.len() >= self.max_viewers {
-            drop(circles);
+        if state.circles.len() >= self.max_viewers {
+            drop(state);
             self.warn_at_cap(now);
             return;
         }
-        circles.insert(viewer.clone(), Arc::new(Circle::new()));
-        drop(circles);
+        state.circles.insert(viewer.clone(), Arc::new(Circle::new()));
+        drop(state);
         self.queue.push(viewer);
     }
 
@@ -233,11 +247,11 @@ impl GraphHandle {
     /// `spec.md`'s `## Defaults taken` already records for slice 2.0's
     /// one-line `src/http/skeleton.rs` edit.
     pub(crate) fn insert_ready(&self, viewer: &ViewerDid, mut circle: Circle) -> u64 {
-        let mut circles = self.circles.write().expect("GraphHandle circles mutex poisoned");
-        let version = circles.get(viewer).map(|c| c.circle_version + 1).unwrap_or(1);
+        let mut state = self.state.write().expect("GraphHandle state lock poisoned");
+        let version = state.circles.get(viewer).map(|c| c.circle_version + 1).unwrap_or(1);
         circle.state = CircleState::Ready;
         circle.circle_version = version;
-        circles.insert(viewer.clone(), Arc::new(circle));
+        state.circles.insert(viewer.clone(), Arc::new(circle));
         version
     }
 
@@ -251,12 +265,20 @@ impl GraphHandle {
     /// [`Self::insert_ready`] is: the worker, in `graph::queue`, is the only
     /// production caller, but this module's own tests exercise it directly
     /// too.
+    ///
+    /// The removal and the cooldown insert happen under one write lock
+    /// (review round 2, defect AB): the previous two-step version (a
+    /// `circles` write lock, released, then a separate `cooldowns` lock)
+    /// left a window with no circle and no cooldown yet, where a concurrent
+    /// `enqueue_first_build` would insert a fresh circle with nothing to
+    /// build it — `JobQueue::push` was still a no-op for that viewer, since
+    /// its outstanding mark was not cleared until after this call returned,
+    /// so the new circle got no job and sat stuck until the process
+    /// restarted.
     pub(crate) fn remove_after_giving_up(&self, viewer: &ViewerDid, now: i64, cooldown_secs: i64) {
-        self.circles.write().expect("GraphHandle circles mutex poisoned").remove(viewer);
-        self.cooldowns
-            .lock()
-            .expect("GraphHandle cooldowns mutex poisoned")
-            .insert(viewer.clone(), now + cooldown_secs);
+        let mut state = self.state.write().expect("GraphHandle state lock poisoned");
+        state.circles.remove(viewer);
+        state.cooldowns.insert(viewer.clone(), now + cooldown_secs);
     }
 
     /// Records `viewer`'s latest request time in memory (BC23). The
@@ -339,7 +361,7 @@ mod tests {
         handle.enqueue_first_build(viewer.clone(), 1_700_000_000);
         handle.enqueue_first_build(viewer.clone(), 1_700_000_001);
 
-        assert_eq!(handle.circles.read().unwrap().len(), 1);
+        assert_eq!(handle.state.read().unwrap().circles.len(), 1);
     }
 
     #[test]
@@ -352,7 +374,7 @@ mod tests {
         handle.enqueue_first_build(second.clone(), 1_700_000_000);
 
         assert!(handle.get(&second).is_none());
-        assert_eq!(handle.circles.read().unwrap().len(), 1);
+        assert_eq!(handle.state.read().unwrap().circles.len(), 1);
     }
 
     #[test]
@@ -427,6 +449,99 @@ mod tests {
 
         handle.enqueue_first_build(viewer.clone(), 1_000 + 3_600);
         assert!(handle.get(&viewer).is_some(), "cooldown has expired");
+    }
+
+    #[test]
+    fn giveup_then_request_in_the_gap_creates_no_jobless_circle() {
+        // Review round 2, findings 1 and 2 (defect AB), replayed
+        // deterministically: the worker gives up on a viewer (removing its
+        // circle and starting its cooldown) but has not yet cleared the
+        // job's outstanding mark on the queue when a request for the same
+        // viewer arrives. Before the fix, the cooldown and the circle
+        // removal were two separate steps under two separate locks, so a
+        // request that landed between them saw no cooldown yet, inserted a
+        // fresh circle, and called `queue.push`, which silently no-opped
+        // because the original job's outstanding mark was still set — the
+        // new circle then sat with no job, forever. With the cooldown and
+        // the circle removal now one atomic step, the request always sees
+        // the cooldown and creates nothing.
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:a".to_string());
+        let queue = handle.queue();
+
+        handle.enqueue_first_build(viewer.clone(), 1_000);
+        assert_eq!(queue.try_pop(), Some(viewer.clone()), "the worker picks up the first job");
+
+        // The worker's 5th failed attempt gives up.
+        handle.remove_after_giving_up(&viewer, 1_000, 3_600);
+
+        // A request lands before the worker's failure path clears the
+        // queue's outstanding mark for this viewer.
+        handle.enqueue_first_build(viewer.clone(), 1_000);
+
+        // Only now does the worker finish its failure path.
+        queue.complete(&viewer);
+
+        assert!(handle.get(&viewer).is_none(), "no circle exists during the cooldown");
+        assert!(queue.try_pop().is_none(), "no job was queued for a circle that does not exist");
+
+        // Once the cooldown passes, a fresh request starts a real first
+        // build with a job to match.
+        handle.enqueue_first_build(viewer.clone(), 1_000 + 3_600);
+        assert!(handle.get(&viewer).is_some());
+        assert_eq!(queue.try_pop(), Some(viewer), "the new circle has a job");
+    }
+
+    #[test]
+    fn enqueue_and_giveup_race_never_leaves_a_circle_without_a_job_or_during_a_cooldown() {
+        // Review round 2, finding 3 (defect AB), replayed: races
+        // `remove_after_giving_up` against a concurrent `enqueue_first_build`
+        // for the same viewer, many times. Before the circle map and the
+        // cooldown map shared one lock, a request could read the (still
+        // empty) cooldown just before the give-up path inserted one, then
+        // insert its own circle after the give-up path had already removed
+        // the old one — leaving a circle behind during what should be its
+        // cooldown. Whatever order the two racing operations actually run
+        // in, that combination must never be observable.
+        use std::sync::Barrier;
+
+        for i in 0..2_000 {
+            let handle = GraphHandle::new(10);
+            let viewer = ViewerDid(format!("did:plc:race-{i}"));
+            let now = 1_000_000 + i as i64;
+
+            let barrier = Arc::new(Barrier::new(2));
+            let giveup = {
+                let handle = Arc::clone(&handle);
+                let viewer = viewer.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle.remove_after_giving_up(&viewer, now, 3_600);
+                })
+            };
+            let enqueue = {
+                let handle = Arc::clone(&handle);
+                let viewer = viewer.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle.enqueue_first_build(viewer, now);
+                })
+            };
+            giveup.join().expect("give-up thread does not panic");
+            enqueue.join().expect("enqueue thread does not panic");
+
+            let state = handle.state.read().unwrap();
+            let has_circle = state.circles.contains_key(&viewer);
+            let cooling_down =
+                state.cooldowns.get(&viewer).is_some_and(|&not_before| now < not_before);
+            drop(state);
+            assert!(
+                !(has_circle && cooling_down),
+                "iteration {i}: a circle exists during its own cooldown"
+            );
+        }
     }
 
     fn migrated_store() -> Store {

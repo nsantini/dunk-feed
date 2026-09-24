@@ -75,6 +75,14 @@ pub struct JobQueue {
     /// success or removal (BC8 as amended, defect W). A viewer with no entry
     /// has failed zero times.
     attempts: Mutex<HashMap<ViewerDid, u32>>,
+    /// Viewers the worker gave up on whose `viewer_delete` failed (review
+    /// round 2, defect AA): [`run_worker_with_retry_delay`]'s loop retries
+    /// each one, on every iteration, until the delete succeeds. A viewer
+    /// left here across a restart is loaded back into `building_d1` by
+    /// [`crate::graph::GraphHandle::from_store`] (its row was never
+    /// deleted) and re-enqueued, so it gets `MAX_FIRST_BUILD_ATTEMPTS` more
+    /// attempts rather than being retried forever as a deletion.
+    pending_deletions: Mutex<HashSet<ViewerDid>>,
     notify: Notify,
 }
 
@@ -85,6 +93,7 @@ impl JobQueue {
             pending: Mutex::new(VecDeque::new()),
             outstanding: Mutex::new(HashSet::new()),
             attempts: Mutex::new(HashMap::new()),
+            pending_deletions: Mutex::new(HashSet::new()),
             notify: Notify::new(),
         })
     }
@@ -153,6 +162,54 @@ impl JobQueue {
     /// viewer, so a later first build starts counting from zero.
     fn clear_attempts(&self, viewer: &ViewerDid) {
         self.attempts.lock().expect("JobQueue attempts poisoned").remove(viewer);
+    }
+
+    /// Records that `viewer`'s `viewer_delete` failed at give-up (review
+    /// round 2, defect AA): [`retry_pending_deletions`] retries it on every
+    /// worker loop iteration until it succeeds.
+    fn mark_deletion_pending(&self, viewer: ViewerDid) {
+        self.pending_deletions.lock().expect("JobQueue pending_deletions poisoned").insert(viewer);
+    }
+
+    /// Every viewer whose `viewer_delete` is still pending a retry, snapshot
+    /// so [`retry_pending_deletions`] can call the store without holding
+    /// this lock across the `await`.
+    fn pending_deletions_snapshot(&self) -> Vec<ViewerDid> {
+        self.pending_deletions
+            .lock()
+            .expect("JobQueue pending_deletions poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Clears `viewer`'s pending-deletion mark once its `viewer_delete`
+    /// finally succeeds (defect AA).
+    fn clear_pending_deletion(&self, viewer: &ViewerDid) {
+        self.pending_deletions.lock().expect("JobQueue pending_deletions poisoned").remove(viewer);
+    }
+}
+
+/// Retries every viewer in `queue`'s pending-deletion set (review round 2,
+/// defect AA): a `viewer_delete` that failed when the worker gave up on a
+/// viewer would otherwise leave that viewer's `building_d1` row in SQLite
+/// forever, so a restart's [`crate::graph::GraphHandle::from_store`] would
+/// load it back and re-enqueue it with a fresh attempt count and no
+/// cooldown, bypassing the give-up limit entirely. [`run_worker_with_retry_delay`]
+/// calls this on every loop iteration, so a viewer only stays here between
+/// one job finishing and the next one being picked up — if a delete keeps
+/// failing and no further jobs ever arrive, the row is still cleaned up on
+/// the next restart: `from_store` re-enqueues it as an ordinary
+/// `building_d1` job, which gets `MAX_FIRST_BUILD_ATTEMPTS` more attempts
+/// before giving up (and retrying its own delete) again.
+async fn retry_pending_deletions(queue: &Arc<JobQueue>, store: &Store) {
+    for viewer in queue.pending_deletions_snapshot() {
+        match store.viewer_delete(&viewer.0) {
+            Ok(()) => queue.clear_pending_deletion(&viewer),
+            Err(err) => {
+                tracing::warn!(kind = ?err, "graph: retry of viewer delete after giving up failed");
+            }
+        }
     }
 }
 
@@ -241,8 +298,17 @@ async fn handle_failure(
         attempts,
         "graph: worker giving up on first build after repeated failures, removing viewer"
     );
+    // Defect AA: the in-memory circle and cooldown are removed and started
+    // regardless of whether the SQLite row could be deleted — a viewer that
+    // keeps its row past give-up must still stop occupying an
+    // `UPSTAGE_MAX_VIEWERS` slot and still be blocked from a new first
+    // build during its cooldown. A failed delete is instead handed to
+    // `retry_pending_deletions`, so a restart before it succeeds does not
+    // bypass the give-up limit (its `building_d1` row would otherwise be
+    // loaded back with a fresh attempt count and no cooldown).
     if let Err(err) = store.viewer_delete(&viewer.0) {
         tracing::warn!(kind = ?err, "graph: failed to delete viewer row after giving up");
+        queue.mark_deletion_pending(viewer.clone());
     }
     handle.remove_after_giving_up(viewer, unix_now(), REMOVAL_COOLDOWN_SECS);
     queue.complete(viewer);
@@ -304,6 +370,10 @@ async fn run_worker_with_retry_delay<S: GraphSource>(
             retry_delay,
         )
         .await;
+        // Defect AA: retry any viewer whose `viewer_delete` failed at
+        // give-up, on every pass through this loop, not only right after it
+        // fails.
+        retry_pending_deletions(&queue, &store).await;
     }
 }
 
@@ -607,5 +677,72 @@ mod tests {
         let rows = store.viewer_load_all().unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].last_request_at > 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_give_up_delete_is_retried_until_it_succeeds() {
+        // Review round 2, findings 1 and 4 (defect AA): a `viewer_delete`
+        // that fails when the worker gives up must not leave the
+        // `building_d1` row behind forever — `retry_pending_deletions`
+        // keeps trying it (here, called directly, the way the worker loop
+        // calls it after every job) until a later attempt, against a
+        // writable connection to the same file, succeeds.
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("upstage-graph-queue-aa-{nanos}.sqlite3"));
+        let path_str = path.to_str().unwrap().to_string();
+        {
+            let seed = Store::open_path(&path_str).unwrap();
+            seed.viewer_save_state("did:plc:viewer", "building_d1", unix_now()).unwrap();
+        }
+        let read_only_store = Store::open_read_only(&path_str).unwrap();
+
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        handle.enqueue_first_build(viewer.clone(), unix_now());
+        let queue = handle.queue();
+        let source = FailingSource { calls: StdMutex::new(0) };
+
+        // Every attempt fails against the read-only connection: `step_1`'s
+        // own `viewer_save_state` write fails immediately, so this also
+        // exercises BC24's store-error path `MAX_FIRST_BUILD_ATTEMPTS`
+        // times running. The give-up path's `viewer_delete` then fails the
+        // same way.
+        for _ in 0..MAX_FIRST_BUILD_ATTEMPTS {
+            let job = queue.pop().await;
+            process_job(
+                &job,
+                &handle,
+                &queue,
+                &read_only_store,
+                &source,
+                10,
+                None,
+                Duration::from_millis(5),
+            )
+            .await;
+        }
+
+        assert!(handle.get(&viewer).is_none(), "the in-memory circle is gone regardless");
+        assert_eq!(
+            queue.pending_deletions_snapshot(),
+            vec![viewer.clone()],
+            "the failed delete is remembered for a retry"
+        );
+
+        // The worker's next loop iteration retries it, now against a
+        // writable connection.
+        let writable_store = Store::open_path(&path_str).unwrap();
+        retry_pending_deletions(&queue, &writable_store).await;
+
+        assert!(queue.pending_deletions_snapshot().is_empty(), "the retry succeeded");
+        assert!(
+            writable_store.viewer_load_all().unwrap().is_empty(),
+            "the row is finally deleted, so a restart does not re-queue it"
+        );
+
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 }
