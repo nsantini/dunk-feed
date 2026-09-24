@@ -872,18 +872,25 @@ mod tests {
     // already capped); the new path serves `build`'s uncapped `items` plus
     // `global`. `global_matches_v1` (`scorer::snapshot`) already proves the
     // two agree on content and order; this test proves the served
-    // `getFeedSkeleton` bytes agree too.
+    // `getFeedSkeleton` bytes agree too, on a fixture where both caps
+    // actually fire.
     #[tokio::test]
     async fn global_output_unchanged() {
         use crate::score::Weights;
         use crate::scorer::snapshot::{build, build_v1_capped_oracle};
         use crate::store::feed::FeedRow;
 
-        fn feed_row(
+        // Like `feed_row`, but with `v_likes_q` set explicitly and every
+        // other count at zero, so the row's *computed* rank
+        // (`recompute_ranks`, which ignores the fixture's own `rank` field)
+        // is driven only by `likes`, at a shared `quoted_at` so age never
+        // confounds the order.
+        fn feed_row_with_likes(
             quote_uri: &str,
             quote_did: &str,
             original_did: &str,
             quoted_at: i64,
+            likes: i64,
         ) -> FeedRow {
             FeedRow {
                 quote_uri: quote_uri.to_string(),
@@ -891,7 +898,7 @@ mod tests {
                 quote_did: quote_did.to_string(),
                 original_did: original_did.to_string(),
                 quoted_at,
-                v_likes_q: 60,
+                v_likes_q: likes,
                 v_reposts_q: 0,
                 v_replies_q: 0,
                 v_likes_o: 0,
@@ -919,19 +926,76 @@ mod tests {
         let weights = Weights { repost: 3.0, reply: 5.0 };
         let now = 1_700_100_000i64;
         let k = 5.0;
-        let rows: Vec<FeedRow> = (0..5)
-            .map(|i| {
-                feed_row(
-                    &format!("at://did:plc:q{i}/app.bsky.feed.post/q"),
-                    &format!("did:plc:quoter{i}"),
-                    &format!("did:plc:orig{i}"),
-                    now - 3600 - i,
-                )
-            })
-            .collect();
+
+        // Rank order (descending likes, all rows at the same age):
+        // cap1-high, cap1-low, repeatq-first, filler1, filler2, repeatq-again.
+        // `cap1-high`/`cap1-low` share `(original_did, day)` (BC4): cap 1
+        // drops `cap1-low`. `repeatq-first`/`repeatq-again` share quoter
+        // `repeatq` (BC5); only 2 filler rows (well inside the 49-item
+        // window) separate them and nothing follows to free the window, so
+        // cap 2 defers `repeatq-again` and then drops it when the main list
+        // runs out — both caps fire.
+        let rows = vec![
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/cap1-high",
+                "did:plc:cap1-quoter-high",
+                "did:plc:cap1-author",
+                now,
+                500,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/cap1-low",
+                "did:plc:cap1-quoter-low",
+                "did:plc:cap1-author",
+                now,
+                480,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/repeatq-first",
+                "did:plc:repeatq",
+                "did:plc:orig-first",
+                now,
+                460,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/filler1",
+                "did:plc:filler-quoter1",
+                "did:plc:orig-filler1",
+                now,
+                440,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/filler2",
+                "did:plc:filler-quoter2",
+                "did:plc:orig-filler2",
+                now,
+                420,
+            ),
+            feed_row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/repeatq-again",
+                "did:plc:repeatq",
+                "did:plc:orig-again",
+                now,
+                400,
+            ),
+        ];
 
         let oracle = build_v1_capped_oracle(rows.clone(), &weights, now, k);
         let (items, global) = build(rows, &weights, now, k);
+
+        // Both caps must actually have fired before the byte comparison
+        // below means anything.
+        assert_eq!(global.len(), 4, "cap 1 drops one row, cap 2 drops another");
+        let survivors: Vec<&str> =
+            global.iter().map(|&i| items[i as usize].quote_uri.as_str()).collect();
+        assert!(
+            !survivors.contains(&"at://did:plc:q/app.bsky.feed.post/cap1-low"),
+            "cap 1 must drop the lower-rank same-author-same-day row"
+        );
+        assert!(
+            !survivors.contains(&"at://did:plc:q/app.bsky.feed.post/repeatq-again"),
+            "cap 2 must drop the deferred row once the main list runs out"
+        );
 
         let oracle_state = state_with_items(oracle);
         let new_state = {

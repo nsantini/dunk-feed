@@ -919,45 +919,121 @@ mod tests {
         assert_eq!(global.len(), 1, "cap 1 drops the second same-author-same-day row from global");
     }
 
-    /// A fixture wide enough to exercise cap 1's drop, cap 2's deferral, and
-    /// a rank tie all at once: `a` and `b` share `(original_did, day)` at a
-    /// rank tie broken by `quote_cid`, so cap 1 keeps only one; `first` and
-    /// `again` share a quoter within the 49-item window, so cap 2 defers
-    /// `again` behind the filler rows.
+    /// `row`, but with `v_likes_q` set explicitly and every other count at
+    /// zero, so the row's *computed* rank (`recompute_ranks`, which ignores
+    /// the fixture's own `rank` field) is driven only by `likes`: with
+    /// `v_likes_o == 0` and `k` fixed, both `D = eq / (eo + k)` and
+    /// `log10(1 + eq)` rise with `eq`, so a higher `likes` value always
+    /// computes a higher rank for rows at the same age.
+    fn row_with_likes(
+        quote_uri: &str,
+        quote_did: &str,
+        original_did: &str,
+        quoted_at: i64,
+        likes: i64,
+    ) -> FeedRow {
+        let mut r = row(quote_uri, quote_did, original_did, quoted_at, 0.0);
+        r.v_likes_q = likes;
+        r
+    }
+
+    /// A fixture that exercises cap 1's drop, cap 2's deferral-then-release,
+    /// and a rank tie, all through *computed* rank (`recompute_ranks`
+    /// overwrites the fixture's placeholder `rank` field, so `build` must
+    /// see real rank differences, not literal ones): every row shares
+    /// `quoted_at == day_start` and `v_likes_o == 0`, so `likes` alone fixes
+    /// the sort order.
+    ///
+    /// - `tie-a` and `tie-b` carry identical `likes` and distinct original
+    ///   and quoting DIDs, so they compute the same rank — a real tie,
+    ///   broken only by `quote_cid ASC` (BC26/BC46).
+    /// - `cap1-high` and `cap1-low` share `(original_did, day)` at distinct
+    ///   ranks, so cap 1 (BC4) drops `cap1-low` and keeps `cap1-high`.
+    /// - `cap2-first` and `cap2-again` share quoter `repeatq`. Exactly 49
+    ///   other rows (`cap2-pre0..2`, 3 rows, then `cap2-post0..45`, 46
+    ///   rows), each a distinct quoter, separate them — inside the 49-item
+    ///   trailing window, so `cap2-again` defers, then releases the moment
+    ///   the last filler row evicts `repeatq` from the window, landing
+    ///   ahead of `cap2-tail` (BC5, the same shape as
+    ///   `caps::tests::cap_one_per_quoter_per_50_reinserts_once_legal`).
     fn ac1_fixture(now: i64) -> Vec<FeedRow> {
         let day_start = now.div_euclid(86_400) * 86_400;
         let mut rows = vec![
-            row("at://did:plc:q/app.bsky.feed.post/a", "did:plc:qa", "did:plc:tie", day_start, 5.0),
-            row("at://did:plc:q/app.bsky.feed.post/b", "did:plc:qb", "did:plc:tie", day_start, 5.0),
-            row(
-                "at://did:plc:q/app.bsky.feed.post/first",
-                "did:plc:same",
-                "did:plc:o1",
-                day_start + 100,
-                10.0,
+            row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/tie-a",
+                "did:plc:tie-quoter-a",
+                "did:plc:tie-orig-a",
+                day_start,
+                500,
+            ),
+            row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/tie-b",
+                "did:plc:tie-quoter-b",
+                "did:plc:tie-orig-b",
+                day_start,
+                500,
+            ),
+            row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/cap1-high",
+                "did:plc:cap1-quoter-high",
+                "did:plc:cap1-author",
+                day_start,
+                400,
+            ),
+            row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/cap1-low",
+                "did:plc:cap1-quoter-low",
+                "did:plc:cap1-author",
+                day_start,
+                350,
+            ),
+            row_with_likes(
+                "at://did:plc:q/app.bsky.feed.post/cap2-first",
+                "did:plc:repeatq",
+                "did:plc:cap2-orig-first",
+                day_start,
+                300,
             ),
         ];
-        for i in 0..5 {
-            rows.push(row(
-                &format!("at://did:plc:q/app.bsky.feed.post/filler{i}"),
-                &format!("did:plc:filler{i}"),
-                "did:plc:o2",
-                day_start + 200,
-                9.0 - i as f64 * 0.01,
+        for i in 0..3 {
+            rows.push(row_with_likes(
+                &format!("at://did:plc:q/app.bsky.feed.post/cap2-pre{i}"),
+                &format!("did:plc:cap2-pre-quoter{i}"),
+                &format!("did:plc:cap2-pre-orig{i}"),
+                day_start,
+                290 - i as i64,
             ));
         }
-        rows.push(row(
-            "at://did:plc:q/app.bsky.feed.post/again",
-            "did:plc:same",
-            "did:plc:o3",
-            day_start + 300,
-            1.0,
+        rows.push(row_with_likes(
+            "at://did:plc:q/app.bsky.feed.post/cap2-again",
+            "did:plc:repeatq",
+            "did:plc:cap2-orig-again",
+            day_start,
+            280,
+        ));
+        for i in 0..46 {
+            rows.push(row_with_likes(
+                &format!("at://did:plc:q/app.bsky.feed.post/cap2-post{i}"),
+                &format!("did:plc:cap2-post-quoter{i}"),
+                &format!("did:plc:cap2-post-orig{i}"),
+                day_start,
+                270 - i as i64,
+            ));
+        }
+        rows.push(row_with_likes(
+            "at://did:plc:q/app.bsky.feed.post/cap2-tail",
+            "did:plc:cap2-tail-quoter",
+            "did:plc:cap2-tail-orig",
+            day_start,
+            1,
         ));
         rows
     }
 
     // AC1: `global` equals the old capped list, item for item, on a fixture
-    // with a cap-1 drop, a cap-2 deferral and a rank tie.
+    // whose computed rank (not the fixture's placeholder `rank` field, which
+    // `build` overwrites) produces a real cap-1 drop, a real cap-2
+    // deferral-then-release, and a real rank tie.
     #[test]
     fn global_matches_v1() {
         let now: i64 = 1_700_100_000;
@@ -966,6 +1042,47 @@ mod tests {
         let oracle = build_v1_capped_oracle(rows.clone(), &weights(), now, 5.0);
         let (items, global) = build(rows, &weights(), now, 5.0);
         let mapped: Vec<FeedItem> = global.iter().map(|&i| items[i as usize].clone()).collect();
+
+        // These checks prove the fixture actually exercised the four
+        // events its comment above claims, so the byte-for-byte equality
+        // assertion below is not vacuous.
+        let contains = |list: &[FeedItem], uri: &str| list.iter().any(|i| i.quote_uri == uri);
+        assert!(
+            !contains(&mapped, "at://did:plc:q/app.bsky.feed.post/cap1-low"),
+            "cap 1 must drop the lower-rank same-author-same-day row"
+        );
+        assert!(
+            contains(&mapped, "at://did:plc:q/app.bsky.feed.post/cap1-high"),
+            "cap 1 must keep the higher-rank same-author-same-day row"
+        );
+
+        let rank_of = |uri: &str| {
+            items
+                .iter()
+                .find(|i| i.quote_uri == uri)
+                .unwrap_or_else(|| panic!("{uri} missing"))
+                .rank
+        };
+        assert_eq!(
+            rank_of("at://did:plc:q/app.bsky.feed.post/tie-a"),
+            rank_of("at://did:plc:q/app.bsky.feed.post/tie-b"),
+            "the tie fixture rows must compute to the same rank"
+        );
+
+        let position = |list: &[FeedItem], uri: &str| {
+            list.iter().position(|i| i.quote_uri == uri).unwrap_or_else(|| panic!("{uri} missing"))
+        };
+        let again_pos = position(&mapped, "at://did:plc:q/app.bsky.feed.post/cap2-again");
+        let last_post_pos = position(&mapped, "at://did:plc:q/app.bsky.feed.post/cap2-post45");
+        let tail_pos = position(&mapped, "at://did:plc:q/app.bsky.feed.post/cap2-tail");
+        assert!(
+            again_pos > last_post_pos,
+            "cap 2 must defer the repeat quoter behind every filler row separating its two quotes"
+        );
+        assert!(
+            again_pos < tail_pos,
+            "the deferred row is released as soon as the window frees it, ahead of the tail row"
+        );
 
         assert_eq!(mapped, oracle);
     }
