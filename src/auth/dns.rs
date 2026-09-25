@@ -18,6 +18,20 @@
 //! blocked under the same standing rule as BC1 to BC3: not globally
 //! routable, so a public host has no reason to publish one.
 //!
+//! The lists follow the IANA IPv4 and IPv6 special-purpose address
+//! registries directly: an entry whose "Globally Reachable" column reads
+//! `False` is blocked, and an entry that reads `True` is allowed even when
+//! it sits inside a wider range this module otherwise blocks. Review round
+//! 2, defect AV: `192.0.0.9/32` and `192.0.0.10/32` are globally reachable
+//! inside the blocked `192.0.0.0/24`, and `2001:1::1/128`, `2001:1::2/128`,
+//! `2001:1::3/128`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28` and
+//! `2001:30::/28` are globally reachable inside the blocked `2001::/23` —
+//! the rest of `2001::/23`, including Teredo `2001::/32`, `2001:2::/48` and
+//! `2001:10::/28`, stays blocked. Defect AW: `100:0:0:1::/64` (a dummy
+//! prefix, not the whole `100::/64` discard-only block above it) and
+//! `5f00::/16` (SRv6 SIDs) are not globally reachable and join the blocked
+//! list.
+//!
 //! [`PublicOnlyResolver`] is a `reqwest::dns::Resolve` over a [`LookupHost`]
 //! seam: production resolves through `tokio::net::lookup_host`, and the
 //! module's own tests resolve through a canned [`LookupHost`], so `did.rs`'s
@@ -49,9 +63,19 @@ pub(super) fn is_public(ip: IpAddr) -> bool {
 }
 
 /// BC1, review round 1 defect AT: the IPv4 special-purpose ranges from the
-/// IANA registry, including `192.88.99.0/24` (6to4 relay anycast).
+/// IANA registry, including `192.88.99.0/24` (6to4 relay anycast). Review
+/// round 2, defect AV: `192.0.0.9/32` and `192.0.0.10/32` are the IANA
+/// registry's globally reachable exceptions inside the blocked
+/// `192.0.0.0/24`, checked ahead of the block list so they read as public.
 fn is_public_v4(ip: Ipv4Addr) -> bool {
     let bits = u32::from(ip);
+    const GLOBALLY_REACHABLE: [u32; 2] = [
+        0xc0000009, // 192.0.0.9/32
+        0xc000000a, // 192.0.0.10/32
+    ];
+    if GLOBALLY_REACHABLE.contains(&bits) {
+        return true;
+    }
     const RANGES: [(u32, u32); 15] = [
         (0x00000000, 8),  // 0.0.0.0/8
         (0x0a000000, 8),  // 10.0.0.0/8
@@ -92,6 +116,28 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         return is_public_v4(embedded);
     }
     let segments = ip.segments();
+    // 2001::/23 globally reachable exceptions (review round 2, defect AV),
+    // checked ahead of the 2001::/23 block below so they read as public:
+    // 2001:1::1/128, 2001:1::2/128 and 2001:1::3/128;
+    if segments[0] == 0x2001
+        && segments[1] == 0x0001
+        && segments[2..7] == [0, 0, 0, 0, 0]
+        && matches!(segments[7], 1..=3)
+    {
+        return true;
+    }
+    // 2001:3::/32;
+    if segments[0] == 0x2001 && segments[1] == 0x0003 {
+        return true;
+    }
+    // 2001:4:112::/48;
+    if segments[0] == 0x2001 && segments[1] == 0x0004 && segments[2] == 0x0112 {
+        return true;
+    }
+    // 2001:20::/28 and 2001:30::/28.
+    if segments[0] == 0x2001 && (segments[1] & 0xfff0 == 0x0020 || segments[1] & 0xfff0 == 0x0030) {
+        return true;
+    }
     // 64:ff9b:1::/48: local-use NAT64. Blocked whole, unlike `64:ff9b::/96`
     // above (`v4_in_v6`): review round 1, defect AT.
     if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
@@ -99,6 +145,15 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     }
     // 100::/64: discard-only (review round 1, defect AT).
     if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0 {
+        return false;
+    }
+    // 100:0:0:1::/64: dummy prefix, a separate /64 from 100::/64 above
+    // (review round 2, defect AW).
+    if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 1 {
+        return false;
+    }
+    // 5f00::/16: SRv6 SIDs (review round 2, defect AW).
+    if segments[0] == 0x5f00 {
         return false;
     }
     // fc00::/7: unique local.
@@ -122,8 +177,9 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         return false;
     }
     // 2001::/23: IETF protocol assignments (review round 1, defect AT),
-    // which holds `2001::/32` Teredo, `2001:2::/48`, `2001:10::/28` and
-    // `2001:20::/28` — the top 7 bits of the second segment are 0.
+    // which holds `2001::/32` Teredo, `2001:2::/48` and `2001:10::/28` —
+    // the top 7 bits of the second segment are 0. Not the whole /23: the
+    // IANA globally reachable exceptions above (defect AV) return early.
     if segments[0] == 0x2001 && segments[1] & 0xfe00 == 0 {
         return false;
     }
@@ -367,8 +423,14 @@ mod tests {
             "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", // 64:ff9b:1::/48, local-use NAT64 (defect AT)
             "100::",
             "100::ffff:ffff:ffff:ffff", // 100::/64, discard-only (defect AT)
+            "100:0:0:1::",
+            "100:0:0:1:ffff:ffff:ffff:ffff", // 100:0:0:1::/64, dummy prefix (defect AW)
+            "5f00::",
+            "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // 5f00::/16, SRv6 SIDs (defect AW)
             "3fff::",
             "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", // 3fff::/20 (defect AT)
+            "2001:2::",
+            "2001:10::", // inside 2001::/23, not one of its exceptions (defect AV)
         ];
         for addr in blocked_v6 {
             let ip: Ipv6Addr = addr.parse().unwrap();
@@ -409,7 +471,20 @@ mod tests {
             is_public(IpAddr::V6("ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
             "just before 100::/64"
         );
-        assert!(is_public(IpAddr::V6("100:0:0:1::".parse().unwrap())), "just past 100::/64");
+        assert!(
+            !is_public(IpAddr::V6("100:0:0:1::".parse().unwrap())),
+            "100:0:0:1::/64, a dummy prefix distinct from 100::/64 (defect AW)"
+        );
+        assert!(
+            !is_public(IpAddr::V6("100:0:0:1:ffff:ffff:ffff:ffff".parse().unwrap())),
+            "still inside 100:0:0:1::/64"
+        );
+        assert!(is_public(IpAddr::V6("100:0:0:2::".parse().unwrap())), "just past 100:0:0:1::/64");
+        assert!(
+            is_public(IpAddr::V6("5eff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
+            "just before 5f00::/16"
+        );
+        assert!(is_public(IpAddr::V6("5f01::".parse().unwrap())), "just past 5f00::/16");
         assert!(
             is_public(IpAddr::V6("3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
             "just before 3fff::/20"
@@ -418,6 +493,47 @@ mod tests {
         assert!(
             !is_public(IpAddr::V6("::ffff:169.254.169.254".parse().unwrap())),
             "mapped link-local (AWS metadata service)"
+        );
+
+        // Review round 2, defect AV: IANA globally reachable exceptions
+        // inside otherwise-blocked ranges.
+        assert!(is_public(IpAddr::V4("192.0.0.9".parse().unwrap())), "192.0.0.9/32 exception");
+        assert!(is_public(IpAddr::V4("192.0.0.10".parse().unwrap())), "192.0.0.10/32 exception");
+        assert!(!is_public(IpAddr::V4("192.0.0.8".parse().unwrap())), "just before 192.0.0.9/32");
+        assert!(!is_public(IpAddr::V4("192.0.0.11".parse().unwrap())), "just after 192.0.0.10/32");
+        assert!(is_public(IpAddr::V6("2001:1::1".parse().unwrap())), "2001:1::1/128 exception");
+        assert!(is_public(IpAddr::V6("2001:1::2".parse().unwrap())), "2001:1::2/128 exception");
+        assert!(is_public(IpAddr::V6("2001:1::3".parse().unwrap())), "2001:1::3/128 exception");
+        assert!(
+            !is_public(IpAddr::V6("2001:1::4".parse().unwrap())),
+            "just past 2001:1::3/128, still inside blocked 2001::/23"
+        );
+        assert!(is_public(IpAddr::V6("2001:3::".parse().unwrap())), "2001:3::/32 exception");
+        assert!(
+            is_public(IpAddr::V6("2001:3:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
+            "still inside 2001:3::/32 exception"
+        );
+        assert!(
+            is_public(IpAddr::V6("2001:4:112::".parse().unwrap())),
+            "2001:4:112::/48 exception"
+        );
+        assert!(
+            !is_public(IpAddr::V6("2001:4:111:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
+            "just before 2001:4:112::/48"
+        );
+        assert!(is_public(IpAddr::V6("2001:20::".parse().unwrap())), "2001:20::/28 exception");
+        assert!(
+            is_public(IpAddr::V6("2001:2f:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
+            "still inside 2001:20::/28 exception"
+        );
+        assert!(
+            !is_public(IpAddr::V6("2001:10::".parse().unwrap())),
+            "2001:10::/28, not an exception"
+        );
+        assert!(is_public(IpAddr::V6("2001:30::".parse().unwrap())), "2001:30::/28 exception");
+        assert!(
+            !is_public(IpAddr::V6("2001:40::".parse().unwrap())),
+            "just past 2001:30::/28, inside blocked 2001::/23"
         );
 
         // BC3: IPv6 carrying an IPv4 address, judged by the carried
