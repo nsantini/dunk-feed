@@ -485,4 +485,130 @@ mod tests {
             "the call counter is reset after a line (BC9)"
         );
     }
+
+    /// A `GraphSource` with no follows and no relationships, for
+    /// [`no_viewer_did_in_logs`] (AC4): that test cares what the logs say,
+    /// not what the circle contains, so the simplest source that lets a
+    /// first build and a refresh both complete is enough — the same role
+    /// `queue::tests::ManyFollowsSource` plays for `queue.rs`'s own tests.
+    struct EmptySource;
+
+    impl crate::graph::build::GraphSource for EmptySource {
+        async fn get_follows(
+            &self,
+            _actor: &str,
+            _limit: u32,
+            _cursor: Option<String>,
+        ) -> Result<crate::graph::build::FollowsPage, crate::appview::pds::PdsError> {
+            Ok(crate::graph::build::FollowsPage { dids: Vec::new(), cursor: None })
+        }
+
+        async fn get_relationships(
+            &self,
+            _actor: &str,
+            _others: &[String],
+        ) -> Result<Vec<String>, crate::appview::pds::PdsError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A `tracing_subscriber::fmt::MakeWriter` that appends every formatted
+    /// event to a shared buffer, so [`no_viewer_did_in_logs`] can search
+    /// everything logged for the test viewer's DID — the same pattern
+    /// `ingest::tests::CapturingWriter` (`src/ingest/mod.rs`) already uses.
+    #[derive(Clone)]
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("CapturingWriter mutex poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // AC4, BC11: a run of first build, refresh, eviction and one health
+    // line, captured at `trace` level, names the test viewer's DID nowhere.
+    #[tokio::test]
+    async fn no_viewer_did_in_logs() {
+        let test_did = "did:plc:privacytest0001";
+        let viewer = crate::auth::ViewerDid(test_did.to_string());
+        let handle = GraphHandle::new(10);
+        handle.enqueue_first_build(viewer.clone(), unix_now());
+
+        let snapshot = SnapshotHandle::new();
+        // Defect AE (`queue.rs`): step 2 waits at generation 0. Swap in an
+        // (empty, but real) pass first so step 2 does not stall.
+        snapshot.swap(Arc::new(Vec::new()), Arc::new(Vec::new()));
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(CapturingWriter(buf.clone()))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let worker_handle = Arc::clone(&handle);
+        tokio::spawn(crate::graph::queue::run_worker(
+            worker_handle,
+            crate::store::Store::open_memory().expect("open in-memory store"),
+            EmptySource,
+            100,
+            None,
+            snapshot.clone(),
+            10,
+            100,
+            24,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(circle) = handle.get(&viewer) {
+                    if circle.state == crate::graph::CircleState::Ready {
+                        return;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first build must reach ready within 5s");
+
+        // A refresh of the now-ready circle: pushed onto the same worker's
+        // queue, drained by the same loop that just finished the first
+        // build. A generous sleep, the same margin `counters_reset` above
+        // gives its own hourly task, stands in for a completion signal the
+        // refresh path has no other way to expose to a test.
+        handle.queue().push(crate::graph::queue::Job::Refresh(viewer.clone()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        handle.evict(&viewer, EvictReason::Idle);
+
+        let calls = FakeCallCounts::default();
+        calls
+            .counts
+            .lock()
+            .expect("FakeCallCounts mutex poisoned")
+            .insert("app.bsky.graph.getFollows", 1);
+        emit_health_line(&handle, &calls, &snapshot, 10, 7);
+
+        drop(dispatch);
+        let output = String::from_utf8(buf.lock().expect("CapturingWriter mutex poisoned").clone())
+            .expect("captured log output must be valid UTF-8");
+
+        assert!(!output.contains(test_did), "no line may name the viewer DID (BC11): {output}");
+    }
 }
