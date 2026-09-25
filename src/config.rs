@@ -117,6 +117,16 @@ pub struct Config {
     /// as `author_ttl_h`: a `FollowsCache::is_fresh` boundary of zero would
     /// treat every entry as stale.
     pub d2_refresh_age_h: u32,
+    /// Hours a `Ready` circle goes with no refresh before the scheduler
+    /// (`graph::schedule`, network-feed story 09) queues a `Refresh` job for
+    /// it, when the viewer has sent a request since the last refresh
+    /// (`UPSTAGE_GRAPH_REFRESH_AGE_H`, story 09 spec.md BC2, BC17, BC17a).
+    /// `0` is rejected, the same rule as `d2_refresh_age_h`.
+    pub graph_refresh_age_h: u32,
+    /// Days a circle can go with no request before the scheduler evicts it
+    /// (`UPSTAGE_GRAPH_IDLE_EVICT_D`, story 09 spec.md BC9, BC18, BC18a).
+    /// `0` is rejected, the same rule as `graph_refresh_age_h`.
+    pub graph_idle_evict_d: u32,
     /// `UPSTAGE_PERSONALISE` (network-feed story 05, BC22): `false` by
     /// default (story 05's `## Non-goals`; story 11 flips the default).
     /// `getFeedSkeleton` (`src/http/skeleton.rs`) reads `Authorization` and
@@ -611,6 +621,8 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         d2_follows_sample: positive_u32_or_default(&lookup, "UPSTAGE_D2_FOLLOWS_SAMPLE", 100)?,
         d2_follows_depth: positive_u32_or_default(&lookup, "UPSTAGE_D2_FOLLOWS_DEPTH", 100)?,
         d2_refresh_age_h: positive_u32_or_default(&lookup, "UPSTAGE_D2_REFRESH_AGE_H", 24)?,
+        graph_refresh_age_h: positive_u32_or_default(&lookup, "UPSTAGE_GRAPH_REFRESH_AGE_H", 6)?,
+        graph_idle_evict_d: positive_u32_or_default(&lookup, "UPSTAGE_GRAPH_IDLE_EVICT_D", 7)?,
         personalise,
         service_did,
         plc_url,
@@ -1212,6 +1224,44 @@ mod tests {
         let err = load(env(&pairs)).unwrap_err();
         match err {
             ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_FOLLOWS_ME_DEPTH"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_refresh_defaults() {
+        // Story 09 spec.md BC17, BC18: default to 6 and 7 when unset.
+        let config = load(env(&required_pair())).unwrap();
+        assert_eq!(config.graph_refresh_age_h, 6);
+        assert_eq!(config.graph_idle_evict_d, 7);
+    }
+
+    #[test]
+    fn zero_graph_refresh_age_h_is_invalid() {
+        // Story 09 spec.md BC17a.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_GRAPH_REFRESH_AGE_H", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "UPSTAGE_GRAPH_REFRESH_AGE_H");
+                assert_eq!(reason, "must be greater than zero");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_graph_idle_evict_d_is_invalid() {
+        // Story 09 spec.md BC18a.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_GRAPH_IDLE_EVICT_D", "0"));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, reason, .. } => {
+                assert_eq!(name, "UPSTAGE_GRAPH_IDLE_EVICT_D");
+                assert_eq!(reason, "must be greater than zero");
+            }
             other => panic!("expected Invalid, got {other:?}"),
         }
     }

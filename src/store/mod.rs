@@ -548,12 +548,52 @@ impl Store {
         viewers::viewer_set_state_if_exists(&conn, viewer_did, state)
     }
 
+    /// Saves a refresh's result: the `viewers` row's `state`, `d1_refreshed_at`
+    /// and `d2_sample`, plus a full replace of `viewer_follows` and
+    /// `viewer_checks`, in one transaction (story 09 spec.md BC5).
+    /// `last_request_at` is left untouched (review round 1, defect AL).
+    /// Never creates a `viewers` row (BC6a); returns whether a row was
+    /// actually updated, so `graph::queue::run_refresh` knows whether to
+    /// swap the new circle into memory (review round 1, defect AM).
+    #[allow(clippy::too_many_arguments)]
+    pub fn viewer_replace_circle(
+        &self,
+        viewer_did: &str,
+        state: &str,
+        now: i64,
+        d1_refreshed_at: i64,
+        d2_sample: &[String],
+        follows: &std::collections::HashSet<u64>,
+        checked: &std::collections::HashSet<u64>,
+        follows_me: &std::collections::HashSet<u64>,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        viewers::viewer_replace_circle(
+            &conn,
+            viewer_did,
+            state,
+            now,
+            d1_refreshed_at,
+            d2_sample,
+            follows,
+            checked,
+            follows_me,
+        )
+    }
+
     /// Deletes a viewer's `viewers`, `viewer_follows` and `viewer_checks`
     /// rows. No caller until story 09's eviction.
     #[allow(dead_code)]
     pub fn viewer_delete(&self, viewer_did: &str) -> Result<(), StoreError> {
         let conn = self.lock()?;
         viewers::viewer_delete(&conn, viewer_did)
+    }
+
+    /// Every `viewer_did` idle at or before `cutoff` (story 09 spec.md BC9a).
+    /// `graph::schedule`'s idle rule is the first caller.
+    pub fn viewers_idle_since(&self, cutoff: i64) -> Result<Vec<String>, StoreError> {
+        let conn = self.read_lock()?;
+        viewers::viewers_idle_since(&conn, cutoff)
     }
 
     /// Saves step 2's result: `state` and a full replace of `viewer_checks`,
@@ -607,6 +647,18 @@ impl Store {
     ) -> Result<(), StoreError> {
         let conn = self.lock()?;
         follows_cache::follows_put(&conn, account_did, fetched_at, follows)
+    }
+
+    /// Deletes every `follows_cache` row older than `cutoff` and not named
+    /// in `keep` (story 09 spec.md BC8, BC8a). `graph::schedule`'s clean-up
+    /// pass is the first caller.
+    pub fn follows_delete_older_than(
+        &self,
+        cutoff: i64,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        follows_cache::follows_delete_older_than(&conn, cutoff, keep)
     }
 
     /// Starts the one writer thread with `WriterConfig::default()`

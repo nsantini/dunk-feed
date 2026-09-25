@@ -814,8 +814,9 @@ async fn wait_for_shutdown_signal() {
 }
 
 /// Starts the graph subsystem — a second `Store` connection, the
-/// `GraphHandle` loaded from it (BC19), the worker task and the touch-flush
-/// task (network-feed story 06) — when `cfg.bsky_handle` and
+/// `GraphHandle` loaded from it (BC19), the worker task and the scheduler
+/// task (network-feed story 06; the scheduler replaces story 06's own
+/// touch-flush task, story 09 BC15) — when `cfg.bsky_handle` and
 /// `cfg.bsky_app_password` are both set. Returns the loaded `GraphHandle`
 /// (slice 4.0: `run` attaches it to `AppState::graph`, BC4) alongside the
 /// hook `run` wires into the resolver so a verified viewer with no circle
@@ -830,7 +831,10 @@ async fn wait_for_shutdown_signal() {
 /// `cfg.follows_me_depth`; both pass straight through to
 /// `graph::run_worker`, along with `cfg.d2_follows_depth` and
 /// `cfg.d2_refresh_age_h` (network-feed story 08), step 3's per-account
-/// fetch depth and freshness window.
+/// fetch depth and freshness window. The scheduler task shares that same
+/// `cfg.d2_refresh_age_h` for its own refill and clean-up rules, plus
+/// `cfg.graph_refresh_age_h` and `cfg.graph_idle_evict_d` (story 09 BC2,
+/// BC9).
 fn start_graph_subsystem(
     cfg: &Config,
     viewer_lists: std::sync::Arc<crate::http::viewer::ViewerLists>,
@@ -883,6 +887,10 @@ fn start_graph_subsystem(
             viewer_lists.drop_viewer(&crate::auth::ViewerDid(viewer_did.to_string()));
         })
     };
+    // Story 09 spec.md BC11a: `GraphHandle::evict` (idle or LRU) has no
+    // `Store` or drop-lists callback of its own to reach for — it shares
+    // this same one, registered once here right after both exist.
+    graph_handle.set_drop_lists(std::sync::Arc::clone(&drop_lists));
 
     let worker_handle = std::sync::Arc::clone(&graph_handle);
     let worker_store = graph_store.clone();
@@ -902,9 +910,20 @@ fn start_graph_subsystem(
         d2_refresh_age_h,
     ));
 
-    let flush_handle = std::sync::Arc::clone(&graph_handle);
-    let flush_store = graph_store.clone();
-    tokio::spawn(crate::graph::run_touch_flush(flush_handle, flush_store));
+    // Story 09: the scheduler's flush step replaces the old touch-flush
+    // task, folded into the same pass as idle eviction, refresh and refill
+    // queueing, and follows-cache clean-up (BC15).
+    let scheduler_handle = std::sync::Arc::clone(&graph_handle);
+    let scheduler_store = graph_store.clone();
+    let graph_refresh_age_h = cfg.graph_refresh_age_h;
+    let graph_idle_evict_d = cfg.graph_idle_evict_d;
+    tokio::spawn(crate::graph::run_scheduler(
+        scheduler_handle,
+        scheduler_store,
+        graph_refresh_age_h,
+        graph_idle_evict_d,
+        d2_refresh_age_h,
+    ));
 
     let hook_handle = std::sync::Arc::clone(&graph_handle);
     let hook: crate::auth::FirstBuildHook =

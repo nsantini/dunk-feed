@@ -295,6 +295,90 @@ pub fn viewer_touch(
     Ok(())
 }
 
+/// Saves a refresh's result in one transaction (story 09 spec.md BC5): the
+/// `viewers` row's `state`, `d1_refreshed_at` and `d2_sample`, plus a full
+/// replace of `viewer_follows` and `viewer_checks` for `viewer_did`.
+/// `last_request_at` is left untouched (review round 1, defect AL): a
+/// refresh must never reset the idle and LRU clocks a request already
+/// advanced, and `graph::queue::run_refresh` no longer has a value to pass
+/// for it either. Unlike `viewer_save_circle`, this never creates a
+/// `viewers` row: a plain `UPDATE`, the same rule `viewer_set_state_if_exists`
+/// applies (review round 2, defect AI) — a refresh always runs against a
+/// viewer that already exists, and a row missing here can only mean it was
+/// deleted (eviction, story 09) while the refresh ran (BC6a), in which case
+/// this saves nothing and the transaction commits as a no-op rather than
+/// recreating the row or its follows/checks. Returns whether a row was
+/// actually updated (review round 1, defect AM): `false` tells
+/// `graph::queue::run_refresh` the row was gone, so it must swap nothing
+/// into memory either, rather than assuming the save always lands just
+/// because it returned `Ok`.
+#[allow(clippy::too_many_arguments)]
+pub fn viewer_replace_circle(
+    conn: &Connection,
+    viewer_did: &str,
+    state: &str,
+    now: i64,
+    d1_refreshed_at: i64,
+    d2_sample: &[String],
+    follows: &HashSet<u64>,
+    checked: &HashSet<u64>,
+    follows_me: &HashSet<u64>,
+) -> Result<bool, StoreError> {
+    let d2_sample_json = encode_d2_sample(d2_sample)?;
+    let tx = conn.unchecked_transaction()?;
+    let updated = tx.execute(
+        "UPDATE viewers SET d1_refreshed_at = ?2, state = ?3, d2_sample = ?4
+         WHERE viewer_did = ?1",
+        rusqlite::params![viewer_did, d1_refreshed_at, state, d2_sample_json],
+    )?;
+    if updated == 0 {
+        // BC6a: the row is gone (e.g. an eviction raced this refresh).
+        // Nothing to replace, and no row is created.
+        tx.commit()?;
+        return Ok(false);
+    }
+    tx.execute("DELETE FROM viewer_follows WHERE viewer_did = ?1", [viewer_did])?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO viewer_follows (viewer_did, subject_hash) VALUES (?1, ?2)",
+        )?;
+        for hash in follows {
+            stmt.execute(rusqlite::params![viewer_did, hash_as_i64(*hash)])?;
+        }
+    }
+    tx.execute("DELETE FROM viewer_checks WHERE viewer_did = ?1", [viewer_did])?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO viewer_checks (viewer_did, author_hash, follows_me, checked_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for hash in checked {
+            let follows_me_flag = i64::from(follows_me.contains(hash));
+            stmt.execute(rusqlite::params![viewer_did, hash_as_i64(*hash), follows_me_flag, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Every `viewer_did` whose `viewers.last_request_at` is at or before
+/// `cutoff` (story 09 spec.md BC9a): `graph::schedule`'s idle rule reads this
+/// to catch a SQLite row with no circle in memory — for example one a job
+/// saved in the BC6a race window right after an eviction — that
+/// `GraphHandle`'s own in-memory idle check can never see. The caller passes
+/// `cutoff = now - idle_evict_d * 86_400` so "at or before" reads the same
+/// "at least `idle_evict_d` days old" rule the effective-`last_request_at`
+/// idle check applies to circles still in memory.
+pub fn viewers_idle_since(conn: &Connection, cutoff: i64) -> Result<Vec<String>, StoreError> {
+    let mut stmt = conn.prepare("SELECT viewer_did FROM viewers WHERE last_request_at <= ?1")?;
+    let mut rows = stmt.query([cutoff])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
 /// Deletes a viewer's `viewers`, `viewer_follows` and `viewer_checks` rows
 /// in one transaction. Spec.md's Non-goals: no caller exists yet in this
 /// story — refresh and eviction (story 09) are the first — so this is
@@ -544,6 +628,110 @@ mod tests {
         for hash in [0_u64, 1, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
             assert_eq!(i64_as_hash(hash_as_i64(hash)), hash);
         }
+    }
+
+    // Story 09 spec.md BC5: `viewer_replace_circle` fully replaces the
+    // viewers row's refresh fields plus `viewer_follows` and `viewer_checks`
+    // in one call, and reports that it updated a row.
+    #[test]
+    fn viewer_replace_circle_round_trips() {
+        let conn = migrated_conn();
+        viewer_save_circle(&conn, "did:plc:a", "ready", 1, 1, &[], &HashSet::new()).unwrap();
+
+        let follows: HashSet<u64> = [10_u64, 20].into_iter().collect();
+        let checked: HashSet<u64> = [30_u64].into_iter().collect();
+        let follows_me: HashSet<u64> = [30_u64].into_iter().collect();
+        let d2_sample = vec!["did:plc:x".to_string()];
+
+        let updated = viewer_replace_circle(
+            &conn,
+            "did:plc:a",
+            "ready",
+            2,
+            2,
+            &d2_sample,
+            &follows,
+            &checked,
+            &follows_me,
+        )
+        .unwrap();
+
+        assert!(updated, "a row existed to update");
+        let rows = viewer_load_all(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].follows, follows);
+        assert_eq!(rows[0].checked, checked);
+        assert_eq!(rows[0].follows_me, follows_me);
+        assert_eq!(rows[0].d2_sample, d2_sample);
+        assert_eq!(rows[0].d1_refreshed_at, Some(2));
+    }
+
+    // Review round 1, defect AL: `viewer_replace_circle` leaves
+    // `last_request_at` exactly as it was, even though `now` (2) differs
+    // from the row's existing value (1) — a refresh must never reset the
+    // idle and LRU clocks a request already advanced.
+    #[test]
+    fn viewer_replace_circle_keeps_last_request_at() {
+        let conn = migrated_conn();
+        viewer_save_circle(&conn, "did:plc:a", "ready", 1, 1, &[], &HashSet::new()).unwrap();
+
+        viewer_replace_circle(
+            &conn,
+            "did:plc:a",
+            "ready",
+            2,
+            2,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let rows = viewer_load_all(&conn).unwrap();
+        assert_eq!(rows[0].last_request_at, 1, "last_request_at is untouched by a refresh");
+    }
+
+    // Story 09 spec.md BC6a: a missing viewers row (an eviction raced the
+    // refresh) creates nothing and reports no row was updated (review round
+    // 1, defect AM).
+    #[test]
+    fn viewer_replace_circle_of_a_missing_viewer_creates_no_row() {
+        let conn = migrated_conn();
+        let follows: HashSet<u64> = [1_u64].into_iter().collect();
+        let updated = viewer_replace_circle(
+            &conn,
+            "did:plc:missing",
+            "ready",
+            1,
+            1,
+            &[],
+            &follows,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(!updated, "no row existed to update");
+        assert_eq!(viewer_load_all(&conn).unwrap(), Vec::new());
+    }
+
+    // Story 09 spec.md BC9a: a row at or before the cutoff is idle; one
+    // strictly after it is not.
+    #[test]
+    fn viewers_idle_since_returns_rows_at_or_before_the_cutoff() {
+        let conn = migrated_conn();
+        viewer_save_state(&conn, "did:plc:idle", "ready", 1_000).unwrap();
+        viewer_save_state(&conn, "did:plc:fresh", "ready", 1_001).unwrap();
+
+        let idle = viewers_idle_since(&conn, 1_000).unwrap();
+
+        assert_eq!(idle, vec!["did:plc:idle".to_string()]);
+    }
+
+    #[test]
+    fn viewers_idle_since_of_an_empty_store_is_empty() {
+        let conn = migrated_conn();
+        assert_eq!(viewers_idle_since(&conn, 1_000).unwrap(), Vec::<String>::new());
     }
 
     // Review round 1, defect Y: a malformed `d2_sample` must not fail the
