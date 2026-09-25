@@ -74,9 +74,12 @@ URI and refuses every other.
    setup" below for how to pick it. `UPSTAGE_PUBLISHER_DID` comes from
    "Bluesky account setup" above.
 
-   Three more variables have no default but are optional: `BSKY_HANDLE`
-   and `BSKY_APP_PASSWORD`, needed only when you run `upstage publish`, and
-   `TUNNEL_TOKEN`, needed only for the tunnel variant.
+   `BSKY_HANDLE` and `BSKY_APP_PASSWORD` are always required for `upstage
+   publish`. `UPSTAGE_PERSONALISE` defaults to `true` (see "The network
+   feed and the kill switch" below), and with the default in place `upstage
+   run` also refuses to start when either one is missing or blank. Fill in
+   both from "Bluesky account setup" above before the first `up -d`.
+   `TUNNEL_TOKEN` has no default and is needed only for the tunnel variant.
 3. Pick one Compose file:
 
    | File | Use it when |
@@ -135,6 +138,82 @@ docker compose -f <file> run --rm -v /home/you/avatar.png:/avatar.png:ro upstage
 ```
 
 Pass the container path, `/avatar.png`, not the host path.
+
+## The network feed and the kill switch
+
+`UPSTAGE_PERSONALISE` defaults to `true`. A viewer who sends a valid
+service JWT gets a feed built from their own follow graph; every other
+request, and the whole feed when the switch is `false`, gets the plain
+global feed from `01`.
+
+With the switch `true`, `upstage run` reads `BSKY_HANDLE` and
+`BSKY_APP_PASSWORD` before it opens the database or makes any network
+call. A missing or blank value exits 1 with a message naming that
+variable, and Docker's restart policy retries forever until you fix
+`.env`. Set both from "Bluesky account setup" above.
+
+These variables tune the network feed. Each lives in `.env`, with the
+same "restart to apply" rule as the `01` variables above.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `UPSTAGE_SERVICE_DID` | `did:web:<UPSTAGE_HOSTNAME>` | The `aud` a viewer's service JWT must name |
+| `UPSTAGE_PLC_URL` | `https://plc.directory` | Base URL the `did:plc` resolver fetches a document from |
+| `UPSTAGE_MAX_VIEWERS` | `1000` | Cap on stored circles. The oldest `last_request_at` is evicted first past this cap |
+| `UPSTAGE_GRAPH_REFRESH_AGE_H` | `6` | Hours a Ready circle goes with no refresh before the scheduler queues one, while the viewer keeps requesting |
+| `UPSTAGE_GRAPH_IDLE_EVICT_D` | `7` | Days a circle can go with no request before the scheduler evicts it |
+| `UPSTAGE_FOLLOWS_ME_DEPTH` | `1000` | Ranked items the "follows me" check covers |
+| `UPSTAGE_D2_FOLLOWS_SAMPLE` | `100` | Viewer's most recent follows that degree-2 discovery samples |
+| `UPSTAGE_D2_FOLLOWS_DEPTH` | `100` | Each sampled account's most recent follows that degree-2 discovery reads |
+| `UPSTAGE_D2_REFRESH_AGE_H` | `24` | Hours a shared follows-list cache entry stays fresh |
+| `UPSTAGE_GRAPH_RPS` | `8.0` | Graph client (PDS) rate limit, requests per second |
+| `UPSTAGE_PDS_URL` | `https://bsky.social` | PDS the session and every graph call go against |
+| `UPSTAGE_RESOLVER_MISSES_PER_MIN` | `30` | Global cap on `did` resolver `Miss` fetches sent in one wall-clock minute. Past the cap, a resolve fails closed and the request gets the global feed |
+| `UPSTAGE_GRAPH_LRU_EVICT_PER_MIN` | `1` | Most LRU circle evictions in one wall-clock minute. Past the cap, a first build that would need one more eviction is refused instead |
+| `UPSTAGE_GRAPH_LRU_PROTECT_MIN` | `60` | Minutes since a circle's last request that make it immune to LRU eviction. `0` disables the protection |
+
+### Kill switch procedure (rollback)
+
+Use this to fall back to the plain global feed without a deploy or a
+code revert. It also clears an incident where the graph subsystem itself
+is the problem: the resolver, the worker, the scheduler and the metrics
+loop all stop, and no viewer JWT is read.
+
+1. Set `UPSTAGE_PERSONALISE=false` in `.env`.
+2. Restart: `docker compose -f <file> up -d`.
+3. Confirm the fallback with a request to the feed:
+
+   ```
+   curl -si "$SKEL&limit=30"
+   ```
+
+   Expected: `Cache-Control: public, max-age=30` in the response headers.
+   That header, and not `private, no-store`, is the global feed.
+
+The `viewers`, `viewer_follows`, `viewer_checks` and `follows_cache`
+tables in SQLite are untouched by the switch. Turning the switch back to
+`true` and restarting picks the circles back up; nothing needs
+rebuilding from scratch unless a circle went idle past
+`UPSTAGE_GRAPH_IDLE_EVICT_D` in the meantime.
+
+### `upstage graph-probe`
+
+An operator-run, read-only command, separate from `run`. It logs in with
+`BSKY_HANDLE`, reads the current `feed` rows from SQLite, and runs one
+first-build pass in memory for each handle you pass, without starting the
+worker or writing anything to SQLite. Run it to size `UPSTAGE_MAX_VIEWERS`
+and the call budget before raising traffic, or to sanity-check the graph
+build's cost against a real account:
+
+```
+docker compose -f <file> run --rm upstage graph-probe --handle <h1> --handle <h2>
+```
+
+It prints, for each handle, the call, page and time cost of each build
+step, the circle size, the overlap against the other handles you passed,
+and the discovery share from degree-2 accounts. It exits 1 before any
+network call if `BSKY_HANDLE` or `BSKY_APP_PASSWORD` is missing or blank,
+or if you pass no `--handle`.
 
 ## Reading the logs
 
@@ -210,6 +289,52 @@ floor itself still drops candidates from the first pass onward, with or
 without this line. Fields: `guard_would_drop`, and six follower-count
 buckets: `zero`, `one_to_99`, `hundred_to_999`, `thousand_to_9999`,
 `ten_k_to_99999`, `hundred_k_plus`.
+
+### `graph.health`
+
+Logged once an hour by the graph metrics loop, only while
+`UPSTAGE_PERSONALISE` is `true`. Fields:
+
+| Field | Meaning |
+|-------|---------|
+| `active_viewers` | Viewers with a stored circle right now |
+| `median_new_pairs_24h` | Median, across active viewers, of pairs each one's list gained in the last 24 hours |
+| `zero_share` | Share of active viewers whose `new_pairs_24h` is `0` |
+| `median_discovery_share` | Median, across viewers with at least one item, of the share of their items found only through a degree-2 account |
+| `evicted_1h` | `{"idle": <n>, "lru": <n>}`, circles evicted in the last hour by each reason |
+| `graph_calls_1h` | Graph client calls in the last hour, by App View method name |
+| `queue_depth` | `{"first_build": <n>, "refresh": <n>, "refill": <n>}`, jobs waiting in each queue right now |
+
+### `graph.evicted`
+
+Logged once for each circle the scheduler or a first build removes from
+memory and SQLite. One `info` line, fields `event` and `reason`. No DID,
+no handle. `reason` is `idle` (no request for `UPSTAGE_GRAPH_IDLE_EVICT_D`
+days) or `lru` (the store passed `UPSTAGE_MAX_VIEWERS` and this circle had
+the oldest `last_request_at`).
+
+### `auth.miss_limited`
+
+Logged at most once a minute, `warn` level, one JSON line, `event:
+"auth.miss_limited"`, no DID. Fires on the first `did:plc` or `did:web`
+resolver miss refused after `UPSTAGE_RESOLVER_MISSES_PER_MIN` fetches have
+already gone out in the current wall-clock minute. A refused resolve
+fails closed: that request gets the global feed, not an error. Frequent
+lines mean either real traffic growth or an attacker sending many unknown
+DIDs; raise the budget only after you have ruled out the second.
+
+### `graph.lru_refused`
+
+Logged at most once a minute, `info` level, one JSON line, `event:
+"graph.lru_refused"`, `reason` field, no DID, no handle, no hash. Fires
+when a first build needs an LRU eviction to make room and the eviction is
+refused. `reason` is `protected` (every evictable circle was inside
+`UPSTAGE_GRAPH_LRU_PROTECT_MIN`) or `budget`
+(`UPSTAGE_GRAPH_LRU_EVICT_PER_MIN` evictions already happened this
+minute). No circle is built for that viewer this request, so they get the
+empty personalised page (`{"feed":[]}`, `Cache-Control: private,
+no-store`), not the global feed; the graph subsystem itself keeps
+running, and their next request tries again.
 
 ## Backup
 

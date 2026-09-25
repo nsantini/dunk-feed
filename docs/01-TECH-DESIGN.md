@@ -414,6 +414,11 @@ record view.
 A URI missing from the `getPosts` response means the post is gone or the author
 is deactivated. Drop with `quote_gone` or `original_gone`.
 
+`docs/02-TECH-DESIGN-network-feed.md` section 7 covers the graph client's own
+App View calls (`getFollows`, `getRelationships`) and their call budget.
+Those calls are separate from the ones in this section and do not change
+them.
+
 ### 8.3 Drop reasons
 
 `self_quote`, `not_a_post`, `quote_gone`, `original_gone`, `detached`,
@@ -517,6 +522,12 @@ forwards to the VM. `UPSTAGE_HOSTNAME` is the Cloudflare hostname.
 
 Budget: a request is one `Arc` clone, at most one scan of 100k items, one
 serialisation. Well under 5 ms.
+
+`docs/02-TECH-DESIGN-network-feed.md` sections 9 and 10 cover the
+personalised path this section does not: the viewer's circle, the
+personalised cursor, the `Cache-Control: private, no-store` response, and
+the `UPSTAGE_PERSONALISE=false` kill switch that falls back to the plain
+`getFeedSkeleton` behaviour described above.
 
 ### 11.2 Publishing, `upstage publish`
 
