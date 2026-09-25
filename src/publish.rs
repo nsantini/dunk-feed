@@ -94,36 +94,24 @@ pub struct Avatar {
     pub content_type: &'static str,
 }
 
-/// Reads `BSKY_HANDLE` and `BSKY_APP_PASSWORD` off `cfg`, then `avatar_path`
-/// off disk, before any `reqwest::Client` is built. `BSKY_HANDLE` or
-/// `BSKY_APP_PASSWORD` missing, or empty once trimmed, fails first
-/// (`MissingCredentials`, BC1). The trim here is the only guard:
-/// `config::required` trims, but `config::optional` is a bare `lookup(name)`
-/// and both `BSKY_*` variables come through `optional`, so
-/// `BSKY_APP_PASSWORD="   "` reaches this function as `Some("   ")` (BC18).
-/// A given `--avatar` path that does not exist fails with `AvatarNotFound`
-/// (BC2); an extension other than `png`, `jpg` or `jpeg`, compared
-/// lowercased, fails with `AvatarType` (BC4); a file that exists but cannot
-/// be read fails with `AvatarRead`, carrying the OS error (BC19). No
-/// `--avatar` at all returns `Ok((credentials, None))` and reads no file
-/// (BC3).
+/// Reads `BSKY_HANDLE` and `BSKY_APP_PASSWORD` off `cfg` through
+/// [`Config::bsky_credentials`], then `avatar_path` off disk, before any
+/// `reqwest::Client` is built. `BSKY_HANDLE` or `BSKY_APP_PASSWORD` missing,
+/// or empty once trimmed, fails first (`MissingCredentials`, BC1): the trim
+/// rule itself lives in `Config::bsky_credentials`, shared with
+/// `ingest::run` (story 11 Approach), so `BSKY_APP_PASSWORD="   "` is
+/// rejected the same way here as there (BC18). A given `--avatar` path that
+/// does not exist fails with `AvatarNotFound` (BC2); an extension other
+/// than `png`, `jpg` or `jpeg`, compared lowercased, fails with
+/// `AvatarType` (BC4); a file that exists but cannot be read fails with
+/// `AvatarRead`, carrying the OS error (BC19). No `--avatar` at all returns
+/// `Ok((credentials, None))` and reads no file (BC3).
 pub fn preflight(
     cfg: &Config,
     avatar_path: Option<&Path>,
 ) -> Result<(Credentials, Option<Avatar>), PublishError> {
-    let handle = cfg
-        .bsky_handle
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .ok_or(PublishError::MissingCredentials { var: "BSKY_HANDLE" })?;
-    let app_password = cfg
-        .bsky_app_password
-        .as_ref()
-        .filter(|value| !value.expose().trim().is_empty())
-        .cloned()
-        .ok_or(PublishError::MissingCredentials { var: "BSKY_APP_PASSWORD" })?;
-    let credentials = Credentials { handle, app_password };
+    let credentials =
+        cfg.bsky_credentials().map_err(|var| PublishError::MissingCredentials { var })?;
 
     let avatar = match avatar_path {
         None => None,

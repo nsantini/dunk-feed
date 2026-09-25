@@ -231,12 +231,18 @@ mod tests {
     /// A minimal, valid `Config`, built through `config::load` over a fixed
     /// map so every field stays in sync with `config.rs`'s own defaults and
     /// validation, rather than a hand-built struct literal drifting out of
-    /// date.
+    /// date. `UPSTAGE_PERSONALISE` is set explicitly to `false` (story 11
+    /// launch flips `config::load`'s own default to `true`): every caller
+    /// of this helper predates that story and was written against the
+    /// switch-off, global-feed behaviour, so this keeps them all green
+    /// without touching each call site. A test that needs the switch on
+    /// uses its own config, like `skeleton::tests::test_config_personalised`.
     pub(crate) fn test_config(http_addr: &str) -> Config {
         let mut pairs: HashMap<String, String> = HashMap::new();
         pairs.insert("UPSTAGE_HOSTNAME".to_string(), "feed.example.com".to_string());
         pairs.insert("UPSTAGE_PUBLISHER_DID".to_string(), "did:plc:abc".to_string());
         pairs.insert("UPSTAGE_HTTP_ADDR".to_string(), http_addr.to_string());
+        pairs.insert("UPSTAGE_PERSONALISE".to_string(), "false".to_string());
         crate::config::load(move |name| pairs.get(name).cloned())
             .expect("test config must be valid")
     }
