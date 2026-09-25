@@ -20,11 +20,13 @@ pub mod build;
 pub mod cache;
 pub mod circle;
 pub mod filter;
+pub mod metrics;
 mod schedule;
 
 pub use cache::FollowsCache;
 pub use circle::Circle;
-pub use queue::{run_worker, DropListsFn, Job, JobQueue};
+#[allow(unused_imports)] // QueueDepth: no production reader yet, slice 2.0 is the first.
+pub use queue::{run_worker, DropListsFn, Job, JobQueue, QueueDepth};
 pub use schedule::run_scheduler;
 
 /// A DID's `xxh3_64` hash, kept in place of the DID string wherever a
@@ -177,6 +179,11 @@ pub struct GraphHandle {
     /// `None` until registered — every test handle that never calls
     /// [`Self::set_drop_lists`] just evicts with no list to drop.
     drop_lists: Mutex<Option<DropListsFn>>,
+    /// Evictions in the last hour, by [`EvictReason`] (story 10 spec.md BC6):
+    /// [`Self::evict_locked`] is this counter's one writer.
+    /// [`Self::evict_counts`] is the hourly metrics task's reader (slice
+    /// 2.0).
+    evictions: Arc<metrics::EvictCounters>,
 }
 
 impl GraphHandle {
@@ -208,7 +215,15 @@ impl GraphHandle {
             follows_cache: Arc::new(FollowsCache::new()),
             store,
             drop_lists: Mutex::new(None),
+            evictions: Arc::new(metrics::EvictCounters::new()),
         })
+    }
+
+    /// The evictions counted since the last call to this method, by
+    /// [`EvictReason`], reset by reading them (story 10 spec.md BC6, BC9).
+    /// `graph::metrics`'s hourly task is this method's caller.
+    pub fn evict_counts(&self) -> (u64, u64) {
+        self.evictions.take()
     }
 
     /// Registers the callback `src/ingest/mod.rs`'s `start_graph_subsystem`
@@ -302,9 +317,8 @@ impl GraphHandle {
     /// The current circle for `viewer`, if one has been created — `None`
     /// for a viewer never seen before (BC4: the handler enqueues a first
     /// build in that case). Reads the lock without an await (spec
-    /// `## Approach`). No production caller yet: `src/http/viewer.rs`
-    /// (slice 3.0) is the first.
-    #[allow(dead_code)]
+    /// `## Approach`). `graph::metrics`'s hourly task (story 10) is a
+    /// caller; `src/http/skeleton.rs` (slice 4.0) is the request path's own.
     pub fn get(&self, viewer: &ViewerDid) -> Option<Arc<Circle>> {
         self.state.read().expect("GraphHandle state lock poisoned").circles.get(viewer).cloned()
     }
@@ -397,6 +411,7 @@ impl GraphHandle {
     /// holds the write lock when it needs to evict, and `RwLock` is not
     /// reentrant.
     fn evict_locked(&self, state: &mut GraphState, viewer: &ViewerDid, reason: EvictReason) {
+        self.evictions.record(reason);
         state.circles.remove(viewer);
         self.touches.lock().expect("GraphHandle touches mutex poisoned").remove(viewer);
         self.queue.forget(viewer);
@@ -549,6 +564,26 @@ impl GraphHandle {
             .iter()
             .filter(|(viewer, circle)| {
                 now - self.effective_last_request_at(viewer, circle) >= cutoff_secs
+            })
+            .map(|(viewer, _)| viewer.clone())
+            .collect()
+    }
+
+    /// Every viewer whose circle has had a request in the last
+    /// `idle_evict_d` days (story 10 spec.md BC2): the effective
+    /// `last_request_at` (BC16) is less than `idle_evict_d` days behind
+    /// `now` — the complement of [`Self::idle_due`]'s `>=` cutoff, so a
+    /// circle is always exactly one of "active" or "idle due", never both
+    /// and never neither. `graph::metrics`'s hourly task reads this to know
+    /// which viewers' current lists to read for the health line.
+    pub(crate) fn active_viewers(&self, now: i64, idle_evict_d: u32) -> Vec<ViewerDid> {
+        let cutoff_secs = i64::from(idle_evict_d) * 86_400;
+        let state = self.state.read().expect("GraphHandle state lock poisoned");
+        state
+            .circles
+            .iter()
+            .filter(|(viewer, circle)| {
+                now - self.effective_last_request_at(viewer, circle) < cutoff_secs
             })
             .map(|(viewer, _)| viewer.clone())
             .collect()
@@ -1004,6 +1039,41 @@ mod tests {
             !remaining.contains(&"did:plc:orphan-row".to_string()),
             "BC9a: the row with no circle in memory is deleted too"
         );
+    }
+
+    #[test]
+    fn active_viewers_excludes_idle_circles() {
+        // Story 10 spec.md BC2: a circle touched within `idle_evict_d` days
+        // is active; one touched further back is not — the complement of
+        // `idle_due`'s own cutoff.
+        let handle = GraphHandle::new(10);
+        let recent = ViewerDid("did:plc:recent".to_string());
+        let idle = ViewerDid("did:plc:idle".to_string());
+        handle.enqueue_first_build(recent.clone(), 1_000_000);
+        handle.enqueue_first_build(idle.clone(), 1_000_000);
+
+        let now = 1_000_000 + 7 * 86_400;
+        handle.record_touch(&recent, now - 1);
+        let active = handle.active_viewers(now, 7);
+
+        assert_eq!(active, vec![recent]);
+        assert!(!active.contains(&idle));
+    }
+
+    #[test]
+    fn evict_counts_by_reason_and_resets() {
+        // Story 10 spec.md BC6, BC9: `evict_counts` reports evictions since
+        // the last call, split by reason, and resets both to zero.
+        let handle = GraphHandle::new(1);
+        let first = ViewerDid("did:plc:a".to_string());
+        handle.enqueue_first_build(first.clone(), 1_000);
+        let second = ViewerDid("did:plc:b".to_string());
+        handle.enqueue_first_build(second.clone(), 2_000); // LRU-evicts `first`.
+
+        handle.evict(&second, EvictReason::Idle);
+
+        assert_eq!(handle.evict_counts(), (1, 1), "one idle, one lru eviction");
+        assert_eq!(handle.evict_counts(), (0, 0), "counts reset after take (BC9)");
     }
 
     #[test]

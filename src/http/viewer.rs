@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use crate::auth::ViewerDid;
 use crate::graph::cache::FollowsCache;
 use crate::graph::circle::Circle;
-use crate::graph::filter::{connected_indices, FilterItem};
+use crate::graph::filter::{connected_indices, connected_indices_with_discovery, FilterItem};
 use crate::scorer::snapshot::{caps, FeedItem, Snapshot};
 
 /// One viewer's capped list at a specific `(generation, circle_version)`:
@@ -170,6 +170,55 @@ fn build_list(
         circle_version: circle.circle_version,
         indices: Arc::new(capped),
     }
+}
+
+/// One item of an active viewer's current, served list, carrying the two
+/// fields the hourly health task needs (story 10 spec.md BC3, BC5):
+/// `promoted_at` for the 24-hour window and whether the item passed only
+/// through degree 2. `graph::metrics`'s hourly task is [`health_items`]'s
+/// only caller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HealthItem {
+    pub promoted_at: i64,
+    pub degree2_only: bool,
+}
+
+/// `circle`'s current list at `snapshot`'s generation, filtered and capped
+/// exactly the way [`build_list`] filters and caps it for a real request —
+/// `connected_indices_with_discovery` in place of `connected_indices`, so
+/// the discovery flag comes along — then capped with the same
+/// `caps::apply` (story 10 spec.md BC3, BC5). Built fresh on every call,
+/// independent of [`ViewerLists`]'s own cache: that cache tracks no
+/// degree-2-only flag, and this reader must never itself change what a
+/// request is served (`## Approach`). The temporary degree-2 set this
+/// builds from `follows_cache` is dropped when the call returns, the same
+/// as [`build_list`]'s own (BC11, BC11a).
+pub fn health_items(
+    circle: &Circle,
+    snapshot: &Snapshot,
+    follows_me_depth: usize,
+    follows_cache: &FollowsCache,
+) -> Vec<HealthItem> {
+    let items: &[FeedItem] = snapshot.items.as_slice();
+    let filter_items: Vec<FilterItem> = items
+        .iter()
+        .map(|item| FilterItem { quote_did: item.quote_did, original_did: item.original_did })
+        .collect();
+
+    let d2_set = follows_cache.degree2_set(&circle.d2_sample);
+    let kept = connected_indices_with_discovery(&filter_items, circle, &d2_set, follows_me_depth);
+    let kept_indices: Vec<u32> = kept.iter().map(|item| item.index).collect();
+    let degree2_only: HashMap<u32, bool> =
+        kept.iter().map(|item| (item.index, item.degree2_only)).collect();
+    let capped = caps::apply(items, &kept_indices);
+
+    capped
+        .into_iter()
+        .map(|index| HealthItem {
+            promoted_at: items[index as usize].promoted_at,
+            degree2_only: degree2_only.get(&index).copied().unwrap_or(false),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -503,6 +552,37 @@ mod tests {
             list.indices.as_slice(),
             &[0, 1],
             "the step 1 item and the new degree-2 item both survive"
+        );
+    }
+
+    // Story 10 spec.md BC3, BC5: `health_items` keeps the same items
+    // `list_for` would serve (filtered, then capped) and additionally flags
+    // which ones passed only through degree 2, carrying each kept item's
+    // `promoted_at` along.
+    #[test]
+    fn health_items_matches_served_list_and_flags_degree2_only() {
+        let step1_author = hash_did("did:plc:step1-author");
+        let d2_author = hash_did("did:plc:degree2-author");
+        let unrelated = hash_did("did:plc:unrelated");
+        let items = vec![
+            item("at://q/s1", "cid-s1", step1_author, hash_did("did:plc:o-s1"), 100, 30.0),
+            item("at://q/d2", "cid-d2", d2_author, hash_did("did:plc:o-d2"), 200, 20.0),
+            item("at://q/u", "cid-u", unrelated, hash_did("did:plc:o-u"), 300, 10.0),
+        ];
+        let snap = snapshot(1, items);
+        let circle = circle_with_d2_sample(&[step1_author], &["did:plc:sampled"], 1);
+        let cache = FollowsCache::new();
+        cache.put("did:plc:sampled", 1, vec![d2_author]);
+
+        let health = health_items(&circle, &snap, 0, &cache);
+
+        assert_eq!(
+            health,
+            vec![
+                HealthItem { promoted_at: 100, degree2_only: false },
+                HealthItem { promoted_at: 200, degree2_only: true },
+            ],
+            "the unrelated item is dropped; the degree-1 item is not flagged, the degree-2 one is"
         );
     }
 }

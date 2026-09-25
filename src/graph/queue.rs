@@ -123,6 +123,18 @@ pub struct JobQueue {
     notify: Notify,
 }
 
+/// [`JobQueue::depth`]'s result: the three lane lengths, read at line time
+/// (story 10 spec.md BC8) — `graph::metrics`'s hourly task (slice 2.0) calls
+/// this right before building the health line, so the depths it reports
+/// reflect the queue's state at that moment, not the last hour's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // No production reader yet: slice 2.0 is the first.
+pub struct QueueDepth {
+    pub first_build: usize,
+    pub refresh: usize,
+    pub refill: usize,
+}
+
 impl JobQueue {
     /// An empty queue.
     pub fn new() -> Arc<Self> {
@@ -235,6 +247,19 @@ impl JobQueue {
     pub(crate) fn forget(&self, viewer: &ViewerDid) {
         self.clear_attempts(viewer);
         self.clear_step2_attempts(viewer);
+    }
+
+    /// The current length of each lane (story 10 spec.md BC8): `first_build`
+    /// is lane 0, `refresh` is lane 1, `refill` is lane 2, matching
+    /// [`Job::lane`]. No production caller yet: `src/graph/metrics.rs`'s
+    /// hourly task (slice 2.0) is the first.
+    #[allow(dead_code)]
+    pub fn depth(&self) -> QueueDepth {
+        QueueDepth {
+            first_build: self.lanes[0].lock().expect("JobQueue lane poisoned").len(),
+            refresh: self.lanes[1].lock().expect("JobQueue lane poisoned").len(),
+            refill: self.lanes[2].lock().expect("JobQueue lane poisoned").len(),
+        }
     }
 }
 
@@ -1304,6 +1329,24 @@ pub(crate) mod tests {
         assert_eq!(queue.try_pop(), Some(refill_a));
         assert_eq!(queue.try_pop(), Some(refill_b));
         assert_eq!(queue.try_pop(), None);
+    }
+
+    #[test]
+    fn depth_reports_each_lane_length() {
+        // Story 10 spec.md BC8: `depth()` reports the current length of each
+        // lane, unaffected by jobs pushed to the other lanes.
+        let queue = JobQueue::new();
+        assert_eq!(queue.depth(), QueueDepth { first_build: 0, refresh: 0, refill: 0 });
+
+        queue.push(Job::FirstBuild(ViewerDid("did:plc:a".to_string())));
+        queue.push(Job::FirstBuild(ViewerDid("did:plc:b".to_string())));
+        queue.push(Job::Refresh(ViewerDid("did:plc:c".to_string())));
+        queue.push(Job::Refill("did:plc:account".to_string()));
+
+        assert_eq!(queue.depth(), QueueDepth { first_build: 2, refresh: 1, refill: 1 });
+
+        queue.try_pop();
+        assert_eq!(queue.depth(), QueueDepth { first_build: 1, refresh: 1, refill: 1 });
     }
 
     #[test]
