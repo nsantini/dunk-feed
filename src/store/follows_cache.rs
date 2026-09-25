@@ -8,6 +8,8 @@
 //! exception, kept as the plain DID text so `graph::cache::FollowsCache` can
 //! key its lookups the same way `Circle::d2_sample` names accounts.
 
+use std::collections::HashSet;
+
 use rusqlite::Connection;
 
 use crate::store::StoreError;
@@ -90,6 +92,43 @@ pub fn follows_put(
     Ok(())
 }
 
+/// Deletes every `follows_cache` row whose `fetched_at` is older than
+/// `cutoff` and whose `account_did` is not in `keep` (story 09 spec.md BC8,
+/// BC8a): `graph::schedule`'s clean-up pass calls this with `keep` set to
+/// every account any circle in memory still names, so an entry a circle
+/// relies on is never removed regardless of its age (BC8a), while one no
+/// circle names any more is dropped once it is stale. Reads the whole table
+/// rather than building a dynamic `NOT IN` clause for `keep`, since
+/// `follows_cache` is small enough (one row per distinct degree-2 account)
+/// that a full scan every 60 s costs nothing worth avoiding.
+pub fn follows_delete_older_than(
+    conn: &Connection,
+    cutoff: i64,
+    keep: &HashSet<String>,
+) -> Result<(), StoreError> {
+    let mut stale = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT account_did, fetched_at FROM follows_cache")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let account_did: String = row.get(0)?;
+            let fetched_at: i64 = row.get(1)?;
+            if fetched_at < cutoff && !keep.contains(&account_did) {
+                stale.push(account_did);
+            }
+        }
+    }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached("DELETE FROM follows_cache WHERE account_did = ?1")?;
+        for account_did in &stale {
+            stmt.execute([account_did])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +192,30 @@ mod tests {
         let count: i64 =
             conn.query_row("SELECT count(*) FROM follows_cache", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    // Story 09 spec.md BC8, BC8a: a stale, unnamed entry is deleted; a
+    // stale, named one and a fresh, unnamed one both survive.
+    #[test]
+    fn follows_delete_older_than_removes_only_stale_unnamed_rows() {
+        let conn = migrated_conn();
+        follows_put(&conn, "did:plc:stale-unnamed", 100, &[1]).unwrap();
+        follows_put(&conn, "did:plc:stale-named", 100, &[2]).unwrap();
+        follows_put(&conn, "did:plc:fresh-unnamed", 500, &[3]).unwrap();
+
+        let keep: std::collections::HashSet<String> =
+            ["did:plc:stale-named".to_string()].into_iter().collect();
+        follows_delete_older_than(&conn, 200, &keep).unwrap();
+
+        assert_eq!(follows_get(&conn, "did:plc:stale-unnamed").unwrap(), None);
+        assert!(follows_get(&conn, "did:plc:stale-named").unwrap().is_some());
+        assert!(follows_get(&conn, "did:plc:fresh-unnamed").unwrap().is_some());
+    }
+
+    #[test]
+    fn follows_delete_older_than_of_an_empty_store_is_a_no_op() {
+        let conn = migrated_conn();
+        follows_delete_older_than(&conn, 1_000, &HashSet::new()).unwrap();
     }
 
     // BC6a, via the read path: a malformed BLOB fails follows_get instead

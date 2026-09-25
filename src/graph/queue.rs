@@ -9,10 +9,12 @@
 //! through [`Store`] (BC3, BC3a, BC7, BC7a, BC8, BC24; story 08 BC1-BC5);
 //! [`run_refresh`] (story 09) rebuilds steps 1 and 2 from scratch on a
 //! `Ready` circle (BC4, BC5, BC6); [`run_refill`] (story 09) re-fetches one
-//! degree-2 account's follows (BC7a, BC7b). [`run_touch_flush`] is the
-//! periodic task that writes `last_request_at` to SQLite at most once every
-//! 60 s per viewer (BC23) — story 09's scheduler (`graph::schedule`) folds
-//! this into its own pass and replaces this task once it exists.
+//! degree-2 account's follows (BC7a, BC7b). The periodic task that used to
+//! live here, writing `last_request_at` to SQLite at most once every 60 s
+//! per viewer (BC23), is now `graph::schedule::run_scheduler`'s own flush
+//! step (BC15): folding it into the same pass that reads `last_request_at`
+//! for the idle rule means the idle rule always sees a touch this same pass
+//! already wrote, rather than racing a separate periodic task.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -55,13 +57,10 @@ pub(crate) const REMOVAL_COOLDOWN_SECS: i64 = 60 * 60;
 /// instead, since the probe measures a whole list's real page count.
 pub(crate) const FIRST_BUILD_MAX_PAGES: u32 = 100;
 
-/// How often [`run_touch_flush`] wakes to check for due touches. Shorter
-/// than [`TOUCH_MIN_INTERVAL_SECS`] so a touch is never held back much past
-/// its 60 s minimum.
-pub const TOUCH_FLUSH_TICK: Duration = Duration::from_secs(5);
-
 /// The minimum time between two SQLite writes of the same viewer's
-/// `last_request_at` (BC23).
+/// `last_request_at` (BC23). `graph::schedule`'s flush step reads this, the
+/// same constant `run_touch_flush` used before this module's touch flush
+/// moved there.
 pub const TOUCH_MIN_INTERVAL_SECS: i64 = 60;
 
 /// A callback the worker invokes after swapping in a freshly built or
@@ -1101,35 +1100,6 @@ async fn run_worker_with_retry_delay<S: GraphSource>(
     }
 }
 
-/// Runs forever, writing every viewer's due in-memory touch to SQLite
-/// (BC23): at most once every 60 s per viewer, off `handle`'s own
-/// snapshot, never on the request path. `run` spawns this alongside
-/// [`run_worker`]. Story 09's scheduler (`graph::schedule`) folds this same
-/// flush into its own periodic pass and replaces this task once it exists.
-pub async fn run_touch_flush(handle: Arc<GraphHandle>, store: Store) {
-    run_touch_flush_with_period(handle, store, TOUCH_FLUSH_TICK, TOUCH_MIN_INTERVAL_SECS).await
-}
-
-/// [`run_touch_flush`]'s body, parameterised over the tick and the minimum
-/// interval, for the same reason [`run_worker_with_retry_delay`] takes a
-/// `retry_delay`.
-async fn run_touch_flush_with_period(
-    handle: Arc<GraphHandle>,
-    store: Store,
-    tick: Duration,
-    min_interval: i64,
-) {
-    loop {
-        tokio::time::sleep(tick).await;
-        let now = unix_now();
-        for (viewer, last_request_at) in handle.due_flushes(now, min_interval) {
-            if let Err(err) = store.viewer_touch(&viewer.0, last_request_at) {
-                tracing::warn!(kind = ?err, "graph: touch flush failed");
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Mutex as StdMutex;
@@ -1913,31 +1883,6 @@ pub(crate) mod tests {
 
         assert!(handle.get(&viewer).is_none(), "no circle was recreated");
         assert!(store.viewer_load_all().unwrap().is_empty(), "no viewers row was created");
-    }
-
-    #[tokio::test]
-    async fn touch_flush_writes_at_most_once_per_period() {
-        // BC23 (flush part): the flush task writes a due touch through to
-        // the store, off `handle`'s own in-memory snapshot.
-        let handle = GraphHandle::new(10);
-        let viewer = ViewerDid("did:plc:a".to_string());
-        let store = memory_store();
-        store.viewer_save_state("did:plc:a", "ready", unix_now()).unwrap();
-        handle.record_touch(&viewer, unix_now());
-
-        let flush_store = store.clone();
-        let flush_handle = Arc::clone(&handle);
-        tokio::spawn(run_touch_flush_with_period(
-            flush_handle,
-            flush_store,
-            Duration::from_millis(10),
-            0,
-        ));
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let rows = store.viewer_load_all().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].last_request_at > 0);
     }
 
     /// A `GraphSource` for step 3 tests: `follows` holds each failing-free

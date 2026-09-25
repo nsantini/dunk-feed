@@ -588,6 +588,13 @@ impl Store {
         viewers::viewer_delete(&conn, viewer_did)
     }
 
+    /// Every `viewer_did` idle at or before `cutoff` (story 09 spec.md BC9a).
+    /// `graph::schedule`'s idle rule is the first caller.
+    pub fn viewers_idle_since(&self, cutoff: i64) -> Result<Vec<String>, StoreError> {
+        let conn = self.read_lock()?;
+        viewers::viewers_idle_since(&conn, cutoff)
+    }
+
     /// Saves step 2's result: `state` and a full replace of `viewer_checks`,
     /// in one transaction (BC3, BC3a, BC10). No production caller yet: the
     /// worker (`graph/queue.rs`, slice 2.0) is the first.
@@ -639,6 +646,18 @@ impl Store {
     ) -> Result<(), StoreError> {
         let conn = self.lock()?;
         follows_cache::follows_put(&conn, account_did, fetched_at, follows)
+    }
+
+    /// Deletes every `follows_cache` row older than `cutoff` and not named
+    /// in `keep` (story 09 spec.md BC8, BC8a). `graph::schedule`'s clean-up
+    /// pass is the first caller.
+    pub fn follows_delete_older_than(
+        &self,
+        cutoff: i64,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        follows_cache::follows_delete_older_than(&conn, cutoff, keep)
     }
 
     /// Starts the one writer thread with `WriterConfig::default()`

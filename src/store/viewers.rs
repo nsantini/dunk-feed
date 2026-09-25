@@ -355,6 +355,24 @@ pub fn viewer_replace_circle(
     Ok(())
 }
 
+/// Every `viewer_did` whose `viewers.last_request_at` is at or before
+/// `cutoff` (story 09 spec.md BC9a): `graph::schedule`'s idle rule reads this
+/// to catch a SQLite row with no circle in memory — for example one a job
+/// saved in the BC6a race window right after an eviction — that
+/// `GraphHandle`'s own in-memory idle check can never see. The caller passes
+/// `cutoff = now - idle_evict_d * 86_400` so "at or before" reads the same
+/// "at least `idle_evict_d` days old" rule the effective-`last_request_at`
+/// idle check applies to circles still in memory.
+pub fn viewers_idle_since(conn: &Connection, cutoff: i64) -> Result<Vec<String>, StoreError> {
+    let mut stmt = conn.prepare("SELECT viewer_did FROM viewers WHERE last_request_at <= ?1")?;
+    let mut rows = stmt.query([cutoff])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
 /// Deletes a viewer's `viewers`, `viewer_follows` and `viewer_checks` rows
 /// in one transaction. Spec.md's Non-goals: no caller exists yet in this
 /// story — refresh and eviction (story 09) are the first — so this is
@@ -661,6 +679,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(viewer_load_all(&conn).unwrap(), Vec::new());
+    }
+
+    // Story 09 spec.md BC9a: a row at or before the cutoff is idle; one
+    // strictly after it is not.
+    #[test]
+    fn viewers_idle_since_returns_rows_at_or_before_the_cutoff() {
+        let conn = migrated_conn();
+        viewer_save_state(&conn, "did:plc:idle", "ready", 1_000).unwrap();
+        viewer_save_state(&conn, "did:plc:fresh", "ready", 1_001).unwrap();
+
+        let idle = viewers_idle_since(&conn, 1_000).unwrap();
+
+        assert_eq!(idle, vec!["did:plc:idle".to_string()]);
+    }
+
+    #[test]
+    fn viewers_idle_since_of_an_empty_store_is_empty() {
+        let conn = migrated_conn();
+        assert_eq!(viewers_idle_since(&conn, 1_000).unwrap(), Vec::<String>::new());
     }
 
     // Review round 1, defect Y: a malformed `d2_sample` must not fail the

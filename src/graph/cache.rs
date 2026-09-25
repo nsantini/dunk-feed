@@ -132,6 +132,29 @@ impl FollowsCache {
         }
         Ok(())
     }
+
+    /// Drops `account_did`'s memory entry, for `graph::schedule`'s clean-up
+    /// pass (story 09 spec.md BC8): a memory miss falls straight through to
+    /// [`Self::get`]'s SQLite read on the rare account that turns out to be
+    /// named by a circle again later, exactly as it would for one that was
+    /// never cached at all. A no-op when `account_did` has no entry.
+    pub fn remove(&self, account_did: &str) {
+        self.entries.write().expect("FollowsCache lock poisoned").remove(account_did);
+    }
+
+    /// Every memory entry's account DID and `fetched_at`, for
+    /// `graph::schedule`'s refresh-staleness and clean-up rules (story 09
+    /// spec.md BC7, BC8): a snapshot, not a live view, so the scheduler's own
+    /// pass never holds this cache's lock while it reads `GraphHandle`'s
+    /// circles or writes to SQLite.
+    pub fn snapshot(&self) -> Vec<(String, i64)> {
+        self.entries
+            .read()
+            .expect("FollowsCache lock poisoned")
+            .iter()
+            .map(|(account_did, (fetched_at, _))| (account_did.clone(), *fetched_at))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +239,39 @@ mod tests {
         let cache = FollowsCache::new();
         cache.put("did:plc:a", 1, vec![1]);
         assert_eq!(cache.degree2_set(&[]), HashSet::new());
+    }
+
+    #[test]
+    fn remove_drops_the_memory_entry_only() {
+        // BC8: after a clean-up removal, a later `get` misses memory and
+        // falls back to whatever SQLite still has.
+        let store = migrated_store();
+        store.follows_put("did:plc:a", 1, &[1, 2]).unwrap();
+        let cache = FollowsCache::new();
+        cache.get(&store, "did:plc:a").unwrap();
+
+        cache.remove("did:plc:a");
+
+        assert!(cache.snapshot().is_empty());
+        // The SQLite row is untouched: a fresh `get` finds it again.
+        assert!(cache.get(&store, "did:plc:a").unwrap().is_some());
+    }
+
+    #[test]
+    fn remove_of_an_unknown_account_is_a_no_op() {
+        let cache = FollowsCache::new();
+        cache.remove("did:plc:missing");
+    }
+
+    #[test]
+    fn snapshot_lists_every_memory_entry() {
+        let cache = FollowsCache::new();
+        cache.put("did:plc:a", 100, vec![1]);
+        cache.put("did:plc:b", 200, vec![2]);
+
+        let mut snapshot = cache.snapshot();
+        snapshot.sort();
+        assert_eq!(snapshot, vec![("did:plc:a".to_string(), 100), ("did:plc:b".to_string(), 200)]);
     }
 
     #[test]

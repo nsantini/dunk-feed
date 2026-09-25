@@ -8,7 +8,7 @@
 
 mod queue;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use xxhash_rust::xxh3::xxh3_64;
@@ -20,10 +20,12 @@ pub mod build;
 pub mod cache;
 pub mod circle;
 pub mod filter;
+mod schedule;
 
 pub use cache::FollowsCache;
 pub use circle::Circle;
-pub use queue::{run_touch_flush, run_worker, DropListsFn, Job, JobQueue};
+pub use queue::{run_worker, DropListsFn, Job, JobQueue};
+pub use schedule::run_scheduler;
 
 /// A DID's `xxh3_64` hash, kept in place of the DID string wherever a
 /// `Circle` or the connection filter only needs to compare, not print, an
@@ -184,7 +186,12 @@ impl GraphHandle {
     /// private in-memory store, so [`Self::evict`] always has a `Store` to
     /// delete from even when no caller ever built this handle from a real
     /// one (`## Defaults taken`) — most of this module's own tests take
-    /// this path and never touch SQLite otherwise.
+    /// this path and never touch SQLite otherwise. No production caller:
+    /// `start_graph_subsystem` (`src/ingest/mod.rs`) always builds a handle
+    /// through [`Self::from_store`] instead, so a restart picks up circles
+    /// already saved in SQLite (BC19); this module's own tests, and
+    /// `http::skeleton`'s, are this function's only callers.
+    #[allow(dead_code)]
     pub fn new(max_viewers: usize) -> Arc<Self> {
         let store =
             Store::open_memory().expect("GraphHandle::new: in-memory store opens and migrates");
@@ -368,12 +375,10 @@ impl GraphHandle {
     /// evicted viewer's very next request starts a new first build at
     /// once), unlike [`Self::remove_after_giving_up`]. Logs one `info`
     /// line, `graph.evicted`, naming only `reason` — no DID, no handle, no
-    /// hash (BC11). `#[allow(dead_code)]`: `graph::schedule`'s idle rule
-    /// (slice 3.0) is this method's first caller outside
-    /// [`Self::enqueue_first_build`] (which uses [`Self::evict_locked`]
-    /// directly, already holding the lock this method takes) and this
-    /// module's own tests.
-    #[allow(dead_code)]
+    /// hash (BC11). `graph::schedule`'s idle rule is this method's first
+    /// caller outside [`Self::enqueue_first_build`] (which uses
+    /// [`Self::evict_locked`] directly, already holding the lock this
+    /// method takes) and this module's own tests.
     pub(crate) fn evict(&self, viewer: &ViewerDid, reason: EvictReason) {
         let mut state = self.state.write().expect("GraphHandle state lock poisoned");
         self.evict_locked(&mut state, viewer, reason);
@@ -492,6 +497,60 @@ impl GraphHandle {
             .circles
             .iter()
             .filter(|(_, circle)| circle.d2_sample.iter().any(|d| d == account))
+            .map(|(viewer, _)| viewer.clone())
+            .collect()
+    }
+
+    /// Every account named by any circle in memory's `d2_sample`, any state
+    /// (story 09 spec.md BC7, BC8, BC8a): `graph::schedule`'s refill rule
+    /// reads this to find which accounts might need a fresher cache entry,
+    /// and its clean-up rule reads it as the set no cache entry is ever
+    /// removed for, regardless of age (BC8a).
+    pub(crate) fn named_d2_accounts(&self) -> HashSet<String> {
+        let state = self.state.read().expect("GraphHandle state lock poisoned");
+        state.circles.values().flat_map(|circle| circle.d2_sample.iter().cloned()).collect()
+    }
+
+    /// Every viewer whose in-memory circle should be evicted as idle right
+    /// now (story 09 spec.md BC9): the effective `last_request_at` (BC16)
+    /// has not moved in at least `idle_evict_d` days. `graph::schedule`'s
+    /// idle rule reads this, then evicts each one returned, one at a time,
+    /// rather than while still holding the read lock this takes.
+    pub(crate) fn idle_due(&self, now: i64, idle_evict_d: u32) -> Vec<ViewerDid> {
+        let cutoff_secs = i64::from(idle_evict_d) * 86_400;
+        let state = self.state.read().expect("GraphHandle state lock poisoned");
+        state
+            .circles
+            .iter()
+            .filter(|(viewer, circle)| {
+                now - self.effective_last_request_at(viewer, circle) >= cutoff_secs
+            })
+            .map(|(viewer, _)| viewer.clone())
+            .collect()
+    }
+
+    /// Every viewer whose `Ready` circle is due for a `Refresh` job right now
+    /// (story 09 spec.md BC2, BC2a, BC3): `now - d1_refreshed_at` (`None`
+    /// treated as `0`, BC2a, so an unset refresh time is always due) is at
+    /// least `refresh_age_h` hours, and the effective `last_request_at`
+    /// (BC16) is later than `d1_refreshed_at` — a `Ready` circle with no
+    /// request since its last refresh gets no job (BC3), and a non-`Ready`
+    /// circle (still building) never does either. `graph::schedule`'s
+    /// refresh rule is the only caller.
+    pub(crate) fn refresh_due(&self, now: i64, refresh_age_h: u32) -> Vec<ViewerDid> {
+        let age_secs = i64::from(refresh_age_h) * 3600;
+        let state = self.state.read().expect("GraphHandle state lock poisoned");
+        state
+            .circles
+            .iter()
+            .filter(|(viewer, circle)| {
+                if circle.state != CircleState::Ready {
+                    return false;
+                }
+                let d1_refreshed_at = circle.d1_refreshed_at.unwrap_or(0);
+                let effective = self.effective_last_request_at(viewer, circle);
+                now - d1_refreshed_at >= age_secs && effective > d1_refreshed_at
+            })
             .map(|(viewer, _)| viewer.clone())
             .collect()
     }
@@ -842,7 +901,7 @@ mod tests {
         );
         assert_eq!(
             dropped.lock().unwrap().as_slice(),
-            &[untouched.0.clone()],
+            std::slice::from_ref(&untouched.0),
             "BC11a: the evicted viewer's cached list is dropped"
         );
 
@@ -850,6 +909,48 @@ mod tests {
         // request starts a fresh first build at once.
         handle.enqueue_first_build(untouched.clone(), 6_001);
         assert!(handle.get(&untouched).is_some(), "no cooldown blocks the evicted viewer");
+    }
+
+    #[test]
+    fn eviction() {
+        // Story 09 spec.md BC9, BC9a, BC14: a restart loads circles from
+        // SQLite (BC19), and the first scheduler pass right after — the same
+        // one `graph::schedule::run_scheduler` fires immediately on start —
+        // evicts a circle idle past `idle_evict_d` (BC9), deletes a
+        // `viewers` row idle the same way but with no circle in memory at
+        // all (BC9a), and leaves a fresh circle untouched.
+        let store = migrated_store();
+        let now = 1_800_000_000_i64;
+        let idle_evict_d = 7_u32;
+        let cutoff_secs = i64::from(idle_evict_d) * 86_400;
+
+        store.viewer_save_state("did:plc:idle", "ready", now - cutoff_secs - 10).unwrap();
+        // BC9a: a row idle the same way, but no circle in memory for it —
+        // `from_store` only loads `building_*` rows into a pending job, so a
+        // `ready` row like this one loads a circle too. To exercise the
+        // no-circle case, this row is inserted directly, after the load.
+        store.viewer_save_state("did:plc:orphan-row", "ready", now - cutoff_secs - 10).unwrap();
+
+        let handle = GraphHandle::from_store(&store, 10).expect("restart loads the ready circle");
+        let idle_viewer = ViewerDid("did:plc:idle".to_string());
+        assert!(handle.get(&idle_viewer).is_some(), "the idle row loaded a circle");
+
+        let fresh_viewer = ViewerDid("did:plc:fresh".to_string());
+        handle.enqueue_first_build(fresh_viewer.clone(), now);
+        handle.queue().try_pop(); // drain its FirstBuild job; not this test's concern.
+
+        // BC14: this is the restart's first scheduler pass.
+        schedule::pass(&handle, &store, now, 6, idle_evict_d, 24);
+
+        assert!(handle.get(&idle_viewer).is_none(), "BC9: the idle circle is evicted");
+        assert!(handle.get(&fresh_viewer).is_some(), "the fresh circle survives");
+        let remaining: Vec<String> =
+            store.viewer_load_all().unwrap().into_iter().map(|row| row.viewer_did).collect();
+        assert!(!remaining.contains(&idle_viewer.0), "BC11a: the evicted row is gone too");
+        assert!(
+            !remaining.contains(&"did:plc:orphan-row".to_string()),
+            "BC9a: the row with no circle in memory is deleted too"
+        );
     }
 
     #[test]
