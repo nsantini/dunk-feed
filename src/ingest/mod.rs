@@ -813,6 +813,33 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+/// `Arc<S>` is a `GraphSource` whenever `S` is (story 10 spec.md
+/// `## Approach`): `start_graph_subsystem` shares one `PdsClient` between the
+/// worker, which owns its `GraphSource` by value, and the hourly health
+/// task's PDS call-count reader, rather than building two clients or moving
+/// the per-method counter out of `PdsClient` itself. `GraphSource` is a
+/// local trait (`src/graph/build.rs`), so this impl needs no change there.
+impl<S: crate::graph::build::GraphSource + Send + Sync> crate::graph::build::GraphSource
+    for std::sync::Arc<S>
+{
+    async fn get_follows(
+        &self,
+        actor: &str,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<crate::graph::build::FollowsPage, crate::appview::pds::PdsError> {
+        (**self).get_follows(actor, limit, cursor).await
+    }
+
+    async fn get_relationships(
+        &self,
+        actor: &str,
+        others: &[String],
+    ) -> Result<Vec<String>, crate::appview::pds::PdsError> {
+        (**self).get_relationships(actor, others).await
+    }
+}
+
 /// Starts the graph subsystem — a second `Store` connection, the
 /// `GraphHandle` loaded from it (BC19), the worker task and the scheduler
 /// task (network-feed story 06; the scheduler replaces story 06's own
@@ -876,6 +903,11 @@ fn start_graph_subsystem(
             return None;
         }
     };
+    // Story 10 spec.md `## Approach`: `Arc`-shared so the hourly health
+    // task below can read and reset the same per-method call counter the
+    // worker's own calls increment (BC7, BC9), rather than building a
+    // second client or moving the counter out of `PdsClient` itself.
+    let pds_client = std::sync::Arc::new(pds_client);
 
     let d2_sample_size = cfg.d2_follows_sample as usize;
     // BC7: dropping a viewer's cached lists the moment the worker swaps in
@@ -894,17 +926,19 @@ fn start_graph_subsystem(
 
     let worker_handle = std::sync::Arc::clone(&graph_handle);
     let worker_store = graph_store.clone();
+    let worker_source = std::sync::Arc::clone(&pds_client);
     let follows_me_depth = cfg.follows_me_depth as usize;
     // Story 08: step 3's per-account fetch depth and freshness window.
     let d2_follows_depth = cfg.d2_follows_depth;
     let d2_refresh_age_h = cfg.d2_refresh_age_h;
+    let worker_snapshot = snapshot.clone();
     tokio::spawn(crate::graph::run_worker(
         worker_handle,
         worker_store,
-        pds_client,
+        worker_source,
         d2_sample_size,
         Some(drop_lists),
-        snapshot,
+        worker_snapshot,
         follows_me_depth,
         d2_follows_depth,
         d2_refresh_age_h,
@@ -923,6 +957,24 @@ fn start_graph_subsystem(
         graph_refresh_age_h,
         graph_idle_evict_d,
         d2_refresh_age_h,
+    ));
+
+    // Story 10 spec.md `## Approach`, BC1-BC13: the hourly health task. This
+    // function is itself only ever called from `run` when `cfg.personalise`
+    // is `true` (BC13), so a metrics task is never spawned with the flag
+    // off. It reads active viewers' current lists through
+    // `http::viewer::health_items`, the PDS call counter shared with the
+    // worker above, `graph_handle`'s own eviction counter and its queue
+    // depth.
+    let metrics_handle = std::sync::Arc::clone(&graph_handle);
+    let metrics_calls = std::sync::Arc::clone(&pds_client);
+    let metrics_snapshot = snapshot.clone();
+    tokio::spawn(crate::graph::metrics::run_hourly_task(
+        metrics_handle,
+        metrics_calls,
+        metrics_snapshot,
+        follows_me_depth,
+        graph_idle_evict_d,
     ));
 
     let hook_handle = std::sync::Arc::clone(&graph_handle);
