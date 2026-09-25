@@ -23,6 +23,7 @@
 #![allow(dead_code)]
 
 mod did;
+mod dns;
 mod jwt;
 mod keys;
 

@@ -146,6 +146,23 @@ The resolver task:
 - After a token that was put in the queue verifies, the resolver adds a
   first build for that viewer to the graph queue.
 
+A `did:web` fetch goes out on a second `reqwest::Client`, built with a
+`dns_resolver` (`auth/dns.rs`'s `PublicOnlyResolver`) and `no_proxy()`. The
+resolver looks the host up with `tokio::net::lookup_host` and fails the
+lookup unless every returned address is public: not private, loopback,
+link-local, or any other range in the IANA special-purpose registries
+(an IPv6 address that carries an IPv4 address is judged by the carried
+address). `reqwest` connects only to the addresses this resolver
+returns, so the checked address is always the connected address — a
+second DNS answer for the same name (DNS rebinding) cannot change the
+target, because there is no second lookup. `no_proxy()` is set because a
+proxy from `HTTPS_PROXY` would look the name up itself, bypassing the
+check. A blocked fetch is `auth::did::FetchError::Blocked`, a fetch
+failure like any other: one `blocked_address` warning naming no DID, host
+or address, and, for a `Miss`, the hourly per-DID cooldown starts. The
+`did:plc` client is unchanged, because `UPSTAGE_PLC_URL` is operator-set
+and trusted.
+
 `jti` is not tracked. A token used again only gets the same viewer's
 feed.
 

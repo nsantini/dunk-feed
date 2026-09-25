@@ -267,6 +267,29 @@ pub(super) enum FetchError {
     Http(u16),
     /// A 200 response whose body did not decode as JSON.
     Decode,
+    /// A `did:web` fetch whose resolved address was not public (BC8):
+    /// [`find_blocked`] recovered this from `reqwest`'s wrapped error by
+    /// walking its `source` chain for `dns::Blocked`. Carries nothing —
+    /// not the host, not the address — so the `blocked_address` warning
+    /// this becomes never can either.
+    Blocked,
+}
+
+/// Walks `err`'s `std::error::Error::source` chain looking for
+/// `dns::Blocked` (spec `## Defaults taken`): `reqwest` wraps a
+/// `dns::Resolve` error in its own error type, so the fetcher never sees
+/// `dns::Blocked` directly. `HttpDidFetcher::fetch` calls this on every
+/// `did:web` send failure; a chain with no `Blocked` in it is an ordinary
+/// [`FetchError::Transport`].
+fn find_blocked(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = current {
+        if err.downcast_ref::<super::dns::Blocked>().is_some() {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 /// One DID document fetch (BC17, BC18). [`HttpDidFetcher`] is the real
@@ -293,15 +316,25 @@ const DID_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// methods, the only part of the document [`extract_key`] ever reads.
 const MAX_DID_DOCUMENT_BYTES: usize = 64 * 1024;
 
-/// The real [`DidFetcher`]. Builds its own `reqwest::Client`, distinct
-/// from [`crate::appview::http_client`], with redirects disabled (review
-/// round 1, defect K): a DID document fetch never needs one, and
+/// The real [`DidFetcher`]. Builds two `reqwest::Client`s, both distinct
+/// from [`crate::appview::http_client`], both with redirects disabled
+/// (review round 1, defect K): a DID document fetch never needs one, and
 /// following a redirect would hand this resolver's request to whatever
 /// second origin a compromised or misconfigured host named, so a 3xx
 /// response is a fetch failure ([`FetchError::Http`]) rather than
 /// something this client chases on its own.
+///
+/// `did:plc` uses `plc_client`, the default resolver — `UPSTAGE_PLC_URL`
+/// is operator-set and trusted (spec `## Non-goals`). `did:web` uses
+/// `web_client`, built with [`super::dns::PublicOnlyResolver`] as its
+/// `dns_resolver` (BC7): `reqwest` then connects only to the addresses
+/// that resolver returned, so a rebinding second DNS answer can never
+/// change the address actually connected to. `web_client` also sets
+/// `no_proxy()` (BC7), because a proxy from `HTTPS_PROXY` would look the
+/// name up itself, bypassing the address check entirely.
 pub(super) struct HttpDidFetcher {
-    http: reqwest::Client,
+    plc_client: reqwest::Client,
+    web_client: reqwest::Client,
     /// `UPSTAGE_PLC_URL`, trailing `/` removed. `src/config.rs` (slice
     /// 3.0) will also remove it at load time (BC24); this trims again as
     /// defence in depth, the same reasoning `HttpPdsTransport::new` gives
@@ -311,13 +344,55 @@ pub(super) struct HttpDidFetcher {
 
 impl HttpDidFetcher {
     pub(super) fn new(plc_url: String) -> Self {
-        Self {
-            http: reqwest::Client::builder()
+        let build = || {
+            reqwest::Client::builder()
                 .timeout(DID_FETCH_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
+        };
+        Self {
+            plc_client: build().build().expect(
+                "reqwest::Client::builder with a timeout and a redirect policy never fails to build",
+            ),
+            web_client: build()
+                .dns_resolver(std::sync::Arc::new(super::dns::PublicOnlyResolver::new()))
+                .no_proxy()
                 .build()
                 .expect(
-                    "reqwest::Client::builder with a timeout and a redirect policy never fails to build",
+                    "reqwest::Client::builder with a timeout, a redirect policy and a dns_resolver never fails to build",
+                ),
+            plc_url: plc_url.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// Test-only seam (AC3, `did_web_blocked`): builds the same two
+    /// clients as [`Self::new`], except `web_client`'s resolver looks up
+    /// through `web_lookup` instead of the real `tokio::net::lookup_host`,
+    /// so the test can send a fixed loopback address without a network
+    /// lookup. `plc_client` is unchanged — still the default resolver —
+    /// so the same test can also show a `did:plc` fetch never consults
+    /// `web_lookup`.
+    #[cfg(test)]
+    fn new_for_test(
+        plc_url: String,
+        web_lookup: std::sync::Arc<dyn super::dns::LookupHost>,
+    ) -> Self {
+        let build = || {
+            reqwest::Client::builder()
+                .timeout(DID_FETCH_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+        };
+        Self {
+            plc_client: build().build().expect(
+                "reqwest::Client::builder with a timeout and a redirect policy never fails to build",
+            ),
+            web_client: build()
+                .dns_resolver(std::sync::Arc::new(super::dns::PublicOnlyResolver::with_lookup(
+                    web_lookup,
+                )))
+                .no_proxy()
+                .build()
+                .expect(
+                    "reqwest::Client::builder with a timeout, a redirect policy and a dns_resolver never fails to build",
                 ),
             plc_url: plc_url.trim_end_matches('/').to_string(),
         }
@@ -371,7 +446,20 @@ fn resolve_url(plc_url: &str, did: &str) -> String {
 impl DidFetcher for HttpDidFetcher {
     async fn fetch(&self, did: &str) -> Result<Value, FetchError> {
         let url = resolve_url(&self.plc_url, did);
-        let response = self.http.get(&url).send().await.map_err(|_err| FetchError::Transport)?;
+        let is_web = did.starts_with("did:web:");
+        let client = if is_web { &self.web_client } else { &self.plc_client };
+        let response = client.get(&url).send().await.map_err(|err| {
+            // BC8: the only way a `did:web` send fails with `Blocked` is
+            // `web_client`'s resolver rejecting every address (BC6); the
+            // `did:plc` client never carries that resolver, so `is_web`
+            // gates the walk rather than running it needlessly on every
+            // transport error.
+            if is_web && find_blocked(&err) {
+                FetchError::Blocked
+            } else {
+                FetchError::Transport
+            }
+        })?;
         let status = response.status().as_u16();
         if status != 200 {
             // Review round 1, defect K: with redirects disabled above, a
@@ -462,7 +550,16 @@ pub(super) async fn run_resolver<F: DidFetcher>(
                 }
             },
             Err(err) => {
-                tracing::warn!(kind = ?err, "auth: did document fetch failed");
+                // BC8: `Blocked` logs a fixed `kind` string rather than its
+                // derived `Debug` (`"Blocked"`), so the line always reads
+                // `blocked_address` — the same word an operator would grep
+                // for regardless of how the variant's `Debug` is spelled.
+                match &err {
+                    FetchError::Blocked => {
+                        tracing::warn!(kind = "blocked_address", "auth: did document fetch failed")
+                    }
+                    other => tracing::warn!(kind = ?other, "auth: did document fetch failed"),
+                }
                 if is_miss {
                     cache.miss_fetch_failed(&did, crate::store::unix_now());
                 }
@@ -1050,5 +1147,133 @@ mod tests {
         run_resolver(rx, FakeFetcher::once(Ok(doc)), Arc::clone(&cache), cfg, None).await;
 
         assert!(matches!(cache.get(did, now), Lookup::Fresh(_)));
+    }
+
+    // --- SSRF: HttpDidFetcher / FetchError::Blocked (BC7, BC8) ----------
+
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A [`crate::auth::dns::LookupHost`] that always resolves to
+    /// `127.0.0.1` and counts how many times it was called, so
+    /// `did_web_blocked` can assert the lookup ran exactly once (BC7: "the
+    /// only name lookup is the one in BC5 and BC6").
+    struct CountingLoopbackLookup(Arc<AtomicUsize>);
+
+    impl crate::auth::dns::LookupHost for CountingLoopbackLookup {
+        fn lookup(
+            &self,
+            _host: String,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<IpAddr>>> + Send>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]) })
+        }
+    }
+
+    #[tokio::test]
+    async fn did_web_blocked() {
+        // AC3: a did:web fetch whose fake lookup returns a loopback
+        // address fails with `FetchError::Blocked`, and the lookup runs
+        // once.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = HttpDidFetcher::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(CountingLoopbackLookup(Arc::clone(&calls))),
+        );
+
+        let result = fetcher.fetch("did:web:blocked.example").await;
+        assert!(matches!(result, Err(FetchError::Blocked)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the lookup must run exactly once");
+
+        // AC3: a did:plc fetch does not use the check — `plc_client` keeps
+        // the default resolver, so `web_lookup` is never consulted for it.
+        // Port 1 on loopback refuses at once, so this needs no real
+        // network; only the transport outcome (not `Blocked`) and the
+        // untouched counter matter here.
+        let plc_result = fetcher.fetch("did:plc:zzzzzzzzzzzzzzzzzzzzzzzz").await;
+        assert!(!matches!(plc_result, Err(FetchError::Blocked)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a did:plc fetch must not consult web_lookup");
+    }
+
+    /// A `tracing_subscriber::fmt::MakeWriter` that appends every formatted
+    /// event to a shared buffer — the same pattern
+    /// `graph::metrics::tests::CapturingWriter` and
+    /// `ingest::tests::CapturingWriter` already use.
+    #[derive(Clone)]
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("CapturingWriter mutex poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_log_and_cooldown() {
+        // AC4: a blocked `Miss` starts the hourly cooldown and logs kind
+        // `blocked_address` with no DID and no host.
+        // `run_resolver` stamps the failed attempt with the real clock
+        // (`store::unix_now()`, this file's own doc comment on
+        // `run_resolver`), so this test judges the cooldown against that
+        // same clock rather than an arbitrary fixed epoch.
+        let did = "did:web:blocked.example";
+        let cache = Arc::new(KeyCache::new(10));
+        let now = crate::store::unix_now();
+        assert!(cache.should_send_miss(did, now), "first miss for this DID enqueues a fetch");
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::fmt().json().with_writer(CapturingWriter(buf.clone())).finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        resolve_one(
+            ResolveRequest::Miss { did: did.to_string(), token: "unused".to_string() },
+            FakeFetcher::once(Err(FetchError::Blocked)),
+            Arc::clone(&cache),
+        )
+        .await;
+
+        drop(dispatch);
+        let output = String::from_utf8(buf.lock().expect("CapturingWriter mutex poisoned").clone())
+            .expect("captured log output must be valid UTF-8");
+        assert!(output.contains("blocked_address"), "log line must name blocked_address: {output}");
+        assert!(!output.contains(did), "no DID may appear in the line: {output}");
+        assert!(!output.contains("blocked.example"), "no host may appear in the line: {output}");
+
+        assert!(
+            !cache.should_send_miss(did, now + 1),
+            "a blocked Miss must start the hourly cooldown like any other failure"
+        );
+        assert!(cache.should_send_miss(did, now + 3601), "the cooldown ends after an hour");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_loopback_host_blocked() {
+        // AC5: a live did:web fetch of a public name that resolves to
+        // 127.0.0.1 is blocked. `localtest.me` is a well-known public DNS
+        // name whose records all resolve to 127.0.0.1. Run by hand:
+        // `cargo test --all-features -- --ignored auth::did::tests::live_loopback_host_blocked`.
+        let fetcher = HttpDidFetcher::new("https://plc.directory".to_string());
+        let result = fetcher.fetch("did:web:localtest.me").await;
+        assert!(
+            matches!(result, Err(FetchError::Blocked)),
+            "a did:web host resolving to 127.0.0.1 must be blocked, got {result:?}"
+        );
     }
 }
