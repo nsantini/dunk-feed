@@ -1120,6 +1120,7 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
             cfg.max_viewers as usize * 2,
             auth_cfg.clone(),
             first_build_hook,
+            cfg.resolver_misses_per_min,
         );
         http_config.auth = Some(crate::http::AuthHandle { cache, resolver_tx, cfg: auth_cfg });
     }

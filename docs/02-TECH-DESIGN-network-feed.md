@@ -106,6 +106,9 @@ the name.
 | `UPSTAGE_D2_REFRESH_AGE_H` | `24` | How long a shared follows list is kept |
 | `UPSTAGE_GRAPH_RPS` | `8` | PDS client rate. The PDS limit is 10 each second for each IP |
 | `UPSTAGE_PDS_URL` | `https://bsky.social` | PDS for the session and the graph calls |
+| `UPSTAGE_RESOLVER_MISSES_PER_MIN` | `30` | Global cap on `did` resolver `Miss` fetches sent in one wall-clock minute |
+| `UPSTAGE_GRAPH_LRU_EVICT_PER_MIN` | `1` | Most LRU circle evictions in one wall-clock minute |
+| `UPSTAGE_GRAPH_LRU_PROTECT_MIN` | `60` | A circle with a request this recently is never an LRU eviction victim. `0` disables the protection |
 
 `BSKY_HANDLE` and `BSKY_APP_PASSWORD` become required for `upstage run`
 when `UPSTAGE_PERSONALISE` is `true`.
@@ -162,6 +165,17 @@ failure like any other: one `blocked_address` warning naming no DID, host
 or address, and, for a `Miss`, the hourly per-DID cooldown starts. The
 `did:plc` client is unchanged, because `UPSTAGE_PLC_URL` is operator-set
 and trusted.
+
+`auth::KeyCache` also holds a global budget of `UPSTAGE_RESOLVER_MISSES_PER_MIN`
+`Miss` fetches for each wall-clock minute (`now / 60`), spent only after
+the per-DID checks above pass — a DID already in flight or in its hourly
+cooldown costs nothing. Once the budget for the minute is spent, a `Miss`
+is refused the same way a full resolver channel refuses one: no in-flight
+mark and no cooldown, so the next request for that DID tries again. The
+first refusal in a minute writes one `auth.miss_limited` warning naming no
+DID; at most one line each minute. A `Refetch` (a stale cached key, or a
+signature failure) never spends this budget — it keeps its own
+story 05 hourly-per-DID limit.
 
 `jti` is not tracked. A token used again only gets the same viewer's
 feed.

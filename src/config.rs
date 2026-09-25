@@ -145,6 +145,24 @@ pub struct Config {
     /// `UPSTAGE_MAX_VIEWERS` (story 05, BC25): `auth::KeyCache`'s cap is
     /// `2 * max_viewers` (`run`, `src/ingest/mod.rs`).
     pub max_viewers: u32,
+    /// `UPSTAGE_RESOLVER_MISSES_PER_MIN` (launch-blockers spec.md BC11 to
+    /// BC16, BC24, BC25): the global cap on `did` resolver `Miss` fetches
+    /// `auth::KeyCache::try_send_miss` sends in one wall-clock minute
+    /// (`now / 60`), spent only after the per-DID checks from story 05
+    /// pass. `0` is rejected: it would silently stop every first
+    /// resolution.
+    pub resolver_misses_per_min: u32,
+    /// `UPSTAGE_GRAPH_LRU_EVICT_PER_MIN` (launch-blockers spec.md BC19,
+    /// BC21, BC24, BC25): the most LRU evictions `graph::GraphHandle::
+    /// enqueue_first_build` (slice 3.0) performs in one wall-clock minute.
+    /// `0` is rejected, the same rule as `resolver_misses_per_min`.
+    pub graph_lru_evict_per_min: u32,
+    /// `UPSTAGE_GRAPH_LRU_PROTECT_MIN` (launch-blockers spec.md BC17,
+    /// BC18, BC26 to BC28): a circle whose effective `last_request_at` is
+    /// within this many minutes of now is never an LRU eviction victim
+    /// (slice 3.0). `0` is valid — it turns the protection off, back to
+    /// story 09's plain LRU pick, with the eviction budget still applied.
+    pub graph_lru_protect_min: u32,
 }
 
 impl Config {
@@ -627,6 +645,22 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
         service_did,
         plc_url,
         max_viewers,
+        resolver_misses_per_min: positive_u32_or_default(
+            &lookup,
+            "UPSTAGE_RESOLVER_MISSES_PER_MIN",
+            30,
+        )?,
+        graph_lru_evict_per_min: positive_u32_or_default(
+            &lookup,
+            "UPSTAGE_GRAPH_LRU_EVICT_PER_MIN",
+            1,
+        )?,
+        // BC26 to BC28: 0 is a valid protection window (it turns
+        // protection off), so this reads the raw number rather than
+        // going through `positive_u32_or_default`'s zero rejection. A u32
+        // parse already fails on a negative value (BC28), and an empty
+        // string is malformed rather than the default (`number_or_default`).
+        graph_lru_protect_min: number_or_default(&lookup, "UPSTAGE_GRAPH_LRU_PROTECT_MIN", 60)?,
     })
 }
 
@@ -1626,6 +1660,68 @@ mod tests {
         let mut pairs = required_pair().to_vec();
         pairs.push(("UPSTAGE_SERVICE_DID", "  did:web:padded.example  "));
         assert_eq!(load(env(&pairs)).unwrap().service_did, "did:web:padded.example");
+    }
+
+    #[test]
+    fn launch_blocker_limits() {
+        // AC13; BC24 to BC28: the three launch-blocker variables load with
+        // their defaults, and reject the values they must reject.
+        let config = load(env(&required_pair())).unwrap();
+        assert_eq!(config.resolver_misses_per_min, 30);
+        assert_eq!(config.graph_lru_evict_per_min, 1);
+        assert_eq!(config.graph_lru_protect_min, 60);
+
+        // BC24, BC25: UPSTAGE_RESOLVER_MISSES_PER_MIN and
+        // UPSTAGE_GRAPH_LRU_EVICT_PER_MIN reject 0, negative and
+        // non-numeric values, and a custom value is read.
+        for name in ["UPSTAGE_RESOLVER_MISSES_PER_MIN", "UPSTAGE_GRAPH_LRU_EVICT_PER_MIN"] {
+            for bad in ["0", "-1", "soon", ""] {
+                let mut pairs = required_pair().to_vec();
+                pairs.push((name, bad));
+                let err = load(env(&pairs)).unwrap_err();
+                match err {
+                    ConfigError::Invalid { name: got, .. } => assert_eq!(got, name),
+                    other => panic!("expected Invalid for {name}={bad}, got {other:?}"),
+                }
+            }
+        }
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_RESOLVER_MISSES_PER_MIN", "60"));
+        assert_eq!(load(env(&pairs)).unwrap().resolver_misses_per_min, 60);
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_GRAPH_LRU_EVICT_PER_MIN", "3"));
+        assert_eq!(load(env(&pairs)).unwrap().graph_lru_evict_per_min, 3);
+
+        // BC26: 0 is a valid protection window, unlike the two variables
+        // above.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_GRAPH_LRU_PROTECT_MIN", "0"));
+        assert_eq!(load(env(&pairs)).unwrap().graph_lru_protect_min, 0);
+
+        // BC28: negative or non-numeric is Invalid.
+        for bad in ["-1", "soon"] {
+            let mut pairs = required_pair().to_vec();
+            pairs.push(("UPSTAGE_GRAPH_LRU_PROTECT_MIN", bad));
+            let err = load(env(&pairs)).unwrap_err();
+            match err {
+                ConfigError::Invalid { name, .. } => {
+                    assert_eq!(name, "UPSTAGE_GRAPH_LRU_PROTECT_MIN")
+                }
+                other => panic!("expected Invalid for {bad}, got {other:?}"),
+            }
+        }
+        // Empty is malformed too, the same rule as every other number.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_GRAPH_LRU_PROTECT_MIN", ""));
+        let err = load(env(&pairs)).unwrap_err();
+        match err {
+            ConfigError::Invalid { name, .. } => assert_eq!(name, "UPSTAGE_GRAPH_LRU_PROTECT_MIN"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_GRAPH_LRU_PROTECT_MIN", "120"));
+        assert_eq!(load(env(&pairs)).unwrap().graph_lru_protect_min, 120);
     }
 
     #[test]

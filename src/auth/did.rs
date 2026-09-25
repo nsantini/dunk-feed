@@ -67,6 +67,30 @@ pub(super) enum Lookup {
     Missing,
 }
 
+/// [`KeyCache::try_send_miss`]'s outcome (launch-blockers spec.md BC9,
+/// BC11 to BC16): whether to send the `Miss`, and, when not, whether the
+/// per-DID rule or the global miss budget was the reason. `mod.rs`'s
+/// `verify` matches on `RefusedBudget` alone to drive the rate-limited
+/// `auth.miss_limited` line (BC16); `RefusedPerDid` needs no log, the same
+/// as before this budget existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MissAttempt {
+    Send,
+    RefusedPerDid,
+    RefusedBudget,
+}
+
+/// The global resolver miss budget's bookkeeping for one wall-clock
+/// minute (launch-blockers spec.md BC11 to BC16): `minute` is `now / 60`,
+/// the minute `count` was last reset for; `logged_minute` is the minute
+/// [`KeyCache::note_miss_limited`] last returned `true` for, so
+/// `auth.miss_limited` fires at most once a minute (BC16).
+struct MissBudgetState {
+    minute: i64,
+    count: u32,
+    logged_minute: Option<i64>,
+}
+
 /// The DID key cache. `new`'s `max_entries` is `2 × UPSTAGE_MAX_VIEWERS`
 /// (BC16), computed by the caller (`src/ingest/mod.rs`, slice 3.0).
 pub struct KeyCache {
@@ -75,14 +99,39 @@ pub struct KeyCache {
     /// Review round 1, defect B: outstanding-miss bookkeeping, keyed by
     /// DID, for [`Self::should_send_miss`] and [`Self::miss_fetch_done`].
     misses: Mutex<HashMap<String, MissState>>,
+    /// The most `Miss` fetches [`Self::try_send_miss`] sends across every
+    /// DID in one wall-clock minute (launch-blockers spec.md BC11 to
+    /// BC14). `new` sets this to `u32::MAX`, effectively unbounded, so
+    /// every caller that built a cache before this budget existed (every
+    /// other test, `src/http/skeleton.rs`) is unaffected;
+    /// [`Self::new_with_miss_budget`] is the one constructor that sets a
+    /// real limit.
+    misses_per_min: u32,
+    miss_budget: Mutex<MissBudgetState>,
 }
 
 impl KeyCache {
     pub fn new(max_entries: usize) -> Self {
+        Self::new_with_miss_budget(max_entries, u32::MAX)
+    }
+
+    /// Builds a cache whose global resolver miss budget is `misses_per_min`
+    /// `Miss` fetches for each wall-clock minute (launch-blockers spec.md
+    /// BC11 to BC16): `spawn_resolver` (`mod.rs`) uses this with
+    /// `UPSTAGE_RESOLVER_MISSES_PER_MIN`; [`Self::new`] above calls this
+    /// with `u32::MAX` so every other caller keeps story 05's unbounded
+    /// behaviour.
+    pub(super) fn new_with_miss_budget(max_entries: usize, misses_per_min: u32) -> Self {
         Self {
             max_entries,
             entries: Mutex::new(HashMap::new()),
             misses: Mutex::new(HashMap::new()),
+            misses_per_min,
+            miss_budget: Mutex::new(MissBudgetState {
+                minute: i64::MIN,
+                count: 0,
+                logged_minute: None,
+            }),
         }
     }
 
@@ -165,11 +214,24 @@ impl KeyCache {
     /// instead, the same way a full resolver channel drops one (BC9):
     /// nothing already tracked is evicted to make room for it.
     pub(super) fn should_send_miss(&self, did: &str, now: i64) -> bool {
+        matches!(self.try_send_miss(did, now), MissAttempt::Send)
+    }
+
+    /// [`Self::should_send_miss`]'s full outcome (launch-blockers spec.md
+    /// BC11 to BC16): `mod.rs`'s `verify` matches on this directly, rather
+    /// than on the bool `should_send_miss` collapses it to, so a refusal
+    /// caused by the global miss budget — and only that reason — can drive
+    /// the rate-limited `auth.miss_limited` line (BC16). The per-DID
+    /// checks (BC13) run first and, on their own, spend nothing from the
+    /// budget; the budget is spent only once they have all passed (BC11),
+    /// and a refusal there (BC12) leaves no in-flight mark and no cooldown,
+    /// the same as a dropped send on a full resolver channel.
+    pub(super) fn try_send_miss(&self, did: &str, now: i64) -> MissAttempt {
         let mut misses = self.misses.lock().expect("KeyCache mutex poisoned");
         if !misses.contains_key(did) && misses.len() >= self.max_entries {
             Self::prune_misses(&mut misses, now);
             if misses.len() >= self.max_entries {
-                return false;
+                return MissAttempt::RefusedPerDid;
             }
         }
         let state = misses.entry(did.to_string()).or_insert(MissState {
@@ -178,14 +240,51 @@ impl KeyCache {
             first_seen: now,
         });
         if state.in_flight {
-            return false;
+            return MissAttempt::RefusedPerDid;
         }
         if let Some(last) = state.last_attempted {
             if now - last < REFETCH_COOLDOWN_SECS {
-                return false;
+                return MissAttempt::RefusedPerDid;
             }
         }
+        if !self.spend_miss_budget(now) {
+            return MissAttempt::RefusedBudget;
+        }
         state.in_flight = true;
+        MissAttempt::Send
+    }
+
+    /// Spends one unit of the global miss budget for the wall-clock minute
+    /// `now / 60` (BC14), resetting the count the first time a call lands
+    /// in a new minute. Returns `false`, spending nothing, once
+    /// `misses_per_min` units are already spent this minute (BC12).
+    fn spend_miss_budget(&self, now: i64) -> bool {
+        let mut budget = self.miss_budget.lock().expect("KeyCache mutex poisoned");
+        let minute = now.div_euclid(60);
+        if budget.minute != minute {
+            budget.minute = minute;
+            budget.count = 0;
+        }
+        if budget.count >= self.misses_per_min {
+            return false;
+        }
+        budget.count += 1;
+        true
+    }
+
+    /// `true` the first time this is called for the wall-clock minute in
+    /// which the miss budget ran out (BC16): `mod.rs`'s `verify` calls
+    /// this only after [`Self::try_send_miss`] returns
+    /// [`MissAttempt::RefusedBudget`], so the `auth.miss_limited` warning
+    /// it then logs fires at most once a minute, however many DIDs are
+    /// refused in that minute.
+    pub(super) fn note_miss_limited(&self, now: i64) -> bool {
+        let mut budget = self.miss_budget.lock().expect("KeyCache mutex poisoned");
+        let minute = now.div_euclid(60);
+        if budget.logged_minute == Some(minute) {
+            return false;
+        }
+        budget.logged_minute = Some(minute);
         true
     }
 
@@ -790,6 +889,68 @@ mod tests {
         assert!(!cache.should_send_miss(also_in_flight, 1), "still in flight");
         assert!(!cache.should_send_miss(cooling, 1), "still cooling down");
         assert!(!cache.should_send_miss(also_cooling, 1), "still cooling down");
+    }
+
+    #[test]
+    fn miss_budget() {
+        // AC6; BC11, BC12, BC14: N misses for distinct DIDs are sent in a
+        // minute, the next is refused, and the budget is free again once
+        // `now / 60` moves to the next minute.
+        let cache = KeyCache::new_with_miss_budget(10, 2);
+        assert!(cache.should_send_miss("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", 0));
+        assert!(cache.should_send_miss("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", 0));
+        assert!(
+            !cache.should_send_miss("did:plc:cccccccccccccccccccccccc", 0),
+            "the budget for this minute is spent"
+        );
+        // Still inside the same minute (59s later): still refused.
+        assert!(!cache.should_send_miss("did:plc:cccccccccccccccccccccccc", 59));
+        // A new minute (now / 60 has advanced) resets the count to 0.
+        assert!(cache.should_send_miss("did:plc:cccccccccccccccccccccccc", 60));
+    }
+
+    #[test]
+    fn miss_budget_rules() {
+        // AC7; BC13, BC15: a DID refused by the per-DID rule spends
+        // nothing from the budget, a budget refusal leaves no cooldown,
+        // and `should_refetch` never touches the budget at all.
+        let cache = KeyCache::new_with_miss_budget(10, 2);
+        let first = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(cache.should_send_miss(first, 0), "the first of two units is spent on first");
+        assert!(!cache.should_send_miss(first, 0), "first is already in flight");
+
+        // The in-flight refusal above spent nothing: a different DID still
+        // gets the second of the two units in this same minute. If the
+        // refusal had spent one, the budget would already be exhausted
+        // here.
+        let second = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(
+            cache.should_send_miss(second, 0),
+            "the in-flight refusal did not spend the budget"
+        );
+
+        // The budget is now spent for this minute; a third DID is refused
+        // by the budget, not by any per-DID state of its own.
+        let third = "did:plc:cccccccccccccccccccccccc";
+        assert!(!cache.should_send_miss(third, 0));
+        // BC12: a budget refusal starts no cooldown, so the very next
+        // minute's first attempt for the same DID succeeds at once.
+        assert!(
+            cache.should_send_miss(third, 60),
+            "a budget refusal must not have started a cooldown"
+        );
+
+        // BC15: `should_refetch` (the stale-entry and signature-failure
+        // path) never spends the miss budget, however many times it runs.
+        let refetch_cache = KeyCache::new_with_miss_budget(10, 1);
+        let refetch_did = "did:plc:dddddddddddddddddddddddd";
+        refetch_cache.insert(refetch_did.to_string(), any_key(), 0);
+        for now in [0, 1, 2, 3, 4] {
+            let _ = refetch_cache.should_refetch(refetch_did, now);
+        }
+        // The budget is untouched: a miss for an unrelated DID still gets
+        // its one unit in this same minute.
+        assert!(refetch_cache.should_send_miss("did:plc:eeeeeeeeeeeeeeeeeeeeeeee", 4));
     }
 
     #[tokio::test]
