@@ -236,7 +236,10 @@ impl GraphHandle {
     /// bypass the `UPSTAGE_MAX_VIEWERS` cap [`Self::enqueue_first_build`]
     /// enforces: they already exist in SQLite, so refusing to load one back
     /// into memory would silently drop a viewer the store already accepted.
-    /// Also preloads the shared [`FollowsCache`] with every `follows_cache`
+    /// If that leaves more circles in memory than the cap allows,
+    /// [`Self::enqueue_first_build`]'s next call evicts as many of the oldest
+    /// as it takes to get back under it (review round 1, defect AN), not
+    /// just one. Also preloads the shared [`FollowsCache`] with every `follows_cache`
     /// row a loaded circle's `d2_sample` names (BC12), regardless of that
     /// circle's own state.
     pub fn from_store(store: &Store, max_viewers: usize) -> Result<Arc<Self>, StoreError> {
@@ -332,7 +335,12 @@ impl GraphHandle {
             // second job is queued.
             return;
         }
-        if state.circles.len() >= self.max_viewers {
+        // Review round 1, defect AN: a loop, not a single eviction — a
+        // restart can load more than `max_viewers` circles at once
+        // (`Self::from_store` bypasses the cap, spec.md `## Approach`), so
+        // one eviction is not always enough to get back under it before this
+        // viewer's own circle is inserted.
+        while state.circles.len() >= self.max_viewers {
             let victim = state
                 .circles
                 .iter()
@@ -342,8 +350,8 @@ impl GraphHandle {
             match victim {
                 Some(victim) => self.evict_locked(&mut state, &victim, EvictReason::Lru),
                 // `max_viewers` is 0, or every circle vanished between the
-                // `len()` check and here: nothing to evict, so nothing to
-                // build for this viewer either.
+                // `len()` check and here: nothing left to evict, so nothing
+                // to build for this viewer either.
                 None => return,
             }
         }
@@ -468,17 +476,34 @@ impl GraphHandle {
         Some(version)
     }
 
-    /// Swaps in `circle` for `viewer` only if a circle already exists for it
-    /// (story 09 spec.md BC6a: an eviction may have removed it while a
-    /// refresh ran), keeping the existing circle's `last_request_at` (BC5,
-    /// BC16 — a refresh must never reset the idle clock a request already
-    /// advanced) and bumping `circle_version` past whatever was there.
-    /// `graph::queue::run_refresh` calls this after a successful save.
-    /// Returns the new version, or `None` (swapping nothing) when `viewer`
-    /// has no circle in memory.
-    pub(crate) fn replace_if_present(&self, viewer: &ViewerDid, mut circle: Circle) -> Option<u64> {
+    /// Swaps in `circle` for `viewer` only if the circle held for it right
+    /// now still has `expected_version` and is still `CircleState::Ready`
+    /// (review round 1, defect AM), checked and swapped under one write
+    /// lock: an eviction may have removed it while a refresh ran (story 09
+    /// spec.md BC6a), or — the case `expected_version` catches that a bare
+    /// existence check cannot — the viewer may have been evicted and then
+    /// re-requested, so a *different*, freshly created circle (a new first
+    /// build, `BuildingD1`, `circle_version` reset) now sits under the same
+    /// key. A stale refresh that started against the old circle must swap
+    /// nothing over that new one. Keeps the existing circle's
+    /// `last_request_at` (BC5, BC16 — a refresh must never reset the idle
+    /// clock a request already advanced) and bumps `circle_version` past
+    /// whatever was there. `graph::queue::run_refresh` calls this after a
+    /// successful save, passing the `circle_version` it read at the start of
+    /// its own run. Returns the new version, or `None` (swapping nothing)
+    /// when `viewer` has no circle in memory, or the one it has no longer
+    /// matches.
+    pub(crate) fn replace_if_present(
+        &self,
+        viewer: &ViewerDid,
+        mut circle: Circle,
+        expected_version: u64,
+    ) -> Option<u64> {
         let mut state = self.state.write().expect("GraphHandle state lock poisoned");
         let existing = state.circles.get(viewer)?;
+        if existing.circle_version != expected_version || existing.state != CircleState::Ready {
+            return None;
+        }
         let version = existing.circle_version + 1;
         circle.last_request_at = existing.last_request_at;
         circle.state = CircleState::Ready;
@@ -909,6 +934,34 @@ mod tests {
         // request starts a fresh first build at once.
         handle.enqueue_first_build(untouched.clone(), 6_001);
         assert!(handle.get(&untouched).is_some(), "no cooldown blocks the evicted viewer");
+    }
+
+    #[test]
+    fn lru_evicts_down_to_the_cap() {
+        // Review round 1, defect AN: `Self::from_store` bypasses the cap on
+        // a restart, so a handle can hold more circles than `max_viewers`
+        // allows. The next first build must evict as many of the oldest as
+        // it takes to land back at the cap, not just one.
+        let store = migrated_store();
+        for i in 0..10 {
+            store.viewer_save_state(&format!("did:plc:{i:02}"), "ready", 1_000 + i as i64).unwrap();
+        }
+        let handle = GraphHandle::from_store(&store, 5).expect("store loads all ten circles");
+        assert_eq!(
+            handle.state.read().unwrap().circles.len(),
+            10,
+            "the cap is bypassed on a restart load"
+        );
+
+        let newcomer = ViewerDid("did:plc:new".to_string());
+        handle.enqueue_first_build(newcomer.clone(), 2_000);
+
+        assert_eq!(
+            handle.state.read().unwrap().circles.len(),
+            5,
+            "eviction ran enough times to land back at the cap"
+        );
+        assert!(handle.get(&newcomer).is_some(), "the new viewer still gets a circle");
     }
 
     #[test]

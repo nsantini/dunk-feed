@@ -315,6 +315,7 @@ async fn process_job<S: GraphSource>(
                 d2_follows_depth,
                 drop_lists,
                 retry_delay,
+                d2_refresh_age_h,
             )
             .await
         }
@@ -871,21 +872,29 @@ async fn run_step3<S: GraphSource>(
 }
 
 /// A `Refresh` job (story 09 spec.md BC4, BC5, BC6): checks the viewer still
-/// has a circle in memory (BC6a — an eviction may have removed it while this
-/// job waited its turn), reads step 2's candidates off `snapshot`, waiting
-/// (no failure) while its generation is still `0` (the same defect AE rule
+/// has a `Ready` circle in memory (BC6a — an eviction may have removed it
+/// while this job waited its turn; review round 1, defect AM — a circle
+/// still building is not this job's to touch either) and records its
+/// `circle_version`, reads step 2's candidates off `snapshot`, waiting (no
+/// failure) while its generation is still `0` (the same defect AE rule
 /// [`run_step2`] applies), then runs [`refresh`] — steps 1 and 2 on a brand
 /// new [`Circle`] with empty `checked` and `follows_me`, so a follow dropped
 /// since the last build actually leaves the result (BC13). On success,
-/// re-checks the circle still exists (BC6a), saves the new `follows`,
-/// `d2_sample`, `checked`, `follows_me` and `d1_refreshed_at = now` through
-/// `viewer_replace_circle` in one transaction, then swaps the result into
-/// memory keeping the existing circle's `last_request_at`
-/// (`GraphHandle::replace_if_present`, BC5) and drops the viewer's cached
-/// lists. On any failure — reading candidates, `refresh` itself, or the
-/// save — the old circle is left completely untouched in memory and SQLite,
-/// and the job is retried after `retry_delay` with no give-up count (BC1b,
-/// BC6).
+/// re-checks the circle held for `viewer` right now still has the
+/// `circle_version` recorded at the start and is still `Ready` (defect AM: a
+/// bare existence check misses the case where the viewer was evicted and
+/// re-requested in between, putting a brand new `BuildingD1` circle under the
+/// same key) — anything else means this attempt is stale, so it saves and
+/// swaps nothing. Otherwise it saves the new `follows`, `d2_sample`,
+/// `checked`, `follows_me` and `d1_refreshed_at = now` through
+/// `viewer_replace_circle` in one transaction (leaving `last_request_at`
+/// untouched, defect AL) — a `false` result means the row was gone (BC6a) —
+/// then swaps the result into memory, still checked against that same
+/// recorded version (`GraphHandle::replace_if_present`, BC5), and drops the
+/// viewer's cached lists. On any failure — reading candidates, `refresh`
+/// itself, the staleness check, or the save — the old circle is left
+/// completely untouched in memory and SQLite, and the job is retried after
+/// `retry_delay` with no give-up count (BC1b, BC6).
 #[allow(clippy::too_many_arguments)]
 async fn run_refresh<S: GraphSource>(
     viewer: &ViewerDid,
@@ -899,13 +908,23 @@ async fn run_refresh<S: GraphSource>(
     snapshot: &SnapshotHandle,
     follows_me_depth: usize,
 ) {
-    if handle.get(viewer).is_none() {
-        // BC6a: the circle was evicted while this job waited its turn.
-        // Nothing to refresh; the job completes without saving or swapping
-        // anything.
-        queue.complete(&Job::Refresh(viewer.clone()));
-        return;
-    }
+    let started_version = match handle.get(viewer) {
+        Some(circle) if circle.state == CircleState::Ready => circle.circle_version,
+        Some(_) => {
+            // Defect AM: the circle exists but is not `Ready` — e.g. a fresh
+            // first build now runs for this viewer after an eviction and
+            // re-request. Nothing of this refresh's to touch.
+            queue.complete(&Job::Refresh(viewer.clone()));
+            return;
+        }
+        None => {
+            // BC6a: the circle was evicted while this job waited its turn.
+            // Nothing to refresh; the job completes without saving or
+            // swapping anything.
+            queue.complete(&Job::Refresh(viewer.clone()));
+            return;
+        }
+    };
 
     if snapshot.current().generation == 0 {
         // Defect AE, applied to a refresh: no scorer pass has swapped a
@@ -936,14 +955,21 @@ async fn run_refresh<S: GraphSource>(
         }
     };
 
-    if handle.get(viewer).is_none() {
-        // BC6a: evicted while `refresh` ran. Save nothing.
+    let still_current = matches!(
+        handle.get(viewer),
+        Some(current) if current.circle_version == started_version
+            && current.state == CircleState::Ready
+    );
+    if !still_current {
+        // BC6a, extended by defect AM: evicted while `refresh` ran, or
+        // evicted and re-requested (a different circle now under this key).
+        // Save nothing, swap nothing.
         queue.complete(&Job::Refresh(viewer.clone()));
         return;
     }
 
     let now = unix_now();
-    if let Err(err) = store.viewer_replace_circle(
+    match store.viewer_replace_circle(
         &viewer.0,
         CircleState::Ready.as_str(),
         now,
@@ -953,13 +979,21 @@ async fn run_refresh<S: GraphSource>(
         &circle.checked,
         &circle.follows_me,
     ) {
-        tracing::warn!(kind = ?err, "graph: refresh failed to save the new circle");
-        schedule_retry(queue, Job::Refresh(viewer.clone()), retry_delay);
-        return;
+        Ok(true) => {}
+        Ok(false) => {
+            // Defect AM: the row was gone by the time the save ran (BC6a).
+            queue.complete(&Job::Refresh(viewer.clone()));
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(kind = ?err, "graph: refresh failed to save the new circle");
+            schedule_retry(queue, Job::Refresh(viewer.clone()), retry_delay);
+            return;
+        }
     }
 
     circle.d1_refreshed_at = Some(now);
-    if handle.replace_if_present(viewer, circle).is_some() {
+    if handle.replace_if_present(viewer, circle, started_version).is_some() {
         if let Some(drop_lists) = drop_lists {
             drop_lists(&viewer.0);
         }
@@ -967,16 +1001,21 @@ async fn run_refresh<S: GraphSource>(
     queue.complete(&Job::Refresh(viewer.clone()));
 }
 
-/// A `Refill` job (story 09 spec.md BC7a, BC7b): fetches `account`'s newest
-/// follows through [`fetch_account_follows`] at `d2_follows_depth`, saves
-/// them to SQLite (`Store::follows_put`) and, only on that save's success,
-/// puts the result in the shared [`FollowsCache`] (the same BC4a ordering
-/// [`run_step3`] follows), then drops the cached list of every viewer whose
-/// in-memory circle's `d2_sample` names `account`
-/// (`GraphHandle::viewers_naming_account`). A `PdsError` from the fetch or a
+/// A `Refill` job (story 09 spec.md BC7a, BC7b): completes with no fetch
+/// (review round 1, defect AO) when no circle in memory names `account` any
+/// more (`GraphHandle::viewers_naming_account`, e.g. the only one that did
+/// was evicted while this job waited its turn) or the cache already holds a
+/// fresh entry for it (`FollowsCache::is_fresh`, a future `fetched_at`
+/// counting as stale). Otherwise fetches `account`'s newest follows through
+/// [`fetch_account_follows`] at `d2_follows_depth`, saves them to SQLite
+/// (`Store::follows_put`) and, only on that save's success, puts the result
+/// in the shared [`FollowsCache`] (the same BC4a ordering [`run_step3`]
+/// follows), then drops the cached list of every viewer whose in-memory
+/// circle's `d2_sample` names `account`. A `PdsError` from the fetch or a
 /// `StoreError` from the save leaves the cache entry — in memory and in
 /// SQLite — exactly as it was, logs with no DID, and retries after
-/// `retry_delay` with no give-up count (BC1b).
+/// `retry_delay` with no give-up count (BC1b): only a still-wanted, still-
+/// stale refill is ever retried this way.
 #[allow(clippy::too_many_arguments)]
 async fn run_refill<S: GraphSource>(
     account: &str,
@@ -987,8 +1026,29 @@ async fn run_refill<S: GraphSource>(
     d2_follows_depth: u32,
     drop_lists: Option<&DropListsFn>,
     retry_delay: Duration,
+    d2_refresh_age_h: u32,
 ) {
+    if handle.viewers_naming_account(account).is_empty() {
+        // Defect AO: nothing in memory names this account any more.
+        queue.complete(&Job::Refill(account.to_string()));
+        return;
+    }
+
     let now = unix_now();
+    let is_fresh = match handle.follows_cache().get(store, account) {
+        Ok(Some((fetched_at, _))) => FollowsCache::is_fresh(now, fetched_at, d2_refresh_age_h),
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(kind = ?err, "graph: refill failed to read the cache entry's freshness");
+            false
+        }
+    };
+    if is_fresh {
+        // Defect AO: already fresh — no fetch needed.
+        queue.complete(&Job::Refill(account.to_string()));
+        return;
+    }
+
     let (hashed, _calls) = match fetch_account_follows(source, account, d2_follows_depth).await {
         Ok(result) => result,
         Err(err) => {
@@ -2098,6 +2158,144 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_keeps_last_request_at() {
+        // Review round 1, defect AL: a refresh's save must never reset the
+        // viewer's `last_request_at`, in memory or in SQLite, even though
+        // the save itself runs at a much later `now`.
+        let store = memory_store();
+        store.viewer_save_circle("did:plc:viewer", "ready", 1, 1, &[], &HashSet::new()).unwrap();
+
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let mut circle = Circle::new();
+        circle.last_request_at = 1_000;
+        handle.swap_circle(&viewer, circle, CircleState::Ready);
+        let queue = handle.queue();
+
+        let source = Arc::new(ChangingFollowsSource::new(vec!["did:plc:1".to_string()]));
+        let snapshot = SnapshotHandle::new();
+        snapshot.swap(Arc::new(Vec::new()), Arc::new(Vec::new()));
+
+        run_refresh(
+            &viewer,
+            &handle,
+            &queue,
+            &store,
+            &source,
+            10,
+            None,
+            Duration::from_millis(20),
+            &snapshot,
+            10,
+        )
+        .await;
+
+        let circle = handle.get(&viewer).expect("circle still exists");
+        assert!(circle.follows.contains(&hash_did("did:plc:1")), "the refresh actually ran");
+        assert_eq!(circle.last_request_at, 1_000, "in-memory last_request_at is untouched");
+
+        let row = store
+            .viewer_load_all()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.viewer_did == viewer.0)
+            .expect("the viewer row still exists");
+        assert_eq!(row.last_request_at, 1, "SQLite last_request_at is untouched");
+    }
+
+    /// A `GraphSource` that, on its first `get_follows` call, simulates the
+    /// viewer being evicted and re-requested while a `Refresh` job's own PDS
+    /// calls are still in flight (review round 1, defect AM), for
+    /// [`stale_refresh_never_overwrites_a_new_circle`]: a fresh `BuildingD1`
+    /// circle sits under the same key by the time `refresh()` returns.
+    struct EvictingMidRefreshSource {
+        handle: Arc<GraphHandle>,
+        viewer: ViewerDid,
+        follows: Vec<String>,
+    }
+
+    impl GraphSource for EvictingMidRefreshSource {
+        async fn get_follows(
+            &self,
+            _actor: &str,
+            limit: u32,
+            cursor: Option<String>,
+        ) -> Result<FollowsPage, PdsError> {
+            self.handle.evict(&self.viewer, crate::graph::EvictReason::Idle);
+            self.handle.enqueue_first_build(self.viewer.clone(), unix_now());
+            let offset: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+            let end = (offset + limit as usize).min(self.follows.len());
+            let dids =
+                self.follows.get(offset.min(self.follows.len())..end).unwrap_or_default().to_vec();
+            let cursor = if end < self.follows.len() { Some(end.to_string()) } else { None };
+            Ok(FollowsPage { dids, cursor })
+        }
+
+        async fn get_relationships(
+            &self,
+            _actor: &str,
+            _others: &[String],
+        ) -> Result<Vec<String>, PdsError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_never_overwrites_a_new_circle() {
+        // Review round 1, defect AM: the viewer is evicted and re-requested
+        // while this `Refresh` job's own PDS calls are still in flight. A
+        // new, freshly created `BuildingD1` circle now sits under the same
+        // key by the time `refresh()` returns. The stale refresh must save
+        // nothing to SQLite and swap nothing over that new circle.
+        let store = memory_store();
+        store.viewer_save_circle("did:plc:viewer", "ready", 1, 1, &[], &HashSet::new()).unwrap();
+
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        handle.swap_circle(&viewer, Circle::new(), CircleState::Ready);
+        let queue = handle.queue();
+
+        let source = EvictingMidRefreshSource {
+            handle: Arc::clone(&handle),
+            viewer: viewer.clone(),
+            follows: vec!["did:plc:1".to_string()],
+        };
+        let snapshot = SnapshotHandle::new();
+        snapshot.swap(Arc::new(Vec::new()), Arc::new(Vec::new()));
+
+        run_refresh(
+            &viewer,
+            &handle,
+            &queue,
+            &store,
+            &source,
+            10,
+            None,
+            Duration::from_millis(20),
+            &snapshot,
+            10,
+        )
+        .await;
+
+        let circle = handle.get(&viewer).expect("the new first build's circle exists");
+        assert_eq!(circle.state, CircleState::BuildingD1, "the new circle was never overwritten");
+
+        let row = store
+            .viewer_load_all()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.viewer_did == viewer.0)
+            .expect("the viewer row still exists");
+        assert_eq!(row.state, "ready", "the stale refresh saved nothing to SQLite");
+
+        assert_eq!(
+            queue.try_pop(),
+            Some(Job::FirstBuild(viewer.clone())),
+            "the new circle's own first build still has a job"
+        );
+    }
+
+    #[tokio::test]
     async fn refill_success_fetches_saves_and_caches() {
         // BC7a: a `Refill` job fetches the account's follows, saves them to
         // SQLite, puts them in the shared cache, and drops the cached list
@@ -2126,6 +2324,7 @@ pub(crate) mod tests {
             100,
             Some(&drop_lists),
             Duration::from_millis(20),
+            24,
         )
         .await;
 
@@ -2153,6 +2352,10 @@ pub(crate) mod tests {
         store.follows_put("did:plc:account", 1, &[hash_did("did:plc:old")]).unwrap();
         let handle = GraphHandle::new(10);
         handle.follows_cache().put("did:plc:account", 1, vec![hash_did("did:plc:old")]);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let mut circle = Circle::new();
+        circle.d2_sample = vec!["did:plc:account".to_string()];
+        handle.swap_circle(&viewer, circle, CircleState::Ready);
         let queue = handle.queue();
 
         let source = FailingSource { calls: StdMutex::new(0) };
@@ -2165,6 +2368,10 @@ pub(crate) mod tests {
             100,
             None,
             Duration::from_millis(20),
+            // A zero refresh age: `FollowsCache::is_fresh` never treats any
+            // age as fresh against it, so this test's entry is always stale
+            // regardless of the real clock.
+            0,
         )
         .await;
 
@@ -2177,6 +2384,43 @@ pub(crate) mod tests {
             queue.try_pop(),
             Some(Job::Refill("did:plc:account".to_string())),
             "the job was re-queued after the retry delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn refill_not_named_completes() {
+        // Review round 1, defect AO: the only circle naming the account is
+        // evicted before this `Refill` runs. It completes with no fetch, and
+        // a later `push` of the same job is accepted again (its outstanding
+        // mark was cleared by `complete`, not left set as a retry would).
+        let store = memory_store();
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let mut circle = Circle::new();
+        circle.d2_sample = vec!["did:plc:account".to_string()];
+        handle.swap_circle(&viewer, circle, CircleState::Ready);
+        handle.evict(&viewer, crate::graph::EvictReason::Idle);
+        let queue = handle.queue();
+
+        let source = FailingSource { calls: StdMutex::new(0) };
+        run_refill(
+            "did:plc:account",
+            &handle,
+            &queue,
+            &store,
+            &source,
+            100,
+            None,
+            Duration::from_millis(20),
+            24,
+        )
+        .await;
+
+        assert_eq!(*source.calls.lock().unwrap(), 0, "no fetch was made");
+        assert!(queue.try_pop().is_none(), "no retry job for a completed run");
+        assert!(
+            queue.push(Job::Refill("did:plc:account".to_string())),
+            "the outstanding mark was cleared by complete, not left set for a retry"
         );
     }
 

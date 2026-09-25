@@ -548,12 +548,13 @@ impl Store {
         viewers::viewer_set_state_if_exists(&conn, viewer_did, state)
     }
 
-    /// Saves a refresh's result: the `viewers` row's refresh fields, plus a
-    /// full replace of `viewer_follows` and `viewer_checks`, in one
-    /// transaction (story 09 spec.md BC5). Never creates a `viewers` row
-    /// (BC6a). No production caller yet: the worker's refresh path
-    /// (`graph/queue.rs`, story 09) is the first.
-    #[allow(dead_code)]
+    /// Saves a refresh's result: the `viewers` row's `state`, `d1_refreshed_at`
+    /// and `d2_sample`, plus a full replace of `viewer_follows` and
+    /// `viewer_checks`, in one transaction (story 09 spec.md BC5).
+    /// `last_request_at` is left untouched (review round 1, defect AL).
+    /// Never creates a `viewers` row (BC6a); returns whether a row was
+    /// actually updated, so `graph::queue::run_refresh` knows whether to
+    /// swap the new circle into memory (review round 1, defect AM).
     #[allow(clippy::too_many_arguments)]
     pub fn viewer_replace_circle(
         &self,
@@ -565,7 +566,7 @@ impl Store {
         follows: &std::collections::HashSet<u64>,
         checked: &std::collections::HashSet<u64>,
         follows_me: &std::collections::HashSet<u64>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let conn = self.lock()?;
         viewers::viewer_replace_circle(
             &conn,
