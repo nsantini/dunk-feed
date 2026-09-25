@@ -397,11 +397,14 @@ fn build_personal<'a>(
     let limit = resolve_limit(params.get("limit").map(String::as_str))?;
     let cursor_value = resolve_personal_cursor(params.get("cursor").map(String::as_str))?;
 
-    // BC4, BC5, BC6a: no graph subsystem, no circle yet, or still building
-    // all serve the empty page. `enqueue_first_build` is itself a no-op
-    // for a viewer that already has a circle (building or ready) or once
-    // `UPSTAGE_MAX_VIEWERS` is reached (BC6a), so calling it here never
-    // risks a second job.
+    // BC4, BC5: no graph subsystem or no circle yet serve the empty page.
+    // `enqueue_first_build` is itself a no-op for a viewer that already has
+    // a circle (building or ready); at `UPSTAGE_MAX_VIEWERS` it now evicts
+    // the least recently active circle to make room instead of refusing
+    // (story 09 spec.md BC10, replacing story 06's cap refusal), so calling
+    // it here still never risks a second job for the same viewer, and an
+    // evicted viewer's own next request (this same code path) just starts
+    // a fresh first build (BC12).
     let Some(graph) = &state.graph else {
         return Ok(empty_response());
     };
@@ -1395,10 +1398,12 @@ mod tests {
         );
     }
 
-    // BC6a: at `UPSTAGE_MAX_VIEWERS`, a new viewer's personalised request
-    // still gets the empty page (the cap itself, and its one-per-minute
-    // warning, are `graph::GraphHandle::enqueue_first_build`'s own
-    // contract, proven directly in `graph::tests`).
+    // Story 09 spec.md BC10: at `UPSTAGE_MAX_VIEWERS`, a new viewer's
+    // personalised request still gets the empty page — its own circle only
+    // starts building on this same request, whether or not the cap made
+    // room for it by evicting another viewer first. The eviction itself is
+    // `graph::GraphHandle::enqueue_first_build`'s own contract, proven
+    // directly in `graph::tests::lru_eviction`.
     #[tokio::test]
     async fn at_cap_new_viewer_gets_empty_page() {
         let cfg = test_config_personalised("127.0.0.1:0");
@@ -1435,6 +1440,65 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["feed"].as_array().unwrap().len(), 0);
+    }
+
+    // AC8; story 09 spec.md BC12, BC6b: an evicted viewer's next
+    // personalised request is served the same way as any other first open
+    // (BC4) — the empty page, plus a fresh `FirstBuild` job — even though
+    // this viewer already had a `Ready` circle once.
+    #[tokio::test]
+    async fn evicted_viewer_first_open() {
+        let cfg = test_config_personalised("127.0.0.1:0");
+        let cache = std::sync::Arc::new(crate::auth::KeyCache::new(10));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let auth = crate::http::AuthHandle {
+            cache: std::sync::Arc::clone(&cache),
+            resolver_tx: tx,
+            cfg: crate::auth::AuthConfig { service_did: cfg.service_did.clone() },
+        };
+        let now = crate::store::unix_now();
+        let did = "did:plc:evictedvieweraaaaaaaaaaa";
+        let token = crate::auth::seed_and_sign_for_test(&cache, did, &cfg.service_did, now);
+        let viewer = crate::auth::ViewerDid(did.to_string());
+
+        let graph = crate::graph::GraphHandle::new(10);
+        graph.enqueue_first_build(viewer.clone(), now);
+        graph.insert_ready(&viewer, crate::graph::Circle::new());
+        assert!(graph.get(&viewer).is_some(), "the viewer has a circle before eviction");
+
+        graph.evict(&viewer, crate::graph::EvictReason::Idle);
+        assert!(graph.get(&viewer).is_none(), "eviction removed the circle");
+
+        let state = crate::http::tests::test_state_with_graph(
+            cfg.clone(),
+            auth,
+            std::sync::Arc::clone(&graph),
+        );
+        let app = router(state);
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["feed"].as_array().unwrap().len(),
+            0,
+            "BC12: the same empty page a first open gets"
+        );
+
+        assert!(
+            graph.get(&viewer).is_some(),
+            "BC12: the request started a fresh first build for the evicted viewer"
+        );
     }
 
     // BC11, BC14, BC17b: a viewer's list shorter than `limit` is served

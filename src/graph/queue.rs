@@ -227,6 +227,32 @@ impl JobQueue {
     fn clear_step2_attempts(&self, viewer: &ViewerDid) {
         self.step2_attempts.lock().expect("JobQueue step2_attempts poisoned").remove(viewer);
     }
+
+    /// Clears every give-up attempt count recorded for `viewer` (story 09
+    /// spec.md BC11a): called from `GraphHandle::evict`, so a viewer's next
+    /// first build — after its cooldown, if a later give-up ever sets one —
+    /// starts counting failures from zero rather than inheriting whatever
+    /// this viewer's previous, now-evicted circle had racked up.
+    pub(crate) fn forget(&self, viewer: &ViewerDid) {
+        self.clear_attempts(viewer);
+        self.clear_step2_attempts(viewer);
+    }
+}
+
+/// BC6a, BC6b: called once a `FirstBuild` step's own existence check finds
+/// `viewer`'s circle gone — evicted (`GraphHandle::evict`) while this job
+/// waited its turn or ran. Completes `job` with nothing saved or swapped
+/// (BC6a), then re-queues it at once if a circle already exists for
+/// `viewer` again (BC6b): a request that arrived while `job`'s outstanding
+/// mark was still set found `JobQueue::push` a no-op, so its new circle
+/// would otherwise sit with no job until this viewer's next request
+/// happened to retry it.
+fn abandon_evicted_job(handle: &Arc<GraphHandle>, queue: &Arc<JobQueue>, viewer: &ViewerDid) {
+    let job = Job::FirstBuild(viewer.clone());
+    queue.complete(&job);
+    if handle.get(viewer).is_some() {
+        queue.push(job);
+    }
 }
 
 /// One job's dispatch (story 09 spec.md `## Approach`): a `FirstBuild` runs
@@ -362,9 +388,14 @@ async fn process_first_build<S: GraphSource>(
     } else {
         match handle.get(viewer) {
             Some(circle) => (*circle).clone(),
-            // The viewer was removed (e.g. a concurrent give-up) between
-            // the queue pop and this read; nothing left to build for it.
-            None => return,
+            // BC6a: the viewer was removed (a concurrent give-up or
+            // eviction) between the queue pop and this read; nothing left
+            // to build for it. BC6b: if a fresh request already recreated
+            // a circle for it, that circle still needs a job.
+            None => {
+                abandon_evicted_job(handle, queue, viewer);
+                return;
+            }
         }
     };
 
@@ -392,7 +423,12 @@ async fn process_first_build<S: GraphSource>(
 /// circle for [`process_first_build`] to hand to [`run_step2`]. On any
 /// failure — a `PdsError` from `step_follows`, or a `StoreError` from either
 /// save (BC24) — hands off to [`handle_step1_failure`] (BC8 as amended,
-/// defect W) and returns `None`.
+/// defect W) and returns `None`. Checks `handle` still holds a circle for
+/// `viewer` before each of its two saves (story 09 spec.md BC6a): an
+/// eviction (`GraphHandle::evict`) may have removed it while this attempt
+/// waited its turn or ran, and neither save is allowed to recreate it —
+/// [`abandon_evicted_job`] handles that case (and BC6b) instead, and this
+/// also returns `None`.
 #[allow(clippy::too_many_arguments)]
 async fn run_step1<S: GraphSource>(
     viewer: &ViewerDid,
@@ -404,6 +440,12 @@ async fn run_step1<S: GraphSource>(
     drop_lists: Option<&DropListsFn>,
     retry_delay: Duration,
 ) -> Option<Circle> {
+    if handle.get(viewer).is_none() {
+        // BC6a: evicted before step 1 ever started saving.
+        abandon_evicted_job(handle, queue, viewer);
+        return None;
+    }
+
     let start_now = unix_now();
     if let Err(err) =
         store.viewer_save_state(&viewer.0, CircleState::BuildingD1.as_str(), start_now)
@@ -420,6 +462,12 @@ async fn run_step1<S: GraphSource>(
     {
         tracing::warn!(kind = ?err, "graph: worker step_follows failed");
         handle_step1_failure(viewer, handle, queue, store, drop_lists, retry_delay).await;
+        return None;
+    }
+
+    if handle.get(viewer).is_none() {
+        // BC6a: evicted while `step_follows` ran.
+        abandon_evicted_job(handle, queue, viewer);
         return None;
     }
 
@@ -575,6 +623,13 @@ async fn run_step2<S: GraphSource>(
     d2_follows_depth: u32,
     d2_refresh_age_h: u32,
 ) {
+    if handle.get(viewer).is_none() {
+        // Story 09 spec.md BC6a: evicted before step 2 (or its resumed
+        // retry) ever started.
+        abandon_evicted_job(handle, queue, viewer);
+        return;
+    }
+
     if snapshot.current().generation == 0 {
         // Defect AE: no scorer pass has swapped a real snapshot in yet.
         // Not a failure — just nothing to check against yet.
@@ -593,6 +648,13 @@ async fn run_step2<S: GraphSource>(
 
     let depth = ranked.len();
     let step_result = step_follows_me(source, &viewer.0, &ranked, depth, &mut circle).await;
+
+    if handle.get(viewer).is_none() {
+        // BC6a: evicted while `step_follows_me` ran, before this attempt's
+        // own save.
+        abandon_evicted_job(handle, queue, viewer);
+        return;
+    }
 
     // Story 08 BC5a, BC5b: a clean step 2 saves and swaps in as
     // `building_d2` (step 3 runs next); a `PdsError` part way through still
@@ -740,8 +802,16 @@ async fn run_step3<S: GraphSource>(
     d2_refresh_age_h: u32,
     drop_lists: Option<&DropListsFn>,
 ) {
-    let d2_sample: Vec<String> =
-        handle.get(viewer).map(|c| c.d2_sample.clone()).unwrap_or_default();
+    let Some(circle) = handle.get(viewer) else {
+        // Story 09 spec.md BC6a: evicted before step 3 ever started.
+        // `mark_ready` and `viewer_set_state_if_exists` below are already
+        // no-ops for a missing viewer (defect AI), but this also skips the
+        // per-account fetch loop entirely rather than doing pointless work
+        // for a circle nothing will ever read again.
+        abandon_evicted_job(handle, queue, viewer);
+        return;
+    };
+    let d2_sample: Vec<String> = circle.d2_sample.clone();
     let cache = handle.follows_cache();
 
     let mut seen: HashSet<&str> = HashSet::new();
@@ -2163,5 +2233,101 @@ pub(crate) mod tests {
             Some(Job::Refill("did:plc:account".to_string())),
             "the job was re-queued after the retry delay"
         );
+    }
+
+    #[tokio::test]
+    async fn evicted_during_job_saves_nothing() {
+        // AC10; story 09 spec.md BC6a: a circle evicted (`GraphHandle::
+        // evict`) after its `FirstBuild` job was already popped, but before
+        // that job runs, must save nothing to SQLite and swap nothing into
+        // memory once the job finally executes — `run_step1`'s own
+        // existence check catches this before its first save.
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        handle.enqueue_first_build(viewer.clone(), unix_now());
+        let queue = handle.queue();
+        let job = queue.pop().await;
+        assert_eq!(job, Job::FirstBuild(viewer.clone()));
+
+        handle.evict(&viewer, crate::graph::EvictReason::Idle);
+
+        let store = memory_store();
+        let source = ManyFollowsSource { follows: vec![did(1)] };
+        process_job(
+            job,
+            &handle,
+            &queue,
+            &store,
+            &source,
+            10,
+            None,
+            Duration::from_millis(20),
+            &SnapshotHandle::new(),
+            10,
+            100,
+            24,
+        )
+        .await;
+
+        assert!(handle.get(&viewer).is_none(), "nothing was recreated in memory");
+        assert!(store.viewer_load_all().unwrap().is_empty(), "nothing was saved to SQLite");
+        assert!(
+            queue.try_pop().is_none(),
+            "no job was re-queued: no new circle appeared for this viewer"
+        );
+    }
+
+    #[test]
+    fn abandon_evicted_job_requeues_when_a_new_circle_already_exists() {
+        // BC6b, a direct test of the completion helper every step's
+        // eviction check hands off to: a circle already existing for
+        // `viewer` by the time this runs (a request that arrived while the
+        // old job's own outstanding mark was still set, so its own `push`
+        // no-oped) gets the job back the moment that mark clears.
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let queue = handle.queue();
+        let job = Job::FirstBuild(viewer.clone());
+        queue.push(job.clone());
+        queue.try_pop();
+
+        handle.enqueue_first_build(viewer.clone(), unix_now());
+
+        abandon_evicted_job(&handle, &queue, &viewer);
+
+        assert_eq!(queue.try_pop(), Some(job), "the new circle gets a job");
+    }
+
+    #[test]
+    fn abandon_evicted_job_requeues_nothing_with_no_circle() {
+        // BC6a's ordinary case: nothing recreated the circle, so nothing is
+        // queued.
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let queue = handle.queue();
+        let job = Job::FirstBuild(viewer.clone());
+        queue.push(job.clone());
+        queue.try_pop();
+
+        abandon_evicted_job(&handle, &queue, &viewer);
+
+        assert!(queue.try_pop().is_none(), "nothing to build, nothing queued");
+    }
+
+    #[test]
+    fn forget_clears_both_give_up_counters() {
+        // BC11a: `GraphHandle::evict` calls `forget` so a viewer's next
+        // first build starts counting failures from zero, whether it was
+        // step 1's count, step 2's, or both.
+        let queue = JobQueue::new();
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+
+        assert_eq!(queue.record_failure(&viewer), 1);
+        assert_eq!(queue.record_step2_failure(&viewer), 1);
+
+        queue.forget(&viewer);
+
+        assert_eq!(queue.record_failure(&viewer), 1, "step 1's count restarted at zero");
+        assert_eq!(queue.record_step2_failure(&viewer), 1, "step 2's count restarted at zero");
     }
 }

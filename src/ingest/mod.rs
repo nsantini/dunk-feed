@@ -883,6 +883,10 @@ fn start_graph_subsystem(
             viewer_lists.drop_viewer(&crate::auth::ViewerDid(viewer_did.to_string()));
         })
     };
+    // Story 09 spec.md BC11a: `GraphHandle::evict` (idle or LRU) has no
+    // `Store` or drop-lists callback of its own to reach for — it shares
+    // this same one, registered once here right after both exist.
+    graph_handle.set_drop_lists(std::sync::Arc::clone(&drop_lists));
 
     let worker_handle = std::sync::Arc::clone(&graph_handle);
     let worker_store = graph_store.clone();

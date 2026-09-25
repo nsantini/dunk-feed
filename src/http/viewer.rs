@@ -118,7 +118,11 @@ impl ViewerLists {
     /// Drops every cached entry for `viewer` (BC7: called from the
     /// worker's drop-lists callback once a fresh circle swaps in), so the
     /// next request rebuilds against the new circle rather than serving a
-    /// list filtered against the one it just replaced.
+    /// list filtered against the one it just replaced. Also called on
+    /// eviction (story 09 spec.md BC11a, `GraphHandle::evict`'s own
+    /// drop-lists call): an evicted viewer's next request is a fresh first
+    /// build (BC12), so its old list must not survive to be served against
+    /// a stale, no-longer-existing circle.
     pub fn drop_viewer(&self, viewer: &ViewerDid) {
         self.entries.lock().expect("ViewerLists mutex poisoned").remove(viewer);
     }
