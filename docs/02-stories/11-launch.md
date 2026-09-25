@@ -1,6 +1,6 @@
 # 11 — Launch
 
-- **Follows**: 04, 10
+- **Follows**: 04, 10, 10b
 - **PRD story**: See only pairs from my circle; Viewers without a valid login; Limit the number of stored circles
 - **Size**: small
 - **Design**: docs/02-TECH-DESIGN-network-feed.md §4, §10, §15, §16
@@ -56,7 +56,7 @@ global output. Then update the documents.
 | `src/ingest/mod.rs` | `run` fails before any task starts when the switch is `true` and a credential is missing |
 | `src/http/skeleton.rs` | Regression test for the switch `false` |
 | `.env.example` | All new variables from design §4, with defaults and one comment each |
-| `docs/RUNBOOK.md` | New variables, the kill switch procedure, the `graph-probe` command, the `graph.health` and `graph.evicted` lines |
+| `docs/RUNBOOK.md` | New variables (including `UPSTAGE_RESOLVER_MISSES_PER_MIN`, `UPSTAGE_GRAPH_LRU_EVICT_PER_MIN` and `UPSTAGE_GRAPH_LRU_PROTECT_MIN` from story 10b), the kill switch procedure, the `graph-probe` command, the `graph.health`, `graph.evicted`, `auth.miss_limited` and `graph.lru_refused` lines |
 | `docs/01-TECH-DESIGN.md` | One pointer line in §8 and one in §11.1 to `02-TECH-DESIGN-network-feed.md` |
 
 ## Behaviour contracts
@@ -204,7 +204,7 @@ global output. Then update the documents.
 
     ```
     grep -n UPSTAGE_PERSONALISE .env.example
-    grep -nE 'graph-probe|graph.health|graph.evicted|UPSTAGE_PERSONALISE=false' docs/RUNBOOK.md
+    grep -nE 'graph-probe|graph.health|graph.evicted|auth.miss_limited|graph.lru_refused|UPSTAGE_PERSONALISE=false' docs/RUNBOOK.md
     grep -n 02-TECH-DESIGN-network-feed docs/01-TECH-DESIGN.md
     ```
 
