@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::time::MissedTickBehavior;
 
-use super::{EvictReason, GraphHandle, QueueDepth};
+use super::{Circle, EvictReason, GraphHandle, QueueDepth};
 use crate::scorer::snapshot::SnapshotHandle;
 use crate::store::unix_now;
 
@@ -200,6 +200,26 @@ pub fn health_line(inputs: HealthInputs) -> Value {
     })
 }
 
+/// One active viewer's [`ViewerHealth`], or `None` when the viewer was
+/// evicted between `active_viewers` listing it and this call reading its
+/// circle (round 1 finding 1): [`emit_health_line`]'s per-viewer step,
+/// pulled out so a test can drive it directly without a live snapshot or
+/// follows cache for every field.
+fn viewer_health(
+    handle: &Arc<GraphHandle>,
+    viewer: &crate::auth::ViewerDid,
+    snap: &crate::scorer::snapshot::Snapshot,
+    follows_me_depth: usize,
+    follows_cache: &super::cache::FollowsCache,
+    cutoff: i64,
+) -> Option<ViewerHealth> {
+    let circle = handle.get(viewer)?;
+    let items = crate::http::viewer::health_items(&circle, snap, follows_me_depth, follows_cache);
+    let new_pairs_24h = items.iter().filter(|item| item.promoted_at >= cutoff).count() as u64;
+    let degree2_only_items = items.iter().filter(|item| item.degree2_only).count();
+    Some(ViewerHealth { new_pairs_24h, total_items: items.len(), degree2_only_items })
+}
+
 /// Builds one hour's [`HealthInputs`] from live state and logs the
 /// `graph.health` line through [`health_line`] (BC1-BC9): reads
 /// `handle`'s active viewers (BC2), each one's current list through
@@ -209,7 +229,11 @@ pub fn health_line(inputs: HealthInputs) -> Value {
 /// is built, so a concurrent writer between this call and the line being
 /// logged is the only window BC9's reset can ever miss. Named fields, not
 /// a single blown-in JSON blob, the same convention `Stats::emit`
-/// (`src/ingest/mod.rs`) already uses for its own periodic line.
+/// (`src/ingest/mod.rs`) already uses for its own periodic line. A viewer
+/// that `active_viewers` lists but that is evicted before `handle.get` runs
+/// is skipped outright (`filter_map`, not `unwrap_or_default`) — round 1
+/// finding 1 — so it adds no phantom zero-item entry to `active_viewers`
+/// (BC2) or `zero_share` (BC4).
 fn emit_health_line<C: CallCountsSource>(
     handle: &Arc<GraphHandle>,
     calls: &C,
@@ -225,22 +249,8 @@ fn emit_health_line<C: CallCountsSource>(
     let viewers: Vec<ViewerHealth> = handle
         .active_viewers(now, idle_evict_d)
         .iter()
-        .map(|viewer| {
-            let items = handle
-                .get(viewer)
-                .map(|circle| {
-                    crate::http::viewer::health_items(
-                        &circle,
-                        &snap,
-                        follows_me_depth,
-                        &follows_cache,
-                    )
-                })
-                .unwrap_or_default();
-            let new_pairs_24h =
-                items.iter().filter(|item| item.promoted_at >= cutoff).count() as u64;
-            let degree2_only_items = items.iter().filter(|item| item.degree2_only).count();
-            ViewerHealth { new_pairs_24h, total_items: items.len(), degree2_only_items }
+        .filter_map(|viewer| {
+            viewer_health(handle, viewer, &snap, follows_me_depth, &follows_cache, cutoff)
         })
         .collect();
 
@@ -483,6 +493,77 @@ mod tests {
         assert!(
             calls.take_call_counts().is_empty(),
             "the call counter is reset after a line (BC9)"
+        );
+    }
+
+    // BC2, BC4, round 1 finding 1: a viewer `active_viewers` lists, but that
+    // is evicted before `viewer_health` reads its circle, contributes no
+    // phantom zero-item entry — it must be absent from `active_viewers`
+    // (not merely present with `total_items: 0`), and it must not push
+    // `zero_share` up for the viewers that really are still there.
+    #[tokio::test]
+    async fn evicted_viewer_not_counted() {
+        use crate::auth::ViewerDid;
+        use crate::scorer::snapshot::FeedItem;
+
+        let handle = GraphHandle::new(10);
+        let present = ViewerDid("did:plc:present".to_string());
+        let evicted = ViewerDid("did:plc:evicted".to_string());
+
+        let step1_author = crate::graph::hash_did("did:plc:step1-author");
+        let mut present_circle = Circle::new();
+        present_circle.follows = [step1_author].into_iter().collect();
+        handle.insert_ready(&present, present_circle);
+
+        let mut evicted_circle = Circle::new();
+        evicted_circle.follows = [step1_author].into_iter().collect();
+        handle.insert_ready(&evicted, evicted_circle);
+
+        let now = unix_now();
+        let item = FeedItem {
+            quote_uri: "at://q/0".to_string(),
+            quote_cid: "cid0".to_string(),
+            rank: 1.0,
+            ratio: 1.0,
+            quote_did: step1_author,
+            original_did: crate::graph::hash_did("did:plc:o0"),
+            quoted_at: now,
+            promoted_at: now,
+        };
+        let snapshot = SnapshotHandle::new();
+        snapshot.swap(Arc::new(vec![item]), Arc::new(vec![0]));
+        let snap = snapshot.current();
+        let follows_cache = handle.follows_cache();
+
+        // `active_viewers` listed both a moment ago; `evicted` is gone from
+        // `handle` by the time `viewer_health` runs — the exact race BC2 and
+        // BC4 must survive.
+        let listed = [present.clone(), evicted.clone()];
+        handle.evict(&evicted, EvictReason::Idle);
+
+        let viewers: Vec<ViewerHealth> = listed
+            .iter()
+            .filter_map(|viewer| viewer_health(&handle, viewer, &snap, 0, &follows_cache, 0))
+            .collect();
+
+        assert_eq!(
+            viewers.len(),
+            1,
+            "the evicted viewer adds no entry at all (BC2), not one with total_items: 0"
+        );
+
+        let line = health_line(HealthInputs {
+            viewers,
+            evicted: (1, 0),
+            graph_calls: HashMap::new(),
+            queue_depth: QueueDepth { first_build: 0, refresh: 0, refill: 0 },
+        });
+
+        assert_eq!(line["active_viewers"], 1, "BC2: only the still-present viewer counts");
+        assert_eq!(
+            line["zero_share"], 0.0,
+            "BC4: the present viewer has a new pair, and the evicted viewer must not add a \
+             phantom zero-item entry that would push this above 0.0"
         );
     }
 
