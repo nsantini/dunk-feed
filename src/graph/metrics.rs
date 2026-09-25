@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::time::MissedTickBehavior;
 
-use super::{Circle, EvictReason, GraphHandle, QueueDepth};
+use super::{EvictReason, GraphHandle, QueueDepth};
 use crate::scorer::snapshot::SnapshotHandle;
 use crate::store::unix_now;
 
@@ -511,11 +511,11 @@ mod tests {
         let evicted = ViewerDid("did:plc:evicted".to_string());
 
         let step1_author = crate::graph::hash_did("did:plc:step1-author");
-        let mut present_circle = Circle::new();
+        let mut present_circle = crate::graph::Circle::new();
         present_circle.follows = [step1_author].into_iter().collect();
         handle.insert_ready(&present, present_circle);
 
-        let mut evicted_circle = Circle::new();
+        let mut evicted_circle = crate::graph::Circle::new();
         evicted_circle.follows = [step1_author].into_iter().collect();
         handle.insert_ready(&evicted, evicted_circle);
 
