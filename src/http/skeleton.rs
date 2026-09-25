@@ -1067,7 +1067,13 @@ mod tests {
             )
             .unwrap();
         store.viewer_save_circle(did_b, "ready", now, now, &[], &follows_b).unwrap();
-        let graph = crate::graph::GraphHandle::from_store(&store, 10).unwrap();
+        // Launch-blockers spec.md `## Files in scope`: this test caller of
+        // `from_store_with_lru_limits` uses protection `0` and a budget
+        // that does not bind, the same defaults `from_store` itself uses,
+        // so this test's behaviour is unchanged from before the LRU
+        // protection window and eviction budget existed.
+        let graph =
+            crate::graph::GraphHandle::from_store_with_lru_limits(&store, 10, 0, u32::MAX).unwrap();
 
         let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph);
         let item_a = item_with_authors(

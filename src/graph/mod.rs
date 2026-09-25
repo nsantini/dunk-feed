@@ -132,6 +132,43 @@ struct TouchEntry {
     last_flushed_at: i64,
 }
 
+/// Why [`GraphHandle::enqueue_first_build`]'s LRU pick created no circle
+/// and queued no job (launch-blockers spec.md BC17 to BC22): every circle
+/// at the cap has had a request inside the protection window
+/// ([`GraphHandle::lru_protect_min`]), or a victim exists but the
+/// per-minute eviction budget ([`GraphHandle::lru_evict_per_min`]) is
+/// already spent. `as_str` is the `reason` field the rate-limited
+/// `graph.lru_refused` log line carries — no DID, no handle, no hash
+/// (BC22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LruRefusal {
+    Protected,
+    Budget,
+}
+
+impl LruRefusal {
+    fn as_str(&self) -> &'static str {
+        match self {
+            LruRefusal::Protected => "protected",
+            LruRefusal::Budget => "budget",
+        }
+    }
+}
+
+/// The per-minute LRU eviction budget's bookkeeping (launch-blockers
+/// spec.md BC19, BC21, BC22), the same shape as `auth::did`'s
+/// `MissBudgetState`: `minute` is `now / 60`, the minute `count` was last
+/// reset for; `logged_minute` is the minute
+/// [`GraphHandle::log_lru_refused`] last logged a `graph.lru_refused` line
+/// for, so it fires at most once a minute regardless of how many first
+/// builds are refused in it, and regardless of which of the two reasons
+/// each one carries.
+struct LruBudgetState {
+    minute: i64,
+    count: u32,
+    logged_minute: Option<i64>,
+}
+
 /// [`GraphHandle`]'s circle map and cooldown map, held behind one lock
 /// (review round 2, defect AB): `enqueue_first_build`'s cooldown check and
 /// circle insert, and `remove_after_giving_up`'s circle removal and
@@ -184,6 +221,24 @@ pub struct GraphHandle {
     /// [`Self::evict_counts`] is the hourly metrics task's reader (slice
     /// 2.0).
     evictions: Arc<metrics::EvictCounters>,
+    /// Minutes a circle's effective `last_request_at`
+    /// ([`Self::effective_last_request_at`]) must be older than before
+    /// [`Self::enqueue_first_build`]'s LRU pick may choose it as a victim
+    /// (launch-blockers spec.md BC17, BC18). `0` disables the protection
+    /// entirely, the same LRU pick story 09 shipped. [`Self::new`] and
+    /// [`Self::from_store`] set this to `0`, so every caller that built a
+    /// handle before this protection existed — every other test in this
+    /// crate, including `graph::queue`'s — is unaffected;
+    /// [`Self::from_store_with_lru_limits`] is the one constructor that
+    /// sets a real window.
+    lru_protect_min: u32,
+    /// The most LRU evictions [`Self::enqueue_first_build`] may perform
+    /// across every viewer in one wall-clock minute (BC19, BC21).
+    /// [`Self::new`] and [`Self::from_store`] set this to `u32::MAX`,
+    /// effectively unbounded, for the same reason [`Self::lru_protect_min`]
+    /// defaults to `0`.
+    lru_evict_per_min: u32,
+    lru_budget: Mutex<LruBudgetState>,
 }
 
 impl GraphHandle {
@@ -202,11 +257,17 @@ impl GraphHandle {
     pub fn new(max_viewers: usize) -> Arc<Self> {
         let store =
             Store::open_memory().expect("GraphHandle::new: in-memory store opens and migrates");
-        Self::with_store(max_viewers, store)
+        Self::with_store(max_viewers, store, 0, u32::MAX)
     }
 
-    /// [`Self::new`] and [`Self::from_store`]'s shared constructor.
-    fn with_store(max_viewers: usize, store: Store) -> Arc<Self> {
+    /// [`Self::new`] and [`Self::from_store_with_lru_limits`]'s shared
+    /// constructor.
+    fn with_store(
+        max_viewers: usize,
+        store: Store,
+        lru_protect_min: u32,
+        lru_evict_per_min: u32,
+    ) -> Arc<Self> {
         Arc::new(GraphHandle {
             state: RwLock::new(GraphState::default()),
             queue: JobQueue::new(),
@@ -216,6 +277,13 @@ impl GraphHandle {
             store,
             drop_lists: Mutex::new(None),
             evictions: Arc::new(metrics::EvictCounters::new()),
+            lru_protect_min,
+            lru_evict_per_min,
+            lru_budget: Mutex::new(LruBudgetState {
+                minute: i64::MIN,
+                count: 0,
+                logged_minute: None,
+            }),
         })
     }
 
@@ -257,8 +325,38 @@ impl GraphHandle {
     /// just one. Also preloads the shared [`FollowsCache`] with every `follows_cache`
     /// row a loaded circle's `d2_sample` names (BC12), regardless of that
     /// circle's own state.
+    /// No production caller since launch-blockers slice 3.0:
+    /// `start_graph_subsystem` (`src/ingest/mod.rs`) and
+    /// `src/http/skeleton.rs`'s test caller both moved to
+    /// [`Self::from_store_with_lru_limits`], to pass real or explicit-default
+    /// LRU limits; `graph::queue`'s tests, which need no LRU behaviour of
+    /// their own, are this function's only remaining callers.
+    #[allow(dead_code)]
     pub fn from_store(store: &Store, max_viewers: usize) -> Result<Arc<Self>, StoreError> {
-        let handle = Self::with_store(max_viewers, store.clone());
+        Self::from_store_with_lru_limits(store, max_viewers, 0, u32::MAX)
+    }
+
+    /// [`Self::from_store`] with an explicit LRU protection window
+    /// (minutes) and eviction budget (evictions for each wall-clock
+    /// minute), launch-blockers spec.md BC17 to BC22: `src/ingest/mod.rs`'s
+    /// `start_graph_subsystem` calls this with
+    /// `UPSTAGE_GRAPH_LRU_PROTECT_MIN` and
+    /// `UPSTAGE_GRAPH_LRU_EVICT_PER_MIN`. [`Self::from_store`] itself calls
+    /// this with `0` and `u32::MAX` — no protection, no bound — so every
+    /// caller that predates this budget (`graph::queue`'s tests,
+    /// `src/http/skeleton.rs`'s production path) keeps story 09's plain LRU
+    /// pick with no code change of its own. This module's own new LRU
+    /// tests (BC17 to BC22) and `src/http/skeleton.rs`'s test caller (slice
+    /// 3.0) are this function's other callers, needing real limits
+    /// [`Self::from_store`] cannot supply.
+    pub fn from_store_with_lru_limits(
+        store: &Store,
+        max_viewers: usize,
+        lru_protect_min: u32,
+        lru_evict_per_min: u32,
+    ) -> Result<Arc<Self>, StoreError> {
+        let handle =
+            Self::with_store(max_viewers, store.clone(), lru_protect_min, lru_evict_per_min);
         let rows = store.viewer_load_all()?;
         let mut d2_accounts: std::collections::HashSet<String> = std::collections::HashSet::new();
         for row in rows {
@@ -353,21 +451,40 @@ impl GraphHandle {
         // restart can load more than `max_viewers` circles at once
         // (`Self::from_store` bypasses the cap, spec.md `## Approach`), so
         // one eviction is not always enough to get back under it before this
-        // viewer's own circle is inserted.
+        // viewer's own circle is inserted. Launch-blockers spec.md BC17,
+        // BC18: the victim is picked only from circles whose effective
+        // `last_request_at` is older than `lru_protect_min` minutes: a
+        // circle with a request inside that window is never a target, no
+        // matter how full the store is.
+        let protect_secs = i64::from(self.lru_protect_min) * 60;
         while state.circles.len() >= self.max_viewers {
             let victim = state
                 .circles
                 .iter()
                 .map(|(v, c)| (v.clone(), self.effective_last_request_at(v, c)))
+                .filter(|(_, effective)| now - *effective >= protect_secs)
                 .min_by_key(|(_, effective)| *effective)
                 .map(|(v, _)| v);
-            match victim {
-                Some(victim) => self.evict_locked(&mut state, &victim, EvictReason::Lru),
-                // `max_viewers` is 0, or every circle vanished between the
-                // `len()` check and here: nothing left to evict, so nothing
-                // to build for this viewer either.
-                None => return,
+            let victim = match victim {
+                Some(victim) => victim,
+                // BC18: every remaining circle has had a request inside the
+                // protection window (or `max_viewers` is 0, or every circle
+                // vanished between the `len()` check and here) — nothing
+                // may be removed, so nothing is built for this viewer
+                // either (BC20: no circle, no job, no cooldown).
+                None => {
+                    self.log_lru_refused(now, LruRefusal::Protected);
+                    return;
+                }
+            };
+            // BC19: the budget is spent only once a real victim is found —
+            // an idle circle refused solely by the protection window above
+            // never touches it.
+            if !self.spend_lru_budget(now) {
+                self.log_lru_refused(now, LruRefusal::Budget);
+                return;
             }
+            self.evict_locked(&mut state, &victim, EvictReason::Lru);
         }
         let mut circle = Circle::new();
         // BC16: a freshly created circle's clock starts at the request
@@ -388,6 +505,42 @@ impl GraphHandle {
         let touches = self.touches.lock().expect("GraphHandle touches mutex poisoned");
         let touch = touches.get(viewer).map(|entry| entry.last_request_at).unwrap_or(0);
         touch.max(circle.last_request_at)
+    }
+
+    /// Spends one unit of the global LRU eviction budget for the
+    /// wall-clock minute `now / 60` (BC19, BC21), resetting the count the
+    /// first time a call lands in a new minute. Returns `false`, spending
+    /// nothing, once `lru_evict_per_min` units are already spent this
+    /// minute. The same pattern as `auth::did::KeyCache::spend_miss_budget`.
+    fn spend_lru_budget(&self, now: i64) -> bool {
+        let mut budget = self.lru_budget.lock().expect("GraphHandle lru_budget mutex poisoned");
+        let minute = now.div_euclid(60);
+        if budget.minute != minute {
+            budget.minute = minute;
+            budget.count = 0;
+        }
+        if budget.count >= self.lru_evict_per_min {
+            return false;
+        }
+        budget.count += 1;
+        true
+    }
+
+    /// Logs one `graph.lru_refused` `info` line naming `reason` (BC22), the
+    /// first time this is called for the wall-clock minute `now / 60` —
+    /// however many first builds are refused in that minute, and whichever
+    /// of the two reasons each one carries, only the first logs. No DID, no
+    /// handle, no hash: the same privacy rule `graph.evicted` already
+    /// follows (BC11).
+    fn log_lru_refused(&self, now: i64, reason: LruRefusal) {
+        let mut budget = self.lru_budget.lock().expect("GraphHandle lru_budget mutex poisoned");
+        let minute = now.div_euclid(60);
+        if budget.logged_minute == Some(minute) {
+            return;
+        }
+        budget.logged_minute = Some(minute);
+        drop(budget);
+        tracing::info!(reason = reason.as_str(), "graph.lru_refused");
     }
 
     /// Removes `viewer`'s circle — idle (`graph::schedule`) or at the
@@ -1099,6 +1252,158 @@ mod tests {
             handle.get(&occupant).is_some(),
             "the occupant is never evicted for a cooling-down request"
         );
+    }
+
+    #[test]
+    fn lru_protects_recent() {
+        // Launch-blockers spec.md BC17, BC18: at the cap, the victim is the
+        // oldest circle *outside* the protection window — a circle with a
+        // request inside it is never picked, no matter how full the store
+        // is.
+        let store = migrated_store();
+        let handle = GraphHandle::from_store_with_lru_limits(&store, 2, 60, u32::MAX)
+            .expect("empty store loads");
+
+        let old = ViewerDid("did:plc:old".to_string());
+        let recent = ViewerDid("did:plc:recent".to_string());
+        handle.enqueue_first_build(old.clone(), 1_000);
+        handle.enqueue_first_build(recent.clone(), 1_000 + 30 * 60);
+
+        // 61 minutes after `old`'s request, 31 after `recent`'s: `old` is
+        // outside the 60 minute window, `recent` is still inside it.
+        let now = 1_000 + 61 * 60;
+        let newcomer = ViewerDid("did:plc:new".to_string());
+        handle.enqueue_first_build(newcomer.clone(), now);
+
+        assert!(handle.get(&old).is_none(), "the circle outside the window is evicted");
+        assert!(handle.get(&recent).is_some(), "the circle inside the window survives");
+        assert!(handle.get(&newcomer).is_some(), "the new viewer still gets a circle");
+    }
+
+    #[test]
+    fn lru_refusal_retries() {
+        // AC11; BC18, BC20: when every circle at the cap is inside the
+        // protection window, a first build is refused — no circle, no job,
+        // no cooldown. The very next call, once a circle has aged out of
+        // the window, succeeds the same as if the refusal had never
+        // happened.
+        let store = migrated_store();
+        let handle =
+            GraphHandle::from_store_with_lru_limits(&store, 1, 60, u32::MAX).expect("store loads");
+        let queue = handle.queue();
+
+        let existing = ViewerDid("did:plc:existing".to_string());
+        handle.enqueue_first_build(existing.clone(), 1_000);
+        assert_eq!(queue.try_pop(), Some(Job::FirstBuild(existing.clone())));
+
+        let newcomer = ViewerDid("did:plc:new".to_string());
+        // Still well inside the 60 minute window.
+        handle.enqueue_first_build(newcomer.clone(), 1_000 + 60);
+
+        assert!(handle.get(&newcomer).is_none(), "refused: the only circle is protected");
+        assert!(handle.get(&existing).is_some(), "the protected circle is left alone");
+        assert!(queue.try_pop().is_none(), "no job queued for the refused viewer");
+
+        // `existing` has now aged out of the window, freeing a slot.
+        let later = 1_000 + 61 * 60;
+        handle.enqueue_first_build(newcomer.clone(), later);
+        assert!(handle.get(&newcomer).is_some(), "room opened, the retry succeeds");
+        assert!(handle.get(&existing).is_none(), "the aged-out circle was evicted to make room");
+    }
+
+    #[test]
+    fn lru_budget() {
+        // AC10; BC19, BC21: the budget allows `lru_evict_per_min`
+        // evictions in a wall-clock minute, refuses the next until the
+        // next minute, and a restart over the cap drains at the budget
+        // rate.
+        let store = migrated_store();
+        let handle = GraphHandle::from_store_with_lru_limits(&store, 2, 0, 1).expect("store loads");
+
+        let a = ViewerDid("did:plc:a".to_string());
+        let b = ViewerDid("did:plc:b".to_string());
+        handle.enqueue_first_build(a.clone(), 1_000);
+        handle.enqueue_first_build(b.clone(), 1_001);
+
+        let c = ViewerDid("did:plc:c".to_string());
+        handle.enqueue_first_build(c.clone(), 1_002); // spends the minute's one eviction, on `a`.
+        assert!(handle.get(&a).is_none(), "the oldest circle is evicted, spending the budget");
+        assert!(handle.get(&c).is_some());
+
+        let d = ViewerDid("did:plc:d".to_string());
+        handle.enqueue_first_build(d.clone(), 1_003); // same minute: budget already spent.
+        assert!(handle.get(&d).is_none(), "refused: the minute's eviction budget is spent");
+        assert!(handle.get(&b).is_some(), "nothing was evicted for the refused viewer");
+
+        // A new wall-clock minute resets the budget.
+        let next_minute = (1_003_i64.div_euclid(60) + 1) * 60;
+        handle.enqueue_first_build(d.clone(), next_minute);
+        assert!(handle.get(&d).is_some(), "the new minute's budget allows the eviction");
+    }
+
+    #[test]
+    fn lru_refused_log() {
+        // AC12; BC22: many refused first builds in one minute write
+        // exactly one `graph.lru_refused` line, naming the reason and no
+        // DID.
+        #[derive(Clone)]
+        struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("CapturingWriter mutex poisoned").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+            type Writer = CapturingWriter;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let store = migrated_store();
+        let handle =
+            GraphHandle::from_store_with_lru_limits(&store, 1, 60, u32::MAX).expect("store loads");
+        let existing = ViewerDid("did:plc:existing".to_string());
+        handle.enqueue_first_build(existing.clone(), 1_000);
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::fmt().json().with_writer(CapturingWriter(buf.clone())).finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        for i in 0..5u32 {
+            let viewer = ViewerDid(format!("did:plc:new-{i}"));
+            handle.enqueue_first_build(viewer, 1_000 + 60 + i as i64);
+        }
+
+        drop(dispatch);
+        let output = String::from_utf8(buf.lock().expect("CapturingWriter mutex poisoned").clone())
+            .expect("captured log output must be valid UTF-8");
+        assert_eq!(
+            output.matches("graph.lru_refused").count(),
+            1,
+            "exactly one graph.lru_refused line for the minute: {output}"
+        );
+        assert!(
+            output.contains("\"reason\":\"protected\""),
+            "the refusal reason must be logged: {output}"
+        );
+        assert!(!output.contains("did:plc:existing"), "no DID may appear in the line: {output}");
+        for i in 0..5u32 {
+            assert!(
+                !output.contains(&format!("did:plc:new-{i}")),
+                "no DID may appear in the line: {output}"
+            );
+        }
     }
 
     #[test]

@@ -241,8 +241,19 @@ The scheduler runs each minute:
   `UPSTAGE_GRAPH_IDLE_EVICT_D` is removed from memory and SQLite.
 - **LRU eviction.** When a first build would take the count above
   `UPSTAGE_MAX_VIEWERS`, the viewer with the oldest `last_request_at` is
-  removed first. Each removal writes one `graph.evicted` log line with
-  the reason and no DID.
+  removed first, but only among circles whose effective `last_request_at`
+  is older than `UPSTAGE_GRAPH_LRU_PROTECT_MIN` minutes — a circle with a
+  request more recent than that is never a target, however full the
+  store is. At most `UPSTAGE_GRAPH_LRU_EVICT_PER_MIN` LRU evictions run
+  in one wall-clock minute; an idle eviction never counts against this
+  budget. When every remaining circle is protected, or the minute's
+  budget is spent, the first build is refused instead: no circle is
+  created, no job is queued, and no cooldown is set, so the very next
+  request for that viewer tries again from scratch, the same as story
+  06's cap refusal. Each real removal still writes one `graph.evicted`
+  log line with the reason and no DID; the first refusal in a minute
+  writes one `graph.lru_refused` line naming the reason (`protected` or
+  `budget`) and no DID.
 
 A refresh builds a new circle and replaces the old one in one step. If a
 refresh fails part of the way, the old circle stays (PRD edge case).
