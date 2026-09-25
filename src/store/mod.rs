@@ -548,6 +548,38 @@ impl Store {
         viewers::viewer_set_state_if_exists(&conn, viewer_did, state)
     }
 
+    /// Saves a refresh's result: the `viewers` row's refresh fields, plus a
+    /// full replace of `viewer_follows` and `viewer_checks`, in one
+    /// transaction (story 09 spec.md BC5). Never creates a `viewers` row
+    /// (BC6a). No production caller yet: the worker's refresh path
+    /// (`graph/queue.rs`, story 09) is the first.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn viewer_replace_circle(
+        &self,
+        viewer_did: &str,
+        state: &str,
+        now: i64,
+        d1_refreshed_at: i64,
+        d2_sample: &[String],
+        follows: &std::collections::HashSet<u64>,
+        checked: &std::collections::HashSet<u64>,
+        follows_me: &std::collections::HashSet<u64>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        viewers::viewer_replace_circle(
+            &conn,
+            viewer_did,
+            state,
+            now,
+            d1_refreshed_at,
+            d2_sample,
+            follows,
+            checked,
+            follows_me,
+        )
+    }
+
     /// Deletes a viewer's `viewers`, `viewer_follows` and `viewer_checks`
     /// rows. No caller until story 09's eviction.
     #[allow(dead_code)]

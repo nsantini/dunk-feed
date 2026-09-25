@@ -260,6 +260,36 @@ pub async fn fetch_account_follows<S: GraphSource>(
     Ok((hashed, calls))
 }
 
+/// A refresh's steps 1 and 2 (story 09 spec.md BC4), run against a brand new
+/// [`Circle`] with an empty `checked` and `follows_me` — never the viewer's
+/// existing one, so a follow dropped since the last build actually leaves the
+/// result (BC13) rather than surviving in a `checked`/`follows` set carried
+/// over from before. Step 1 keeps the same [`crate::graph::queue::FIRST_BUILD_MAX_PAGES`]
+/// cap a first build uses. Returns the freshly built circle on success; on a
+/// `PdsError` from either step, returns that error and the caller
+/// (`graph::queue::run_refresh`) saves and swaps in nothing (BC6): this
+/// function never partially fills a circle that its caller could mistake for
+/// a complete refresh.
+pub async fn refresh<S: GraphSource>(
+    source: &S,
+    viewer: &str,
+    d2_sample_size: usize,
+    ranked: &[RankedAuthors],
+    follows_me_depth: usize,
+) -> Result<Circle, PdsError> {
+    let mut circle = Circle::new();
+    step_follows(
+        source,
+        viewer,
+        d2_sample_size,
+        &mut circle,
+        Some(crate::graph::queue::FIRST_BUILD_MAX_PAGES),
+    )
+    .await?;
+    step_follows_me(source, viewer, ranked, follows_me_depth, &mut circle).await?;
+    Ok(circle)
+}
+
 /// Step 3, the probe's own path (`graph_probe::run_one_handle`), behaviour
 /// unchanged from before [`fetch_account_follows`] existed: for each account
 /// in `d2_sample` with no entry yet in `shared`, calls
@@ -670,6 +700,40 @@ mod tests {
 
         assert_eq!(stats.calls, 2);
         assert_eq!(shared.get("acct-a").unwrap().len(), 1);
+    }
+
+    /// A `GraphSource` whose `get_follows` always fails, for
+    /// [`failed_refresh_keeps_old`] (AC4, BC6).
+    struct FailingFollowsSource;
+
+    impl GraphSource for FailingFollowsSource {
+        async fn get_follows(
+            &self,
+            _actor: &str,
+            _limit: u32,
+            _cursor: Option<String>,
+        ) -> Result<FollowsPage, PdsError> {
+            Err(PdsError::Session)
+        }
+
+        async fn get_relationships(
+            &self,
+            _actor: &str,
+            _others: &[String],
+        ) -> Result<Vec<String>, PdsError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_old() {
+        // AC4, BC6: a `PdsError` from step 1 makes `refresh` return an
+        // error rather than a partially built circle. The caller
+        // (`graph::queue::run_refresh`) never has anything to save or swap
+        // in, so the viewer's old circle in memory and SQLite is untouched.
+        let source = FailingFollowsSource;
+        let result = refresh(&source, "did:plc:viewer", 10, &[], 10).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

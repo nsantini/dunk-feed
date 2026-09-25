@@ -23,7 +23,7 @@ pub mod filter;
 
 pub use cache::FollowsCache;
 pub use circle::Circle;
-pub use queue::{run_touch_flush, run_worker, DropListsFn, JobQueue};
+pub use queue::{run_touch_flush, run_worker, DropListsFn, Job, JobQueue};
 
 /// A DID's `xxh3_64` hash, kept in place of the DID string wherever a
 /// `Circle` or the connection filter only needs to compare, not print, an
@@ -209,7 +209,7 @@ impl GraphHandle {
             {
                 // BC12a: a building_d2 row resumes at step 3 only
                 // (`graph::queue::process_job`'s BC5c routing).
-                handle.queue.push(viewer);
+                handle.queue.push(Job::FirstBuild(viewer));
             }
         }
         // BC12: preload every follows_cache row a loaded circle's
@@ -275,7 +275,7 @@ impl GraphHandle {
         }
         state.circles.insert(viewer.clone(), Arc::new(Circle::new()));
         drop(state);
-        self.queue.push(viewer);
+        self.queue.push(Job::FirstBuild(viewer));
     }
 
     /// BC6a: one `warn` line, naming no DID, at most once a minute.
@@ -351,6 +351,39 @@ impl GraphHandle {
         circle.circle_version = version;
         state.circles.insert(viewer.clone(), Arc::new(circle));
         Some(version)
+    }
+
+    /// Swaps in `circle` for `viewer` only if a circle already exists for it
+    /// (story 09 spec.md BC6a: an eviction may have removed it while a
+    /// refresh ran), keeping the existing circle's `last_request_at` (BC5,
+    /// BC16 — a refresh must never reset the idle clock a request already
+    /// advanced) and bumping `circle_version` past whatever was there.
+    /// `graph::queue::run_refresh` calls this after a successful save.
+    /// Returns the new version, or `None` (swapping nothing) when `viewer`
+    /// has no circle in memory.
+    pub(crate) fn replace_if_present(&self, viewer: &ViewerDid, mut circle: Circle) -> Option<u64> {
+        let mut state = self.state.write().expect("GraphHandle state lock poisoned");
+        let existing = state.circles.get(viewer)?;
+        let version = existing.circle_version + 1;
+        circle.last_request_at = existing.last_request_at;
+        circle.state = CircleState::Ready;
+        circle.circle_version = version;
+        state.circles.insert(viewer.clone(), Arc::new(circle));
+        Some(version)
+    }
+
+    /// The viewers whose in-memory circle's `d2_sample` names `account`
+    /// (story 09 spec.md BC7a): `graph::queue::run_refill` calls this to
+    /// drop each one's cached list once a fresher `follows_cache` entry for
+    /// that account lands.
+    pub(crate) fn viewers_naming_account(&self, account: &str) -> Vec<ViewerDid> {
+        let state = self.state.read().expect("GraphHandle state lock poisoned");
+        state
+            .circles
+            .iter()
+            .filter(|(_, circle)| circle.d2_sample.iter().any(|d| d == account))
+            .map(|(viewer, _)| viewer.clone())
+            .collect()
     }
 
     /// Removes `viewer`'s in-memory circle and starts a `cooldown_secs`
@@ -568,7 +601,11 @@ mod tests {
         let queue = handle.queue();
 
         handle.enqueue_first_build(viewer.clone(), 1_000);
-        assert_eq!(queue.try_pop(), Some(viewer.clone()), "the worker picks up the first job");
+        assert_eq!(
+            queue.try_pop(),
+            Some(Job::FirstBuild(viewer.clone())),
+            "the worker picks up the first job"
+        );
 
         // The worker's 5th failed attempt gives up.
         handle.remove_after_giving_up(&viewer, 1_000, 3_600);
@@ -578,7 +615,7 @@ mod tests {
         handle.enqueue_first_build(viewer.clone(), 1_000);
 
         // Only now does the worker finish its failure path.
-        queue.complete(&viewer);
+        queue.complete(&Job::FirstBuild(viewer.clone()));
 
         assert!(handle.get(&viewer).is_none(), "no circle exists during the cooldown");
         assert!(queue.try_pop().is_none(), "no job was queued for a circle that does not exist");
@@ -587,7 +624,7 @@ mod tests {
         // build with a job to match.
         handle.enqueue_first_build(viewer.clone(), 1_000 + 3_600);
         assert!(handle.get(&viewer).is_some());
-        assert_eq!(queue.try_pop(), Some(viewer), "the new circle has a job");
+        assert_eq!(queue.try_pop(), Some(Job::FirstBuild(viewer)), "the new circle has a job");
     }
 
     #[test]
@@ -679,7 +716,7 @@ mod tests {
         // job for it.
         let queue = handle.queue();
         let popped = queue.try_pop().expect("building_d1 row was re-enqueued");
-        assert_eq!(popped, ViewerDid("did:plc:building".to_string()));
+        assert_eq!(popped, Job::FirstBuild(ViewerDid("did:plc:building".to_string())));
     }
 
     #[test]
@@ -749,7 +786,7 @@ mod tests {
         let popped = queue.try_pop().expect("the building_fm row was re-enqueued");
         assert_eq!(
             popped,
-            ViewerDid("did:plc:fm".to_string()),
+            Job::FirstBuild(ViewerDid("did:plc:fm".to_string())),
             "resumes at step 2, not the ready row"
         );
         assert!(queue.try_pop().is_none(), "the ready row is not re-enqueued");
@@ -804,6 +841,77 @@ mod tests {
         // only.
         let queue = handle.queue();
         let popped = queue.try_pop().expect("the building_d2 row was re-enqueued");
-        assert_eq!(popped, ViewerDid("did:plc:viewer".to_string()));
+        assert_eq!(popped, Job::FirstBuild(ViewerDid("did:plc:viewer".to_string())));
+    }
+
+    #[tokio::test]
+    async fn follow_changes_after_refresh() {
+        // AC5; story 09 spec.md BC5, BC13: a follow dropped and a follow
+        // gained since the first build both show up in the circle once a
+        // `Refresh` job runs.
+        use crate::graph::queue::tests::ChangingFollowsSource;
+        use crate::scorer::snapshot::SnapshotHandle;
+
+        let handle = GraphHandle::new(10);
+        let viewer = ViewerDid("did:plc:viewer".to_string());
+        let source = Arc::new(ChangingFollowsSource::new(vec![
+            "did:plc:1".to_string(),
+            "did:plc:2".to_string(),
+        ]));
+        handle.enqueue_first_build(viewer.clone(), crate::store::unix_now());
+
+        let snapshot = SnapshotHandle::new();
+        snapshot.swap(Arc::new(Vec::new()), Arc::new(Vec::new()));
+
+        let store = Store::open_memory().expect("in-memory store opens and migrates");
+        let worker_handle = Arc::clone(&handle);
+        let worker_source = Arc::clone(&source);
+        tokio::spawn(run_worker(
+            worker_handle,
+            store,
+            worker_source,
+            10,
+            None,
+            snapshot,
+            10,
+            100,
+            24,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(circle) = handle.get(&viewer) {
+                    if circle.state == CircleState::Ready {
+                        return;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first build completes within 5 s");
+
+        let built_version = handle.get(&viewer).unwrap().circle_version;
+
+        // Drop did:plc:1, add did:plc:3.
+        source.set_follows(vec!["did:plc:2".to_string(), "did:plc:3".to_string()]);
+        handle.queue().push(Job::Refresh(viewer.clone()));
+
+        let refreshed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(circle) = handle.get(&viewer) {
+                    if circle.circle_version > built_version {
+                        return circle;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh completes within 5 s");
+
+        assert!(refreshed.follows.contains(&hash_did("did:plc:2")));
+        assert!(refreshed.follows.contains(&hash_did("did:plc:3")), "the new follow shows up");
+        assert!(!refreshed.follows.contains(&hash_did("did:plc:1")), "the dropped follow is gone");
     }
 }

@@ -295,6 +295,66 @@ pub fn viewer_touch(
     Ok(())
 }
 
+/// Saves a refresh's result in one transaction (story 09 spec.md BC5): the
+/// `viewers` row's `state`, `d1_refreshed_at`, `last_request_at` and
+/// `d2_sample`, plus a full replace of `viewer_follows` and `viewer_checks`
+/// for `viewer_did`. Unlike `viewer_save_circle`, this never creates a
+/// `viewers` row: a plain `UPDATE`, the same rule `viewer_set_state_if_exists`
+/// applies (review round 2, defect AI) — a refresh always runs against a
+/// viewer that already exists, and a row missing here can only mean it was
+/// deleted (eviction, story 09) while the refresh ran (BC6a), in which case
+/// this saves nothing and the transaction commits as a no-op rather than
+/// recreating the row or its follows/checks.
+#[allow(dead_code)] // First caller is the worker's refresh path (`graph/queue.rs`, story 09).
+#[allow(clippy::too_many_arguments)]
+pub fn viewer_replace_circle(
+    conn: &Connection,
+    viewer_did: &str,
+    state: &str,
+    now: i64,
+    d1_refreshed_at: i64,
+    d2_sample: &[String],
+    follows: &HashSet<u64>,
+    checked: &HashSet<u64>,
+    follows_me: &HashSet<u64>,
+) -> Result<(), StoreError> {
+    let d2_sample_json = encode_d2_sample(d2_sample)?;
+    let tx = conn.unchecked_transaction()?;
+    let updated = tx.execute(
+        "UPDATE viewers SET last_request_at = ?2, d1_refreshed_at = ?3, state = ?4, d2_sample = ?5
+         WHERE viewer_did = ?1",
+        rusqlite::params![viewer_did, now, d1_refreshed_at, state, d2_sample_json],
+    )?;
+    if updated == 0 {
+        // BC6a: the row is gone (e.g. an eviction raced this refresh).
+        // Nothing to replace, and no row is created.
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute("DELETE FROM viewer_follows WHERE viewer_did = ?1", [viewer_did])?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO viewer_follows (viewer_did, subject_hash) VALUES (?1, ?2)",
+        )?;
+        for hash in follows {
+            stmt.execute(rusqlite::params![viewer_did, hash_as_i64(*hash)])?;
+        }
+    }
+    tx.execute("DELETE FROM viewer_checks WHERE viewer_did = ?1", [viewer_did])?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO viewer_checks (viewer_did, author_hash, follows_me, checked_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for hash in checked {
+            let follows_me_flag = i64::from(follows_me.contains(hash));
+            stmt.execute(rusqlite::params![viewer_did, hash_as_i64(*hash), follows_me_flag, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Deletes a viewer's `viewers`, `viewer_follows` and `viewer_checks` rows
 /// in one transaction. Spec.md's Non-goals: no caller exists yet in this
 /// story — refresh and eviction (story 09) are the first — so this is
@@ -544,6 +604,63 @@ mod tests {
         for hash in [0_u64, 1, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
             assert_eq!(i64_as_hash(hash_as_i64(hash)), hash);
         }
+    }
+
+    // Story 09 spec.md BC5: `viewer_replace_circle` fully replaces the
+    // viewers row's refresh fields plus `viewer_follows` and `viewer_checks`
+    // in one call.
+    #[test]
+    fn viewer_replace_circle_round_trips() {
+        let conn = migrated_conn();
+        viewer_save_circle(&conn, "did:plc:a", "ready", 1, 1, &[], &HashSet::new()).unwrap();
+
+        let follows: HashSet<u64> = [10_u64, 20].into_iter().collect();
+        let checked: HashSet<u64> = [30_u64].into_iter().collect();
+        let follows_me: HashSet<u64> = [30_u64].into_iter().collect();
+        let d2_sample = vec!["did:plc:x".to_string()];
+
+        viewer_replace_circle(
+            &conn,
+            "did:plc:a",
+            "ready",
+            2,
+            2,
+            &d2_sample,
+            &follows,
+            &checked,
+            &follows_me,
+        )
+        .unwrap();
+
+        let rows = viewer_load_all(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].follows, follows);
+        assert_eq!(rows[0].checked, checked);
+        assert_eq!(rows[0].follows_me, follows_me);
+        assert_eq!(rows[0].d2_sample, d2_sample);
+        assert_eq!(rows[0].d1_refreshed_at, Some(2));
+        assert_eq!(rows[0].last_request_at, 2);
+    }
+
+    // Story 09 spec.md BC6a: a missing viewers row (an eviction raced the
+    // refresh) creates nothing.
+    #[test]
+    fn viewer_replace_circle_of_a_missing_viewer_creates_no_row() {
+        let conn = migrated_conn();
+        let follows: HashSet<u64> = [1_u64].into_iter().collect();
+        viewer_replace_circle(
+            &conn,
+            "did:plc:missing",
+            "ready",
+            1,
+            1,
+            &[],
+            &follows,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(viewer_load_all(&conn).unwrap(), Vec::new());
     }
 
     // Review round 1, defect Y: a malformed `d2_sample` must not fail the

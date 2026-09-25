@@ -1207,11 +1207,15 @@ mod tests {
         let graph = crate::graph::GraphHandle::new(10);
         graph.enqueue_first_build(viewer.clone(), now);
         let queue = graph.queue();
-        assert_eq!(queue.try_pop(), Some(viewer.clone()), "the one job from enqueue_first_build");
+        assert_eq!(
+            queue.try_pop(),
+            Some(crate::graph::Job::FirstBuild(viewer.clone())),
+            "the one job from enqueue_first_build"
+        );
         // Re-push it, as `run_worker` would leave it while a real attempt
         // is in flight (the outstanding mark, not the FIFO position, is
         // what de-duplicates).
-        queue.retry(viewer.clone());
+        queue.retry(crate::graph::Job::FirstBuild(viewer.clone()));
 
         let state = crate::http::tests::test_state_with_graph(cfg.clone(), auth, graph.clone());
         let app = router(state);
@@ -1238,7 +1242,7 @@ mod tests {
         );
         assert_eq!(
             queue.try_pop(),
-            Some(viewer),
+            Some(crate::graph::Job::FirstBuild(viewer)),
             "still exactly the one job the retry re-queued, no second job added"
         );
         assert!(queue.try_pop().is_none(), "no second job");
