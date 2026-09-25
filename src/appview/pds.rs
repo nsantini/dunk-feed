@@ -33,6 +33,7 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::appview::{http_client, retry_decision, RetryDecision};
 use crate::config::{Config, Secret};
 use crate::graph::build::{FollowsPage as GraphFollowsPage, GraphSource};
+use crate::graph::metrics::CallCounters;
 
 /// `com.atproto.server.createSession`'s nsid, used both to build the URL
 /// and to label a login failure (BC1).
@@ -424,6 +425,13 @@ pub struct PdsClient<T: PdsTransport = HttpPdsTransport> {
     credentials: Credentials,
     session: Mutex<Option<Session>>,
     limiter: Mutex<time::Interval>,
+    /// PDS calls in the last hour, by nsid (story 10 spec.md BC7):
+    /// [`Self::send_with_retry`] is the one choke point every call — the
+    /// `call`/`call_raw` methods and the session calls `login_raw` and
+    /// `refresh_raw` make directly — passes through, so it is this counter's
+    /// one writer. [`Self::take_call_counts`] is the hourly metrics task's
+    /// reader (slice 2.0).
+    calls: CallCounters,
 }
 
 /// Manual `Debug`: only `credentials` is shown (already redacted by
@@ -459,7 +467,15 @@ impl<T: PdsTransport> PdsClient<T> {
             credentials,
             session: Mutex::new(None),
             limiter: Mutex::new(interval),
+            calls: CallCounters::new(),
         })
+    }
+
+    /// The PDS calls counted since the last call to this method, keyed by
+    /// nsid, reset to empty by reading them (story 10 spec.md BC7, BC9).
+    /// `graph::metrics`'s hourly task (slice 2.0) is this method's caller.
+    pub fn take_call_counts(&self) -> std::collections::HashMap<&'static str, u64> {
+        self.calls.take()
     }
 
     /// Waits for the rate limiter's next tick. Every transport call,
@@ -568,6 +584,12 @@ impl<T: PdsTransport> PdsClient<T> {
         query: &[(&str, &str)],
         body: RequestBody,
     ) -> Result<Attempted, PdsError> {
+        // Story 10 spec.md BC7, `## Defaults taken`: this is the one choke
+        // point every call — `call`/`call_raw`'s methods and the session
+        // calls `login_raw`/`refresh_raw` make directly — passes through, so
+        // counting once per attempted call here, keyed by nsid, covers every
+        // method in one place.
+        self.calls.record(nsid);
         let mut attempt: u32 = 0;
         loop {
             self.throttle().await;
