@@ -20,7 +20,8 @@ into vertical slices and puts the probe gate before the graph work.
 | 08 | [Degree 2 with a shared follows cache](08-degree-two.md) | Discover people one step out; First open builds my circle | 06 | `UPSTAGE_PERSONALISE` (default `false`) |
 | 09 | [Circles stay current and bounded](09-circles-current-and-bounded.md) | My circle stays current; Limit the number of stored circles | 07, 08 | `UPSTAGE_PERSONALISE` (default `false`) |
 | 10 | [Feed health metrics](10-feed-health-metrics.md) | Read feed health | 09 | `UPSTAGE_PERSONALISE` (default `false`) |
-| 11 | [Launch](11-launch.md) | See only pairs from my circle; Viewers without a valid login | 04, 10 | `UPSTAGE_PERSONALISE` (flips default to `true`) |
+| 10b | [Launch blockers](10b-launch-blockers.md) | Viewers without a valid login; Limit the number of stored circles | 05, 09, 10 | `UPSTAGE_PERSONALISE` (default `false`) |
+| 11 | [Launch](11-launch.md) | See only pairs from my circle; Viewers without a valid login | 04, 10, 10b | `UPSTAGE_PERSONALISE` (flips default to `true`) |
 
 **Stop after story 04 and read the result.** Story 04 is the probe gate.
 If the measured calls for each viewer do not fit the budget in design §7,

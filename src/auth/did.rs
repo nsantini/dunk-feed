@@ -67,6 +67,30 @@ pub(super) enum Lookup {
     Missing,
 }
 
+/// [`KeyCache::try_send_miss`]'s outcome (launch-blockers spec.md BC9,
+/// BC11 to BC16): whether to send the `Miss`, and, when not, whether the
+/// per-DID rule or the global miss budget was the reason. `mod.rs`'s
+/// `verify` matches on `RefusedBudget` alone to drive the rate-limited
+/// `auth.miss_limited` line (BC16); `RefusedPerDid` needs no log, the same
+/// as before this budget existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MissAttempt {
+    Send,
+    RefusedPerDid,
+    RefusedBudget,
+}
+
+/// The global resolver miss budget's bookkeeping for one wall-clock
+/// minute (launch-blockers spec.md BC11 to BC16): `minute` is `now / 60`,
+/// the minute `count` was last reset for; `logged_minute` is the minute
+/// [`KeyCache::note_miss_limited`] last returned `true` for, so
+/// `auth.miss_limited` fires at most once a minute (BC16).
+struct MissBudgetState {
+    minute: i64,
+    count: u32,
+    logged_minute: Option<i64>,
+}
+
 /// The DID key cache. `new`'s `max_entries` is `2 × UPSTAGE_MAX_VIEWERS`
 /// (BC16), computed by the caller (`src/ingest/mod.rs`, slice 3.0).
 pub struct KeyCache {
@@ -75,14 +99,39 @@ pub struct KeyCache {
     /// Review round 1, defect B: outstanding-miss bookkeeping, keyed by
     /// DID, for [`Self::should_send_miss`] and [`Self::miss_fetch_done`].
     misses: Mutex<HashMap<String, MissState>>,
+    /// The most `Miss` fetches [`Self::try_send_miss`] sends across every
+    /// DID in one wall-clock minute (launch-blockers spec.md BC11 to
+    /// BC14). `new` sets this to `u32::MAX`, effectively unbounded, so
+    /// every caller that built a cache before this budget existed (every
+    /// other test, `src/http/skeleton.rs`) is unaffected;
+    /// [`Self::new_with_miss_budget`] is the one constructor that sets a
+    /// real limit.
+    misses_per_min: u32,
+    miss_budget: Mutex<MissBudgetState>,
 }
 
 impl KeyCache {
     pub fn new(max_entries: usize) -> Self {
+        Self::new_with_miss_budget(max_entries, u32::MAX)
+    }
+
+    /// Builds a cache whose global resolver miss budget is `misses_per_min`
+    /// `Miss` fetches for each wall-clock minute (launch-blockers spec.md
+    /// BC11 to BC16): `spawn_resolver` (`mod.rs`) uses this with
+    /// `UPSTAGE_RESOLVER_MISSES_PER_MIN`; [`Self::new`] above calls this
+    /// with `u32::MAX` so every other caller keeps story 05's unbounded
+    /// behaviour.
+    pub(super) fn new_with_miss_budget(max_entries: usize, misses_per_min: u32) -> Self {
         Self {
             max_entries,
             entries: Mutex::new(HashMap::new()),
             misses: Mutex::new(HashMap::new()),
+            misses_per_min,
+            miss_budget: Mutex::new(MissBudgetState {
+                minute: i64::MIN,
+                count: 0,
+                logged_minute: None,
+            }),
         }
     }
 
@@ -165,27 +214,83 @@ impl KeyCache {
     /// instead, the same way a full resolver channel drops one (BC9):
     /// nothing already tracked is evicted to make room for it.
     pub(super) fn should_send_miss(&self, did: &str, now: i64) -> bool {
+        matches!(self.try_send_miss(did, now), MissAttempt::Send)
+    }
+
+    /// [`Self::should_send_miss`]'s full outcome (launch-blockers spec.md
+    /// BC11 to BC16): `mod.rs`'s `verify` matches on this directly, rather
+    /// than on the bool `should_send_miss` collapses it to, so a refusal
+    /// caused by the global miss budget — and only that reason — can drive
+    /// the rate-limited `auth.miss_limited` line (BC16). The per-DID
+    /// checks (BC13) run first, against any `MissState` already on record,
+    /// and on their own spend nothing from the budget. Review round 1,
+    /// defect AR: `misses` gets a new entry only once the budget has also
+    /// passed — a budget refusal (BC12) must leave no `MissState` behind,
+    /// or a flood of budget-refused DIDs would fill `misses` up to
+    /// `max_entries` with bookkeeping `prune_misses` can never clear
+    /// (`last_attempted` stays `None`), permanently refusing every
+    /// legitimate new DID with `RefusedPerDid` instead.
+    pub(super) fn try_send_miss(&self, did: &str, now: i64) -> MissAttempt {
         let mut misses = self.misses.lock().expect("KeyCache mutex poisoned");
         if !misses.contains_key(did) && misses.len() >= self.max_entries {
             Self::prune_misses(&mut misses, now);
             if misses.len() >= self.max_entries {
-                return false;
+                return MissAttempt::RefusedPerDid;
             }
+        }
+        if let Some(state) = misses.get(did) {
+            if state.in_flight {
+                return MissAttempt::RefusedPerDid;
+            }
+            if let Some(last) = state.last_attempted {
+                if now - last < REFETCH_COOLDOWN_SECS {
+                    return MissAttempt::RefusedPerDid;
+                }
+            }
+        }
+        if !self.spend_miss_budget(now) {
+            return MissAttempt::RefusedBudget;
         }
         let state = misses.entry(did.to_string()).or_insert(MissState {
             in_flight: false,
             last_attempted: None,
             first_seen: now,
         });
-        if state.in_flight {
+        state.in_flight = true;
+        MissAttempt::Send
+    }
+
+    /// Spends one unit of the global miss budget for the wall-clock minute
+    /// `now / 60` (BC14), resetting the count the first time a call lands
+    /// in a new minute. Returns `false`, spending nothing, once
+    /// `misses_per_min` units are already spent this minute (BC12).
+    fn spend_miss_budget(&self, now: i64) -> bool {
+        let mut budget = self.miss_budget.lock().expect("KeyCache mutex poisoned");
+        let minute = now.div_euclid(60);
+        if budget.minute != minute {
+            budget.minute = minute;
+            budget.count = 0;
+        }
+        if budget.count >= self.misses_per_min {
             return false;
         }
-        if let Some(last) = state.last_attempted {
-            if now - last < REFETCH_COOLDOWN_SECS {
-                return false;
-            }
+        budget.count += 1;
+        true
+    }
+
+    /// `true` the first time this is called for the wall-clock minute in
+    /// which the miss budget ran out (BC16): `mod.rs`'s `verify` calls
+    /// this only after [`Self::try_send_miss`] returns
+    /// [`MissAttempt::RefusedBudget`], so the `auth.miss_limited` warning
+    /// it then logs fires at most once a minute, however many DIDs are
+    /// refused in that minute.
+    pub(super) fn note_miss_limited(&self, now: i64) -> bool {
+        let mut budget = self.miss_budget.lock().expect("KeyCache mutex poisoned");
+        let minute = now.div_euclid(60);
+        if budget.logged_minute == Some(minute) {
+            return false;
         }
-        state.in_flight = true;
+        budget.logged_minute = Some(minute);
         true
     }
 
@@ -205,17 +310,22 @@ impl KeyCache {
         });
     }
 
-    /// Clears `did`'s in-flight mark without starting the hourly cooldown
-    /// (BC9): `verify`'s `Missing` arm (`mod.rs`) calls this when
-    /// `try_send` drops the `Miss` because the resolver channel was full,
-    /// so the very next request for the same DID can enqueue it again at
-    /// once, rather than waiting as if a real attempt had run and
-    /// finished.
+    /// Removes `did`'s `MissState` entirely (review round 2, defect AU;
+    /// engineer override in spec.md `## Answers from the engineer`):
+    /// `verify`'s `Missing` arm (`mod.rs`) calls this when `try_send` drops
+    /// the `Miss` because the resolver channel was full, so the dropped
+    /// send costs nothing and the very next request for the same DID
+    /// enqueues it again at once, the same as if no `MissState` had ever
+    /// been created for it. Clearing the in-flight mark alone was not
+    /// enough: the resolver fetches one DID at a time with a 10 s timeout,
+    /// so a run of slow `did:web` hosts can fill the 1024-slot channel, and
+    /// a left-behind entry with `last_attempted: None` would still count
+    /// against [`Self::try_send_miss`]'s `max_entries` bound on `misses`
+    /// forever, since [`Self::prune_misses`] never removes an entry whose
+    /// `last_attempted` is `None`.
     pub(super) fn miss_send_dropped(&self, did: &str) {
         let mut misses = self.misses.lock().expect("KeyCache mutex poisoned");
-        if let Some(state) = misses.get_mut(did) {
-            state.in_flight = false;
-        }
+        misses.remove(did);
     }
 
     /// Marks `did`'s outstanding `Miss` fetch as finished successfully
@@ -267,6 +377,29 @@ pub(super) enum FetchError {
     Http(u16),
     /// A 200 response whose body did not decode as JSON.
     Decode,
+    /// A `did:web` fetch whose resolved address was not public (BC8):
+    /// [`find_blocked`] recovered this from `reqwest`'s wrapped error by
+    /// walking its `source` chain for `dns::Blocked`. Carries nothing —
+    /// not the host, not the address — so the `blocked_address` warning
+    /// this becomes never can either.
+    Blocked,
+}
+
+/// Walks `err`'s `std::error::Error::source` chain looking for
+/// `dns::Blocked` (spec `## Defaults taken`): `reqwest` wraps a
+/// `dns::Resolve` error in its own error type, so the fetcher never sees
+/// `dns::Blocked` directly. `HttpDidFetcher::fetch` calls this on every
+/// `did:web` send failure; a chain with no `Blocked` in it is an ordinary
+/// [`FetchError::Transport`].
+fn find_blocked(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = current {
+        if err.downcast_ref::<super::dns::Blocked>().is_some() {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 /// One DID document fetch (BC17, BC18). [`HttpDidFetcher`] is the real
@@ -293,15 +426,25 @@ const DID_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// methods, the only part of the document [`extract_key`] ever reads.
 const MAX_DID_DOCUMENT_BYTES: usize = 64 * 1024;
 
-/// The real [`DidFetcher`]. Builds its own `reqwest::Client`, distinct
-/// from [`crate::appview::http_client`], with redirects disabled (review
-/// round 1, defect K): a DID document fetch never needs one, and
+/// The real [`DidFetcher`]. Builds two `reqwest::Client`s, both distinct
+/// from [`crate::appview::http_client`], both with redirects disabled
+/// (review round 1, defect K): a DID document fetch never needs one, and
 /// following a redirect would hand this resolver's request to whatever
 /// second origin a compromised or misconfigured host named, so a 3xx
 /// response is a fetch failure ([`FetchError::Http`]) rather than
 /// something this client chases on its own.
+///
+/// `did:plc` uses `plc_client`, the default resolver — `UPSTAGE_PLC_URL`
+/// is operator-set and trusted (spec `## Non-goals`). `did:web` uses
+/// `web_client`, built with [`super::dns::PublicOnlyResolver`] as its
+/// `dns_resolver` (BC7): `reqwest` then connects only to the addresses
+/// that resolver returned, so a rebinding second DNS answer can never
+/// change the address actually connected to. `web_client` also sets
+/// `no_proxy()` (BC7), because a proxy from `HTTPS_PROXY` would look the
+/// name up itself, bypassing the address check entirely.
 pub(super) struct HttpDidFetcher {
-    http: reqwest::Client,
+    plc_client: reqwest::Client,
+    web_client: reqwest::Client,
     /// `UPSTAGE_PLC_URL`, trailing `/` removed. `src/config.rs` (slice
     /// 3.0) will also remove it at load time (BC24); this trims again as
     /// defence in depth, the same reasoning `HttpPdsTransport::new` gives
@@ -311,13 +454,55 @@ pub(super) struct HttpDidFetcher {
 
 impl HttpDidFetcher {
     pub(super) fn new(plc_url: String) -> Self {
-        Self {
-            http: reqwest::Client::builder()
+        let build = || {
+            reqwest::Client::builder()
                 .timeout(DID_FETCH_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
+        };
+        Self {
+            plc_client: build().build().expect(
+                "reqwest::Client::builder with a timeout and a redirect policy never fails to build",
+            ),
+            web_client: build()
+                .dns_resolver(std::sync::Arc::new(super::dns::PublicOnlyResolver::new()))
+                .no_proxy()
                 .build()
                 .expect(
-                    "reqwest::Client::builder with a timeout and a redirect policy never fails to build",
+                    "reqwest::Client::builder with a timeout, a redirect policy and a dns_resolver never fails to build",
+                ),
+            plc_url: plc_url.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// Test-only seam (AC3, `did_web_blocked`): builds the same two
+    /// clients as [`Self::new`], except `web_client`'s resolver looks up
+    /// through `web_lookup` instead of the real `tokio::net::lookup_host`,
+    /// so the test can send a fixed loopback address without a network
+    /// lookup. `plc_client` is unchanged — still the default resolver —
+    /// so the same test can also show a `did:plc` fetch never consults
+    /// `web_lookup`.
+    #[cfg(test)]
+    fn new_for_test(
+        plc_url: String,
+        web_lookup: std::sync::Arc<dyn super::dns::LookupHost>,
+    ) -> Self {
+        let build = || {
+            reqwest::Client::builder()
+                .timeout(DID_FETCH_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+        };
+        Self {
+            plc_client: build().build().expect(
+                "reqwest::Client::builder with a timeout and a redirect policy never fails to build",
+            ),
+            web_client: build()
+                .dns_resolver(std::sync::Arc::new(super::dns::PublicOnlyResolver::with_lookup(
+                    web_lookup,
+                )))
+                .no_proxy()
+                .build()
+                .expect(
+                    "reqwest::Client::builder with a timeout, a redirect policy and a dns_resolver never fails to build",
                 ),
             plc_url: plc_url.trim_end_matches('/').to_string(),
         }
@@ -371,7 +556,20 @@ fn resolve_url(plc_url: &str, did: &str) -> String {
 impl DidFetcher for HttpDidFetcher {
     async fn fetch(&self, did: &str) -> Result<Value, FetchError> {
         let url = resolve_url(&self.plc_url, did);
-        let response = self.http.get(&url).send().await.map_err(|_err| FetchError::Transport)?;
+        let is_web = did.starts_with("did:web:");
+        let client = if is_web { &self.web_client } else { &self.plc_client };
+        let response = client.get(&url).send().await.map_err(|err| {
+            // BC8: the only way a `did:web` send fails with `Blocked` is
+            // `web_client`'s resolver rejecting every address (BC6); the
+            // `did:plc` client never carries that resolver, so `is_web`
+            // gates the walk rather than running it needlessly on every
+            // transport error.
+            if is_web && find_blocked(&err) {
+                FetchError::Blocked
+            } else {
+                FetchError::Transport
+            }
+        })?;
         let status = response.status().as_u16();
         if status != 200 {
             // Review round 1, defect K: with redirects disabled above, a
@@ -462,7 +660,16 @@ pub(super) async fn run_resolver<F: DidFetcher>(
                 }
             },
             Err(err) => {
-                tracing::warn!(kind = ?err, "auth: did document fetch failed");
+                // BC8: `Blocked` logs a fixed `kind` string rather than its
+                // derived `Debug` (`"Blocked"`), so the line always reads
+                // `blocked_address` — the same word an operator would grep
+                // for regardless of how the variant's `Debug` is spelled.
+                match &err {
+                    FetchError::Blocked => {
+                        tracing::warn!(kind = "blocked_address", "auth: did document fetch failed")
+                    }
+                    other => tracing::warn!(kind = ?other, "auth: did document fetch failed"),
+                }
                 if is_miss {
                     cache.miss_fetch_failed(&did, crate::store::unix_now());
                 }
@@ -607,6 +814,30 @@ mod tests {
     }
 
     #[test]
+    fn dropped_sends_leave_no_entry() {
+        // Review round 2, defect AU: a dropped send must remove `did`'s
+        // `MissState` entirely, not just clear its in-flight mark, so it
+        // never counts against `try_send_miss`'s `max_entries` bound on
+        // `misses`. Four DIDs each fill the cap of 4, and each is then
+        // dropped; if any left a `MissState` behind, `misses` would still
+        // be full and a brand new fifth DID would be refused per-DID
+        // instead of getting `Send`.
+        let cache = KeyCache::new(4);
+        for i in 0..4u32 {
+            let did = format!("did:plc:{i:024}");
+            assert!(cache.should_send_miss(&did, 0), "DID {i} gets its one outstanding Miss");
+            cache.miss_send_dropped(&did);
+        }
+        assert_eq!(cache.misses.lock().unwrap().len(), 0, "every dropped send left no entry");
+
+        let fifth = "did:plc:444444444444444444444444";
+        assert!(
+            cache.should_send_miss(fifth, 1),
+            "no bookkeeping was left behind to crowd out a new DID"
+        );
+    }
+
+    #[test]
     fn miss_fetch_succeeded_clears_state_so_an_evicted_did_refetches_at_once() {
         // BC9, BC16: a successful fetch removes the miss state entirely;
         // only a failed fetch starts the hourly cooldown. This matters
@@ -693,6 +924,106 @@ mod tests {
         assert!(!cache.should_send_miss(also_in_flight, 1), "still in flight");
         assert!(!cache.should_send_miss(cooling, 1), "still cooling down");
         assert!(!cache.should_send_miss(also_cooling, 1), "still cooling down");
+    }
+
+    #[test]
+    fn miss_budget() {
+        // AC6; BC11, BC12, BC14: N misses for distinct DIDs are sent in a
+        // minute, the next is refused, and the budget is free again once
+        // `now / 60` moves to the next minute.
+        let cache = KeyCache::new_with_miss_budget(10, 2);
+        assert!(cache.should_send_miss("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", 0));
+        assert!(cache.should_send_miss("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", 0));
+        assert!(
+            !cache.should_send_miss("did:plc:cccccccccccccccccccccccc", 0),
+            "the budget for this minute is spent"
+        );
+        // Still inside the same minute (59s later): still refused.
+        assert!(!cache.should_send_miss("did:plc:cccccccccccccccccccccccc", 59));
+        // A new minute (now / 60 has advanced) resets the count to 0.
+        assert!(cache.should_send_miss("did:plc:cccccccccccccccccccccccc", 60));
+    }
+
+    #[test]
+    fn miss_budget_rules() {
+        // AC7; BC13, BC15: a DID refused by the per-DID rule spends
+        // nothing from the budget, a budget refusal leaves no cooldown,
+        // and `should_refetch` never touches the budget at all.
+        let cache = KeyCache::new_with_miss_budget(10, 2);
+        let first = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(cache.should_send_miss(first, 0), "the first of two units is spent on first");
+        assert!(!cache.should_send_miss(first, 0), "first is already in flight");
+
+        // The in-flight refusal above spent nothing: a different DID still
+        // gets the second of the two units in this same minute. If the
+        // refusal had spent one, the budget would already be exhausted
+        // here.
+        let second = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(
+            cache.should_send_miss(second, 0),
+            "the in-flight refusal did not spend the budget"
+        );
+
+        // The budget is now spent for this minute; a third DID is refused
+        // by the budget, not by any per-DID state of its own.
+        let third = "did:plc:cccccccccccccccccccccccc";
+        assert!(!cache.should_send_miss(third, 0));
+        // BC12: a budget refusal starts no cooldown, so the very next
+        // minute's first attempt for the same DID succeeds at once.
+        assert!(
+            cache.should_send_miss(third, 60),
+            "a budget refusal must not have started a cooldown"
+        );
+
+        // BC15: `should_refetch` (the stale-entry and signature-failure
+        // path) never spends the miss budget, however many times it runs.
+        let refetch_cache = KeyCache::new_with_miss_budget(10, 1);
+        let refetch_did = "did:plc:dddddddddddddddddddddddd";
+        refetch_cache.insert(refetch_did.to_string(), any_key(), 0);
+        for now in [0, 1, 2, 3, 4] {
+            let _ = refetch_cache.should_refetch(refetch_did, now);
+        }
+        // The budget is untouched: a miss for an unrelated DID still gets
+        // its one unit in this same minute.
+        assert!(refetch_cache.should_send_miss("did:plc:eeeeeeeeeeeeeeeeeeeeeeee", 4));
+    }
+
+    #[test]
+    fn miss_budget_refusal_leaves_no_entry() {
+        // Review round 1, defect AR: a budget refusal must not leave a
+        // `MissState` behind. Without the fix, four budget-refused DIDs
+        // plus the one sent DID would fill `misses` to `max_entries` (4)
+        // with entries `prune_misses` can never clear (their
+        // `last_attempted` is `None`), so a brand new DID in the next
+        // minute would still be refused by the per-DID cap instead of
+        // getting its budget-backed `Send`.
+        let cache = KeyCache::new_with_miss_budget(4, 1);
+        assert!(
+            cache.try_send_miss("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", 0) == MissAttempt::Send,
+            "the one unit of budget for this minute is spent on the first DID"
+        );
+        for did in [
+            "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+            "did:plc:cccccccccccccccccccccccc",
+            "did:plc:dddddddddddddddddddddddd",
+            "did:plc:eeeeeeeeeeeeeeeeeeeeeeee",
+        ] {
+            assert_eq!(
+                cache.try_send_miss(did, 0),
+                MissAttempt::RefusedBudget,
+                "budget already spent this minute"
+            );
+        }
+
+        // A new minute resets the budget. If the four refusals above had
+        // left `MissState` entries behind, `misses` would already be at
+        // its cap of 4 and this brand new DID would be refused per-DID
+        // instead.
+        assert_eq!(
+            cache.try_send_miss("did:plc:ffffffffffffffffffffffff", 60),
+            MissAttempt::Send,
+            "a budget refusal must leave no bookkeeping for prior DIDs to crowd out a new one"
+        );
     }
 
     #[tokio::test]
@@ -1050,5 +1381,133 @@ mod tests {
         run_resolver(rx, FakeFetcher::once(Ok(doc)), Arc::clone(&cache), cfg, None).await;
 
         assert!(matches!(cache.get(did, now), Lookup::Fresh(_)));
+    }
+
+    // --- SSRF: HttpDidFetcher / FetchError::Blocked (BC7, BC8) ----------
+
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A [`crate::auth::dns::LookupHost`] that always resolves to
+    /// `127.0.0.1` and counts how many times it was called, so
+    /// `did_web_blocked` can assert the lookup ran exactly once (BC7: "the
+    /// only name lookup is the one in BC5 and BC6").
+    struct CountingLoopbackLookup(Arc<AtomicUsize>);
+
+    impl crate::auth::dns::LookupHost for CountingLoopbackLookup {
+        fn lookup(
+            &self,
+            _host: String,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<IpAddr>>> + Send>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]) })
+        }
+    }
+
+    #[tokio::test]
+    async fn did_web_blocked() {
+        // AC3: a did:web fetch whose fake lookup returns a loopback
+        // address fails with `FetchError::Blocked`, and the lookup runs
+        // once.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = HttpDidFetcher::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            Arc::new(CountingLoopbackLookup(Arc::clone(&calls))),
+        );
+
+        let result = fetcher.fetch("did:web:blocked.example").await;
+        assert!(matches!(result, Err(FetchError::Blocked)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the lookup must run exactly once");
+
+        // AC3: a did:plc fetch does not use the check — `plc_client` keeps
+        // the default resolver, so `web_lookup` is never consulted for it.
+        // Port 1 on loopback refuses at once, so this needs no real
+        // network; only the transport outcome (not `Blocked`) and the
+        // untouched counter matter here.
+        let plc_result = fetcher.fetch("did:plc:zzzzzzzzzzzzzzzzzzzzzzzz").await;
+        assert!(!matches!(plc_result, Err(FetchError::Blocked)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a did:plc fetch must not consult web_lookup");
+    }
+
+    /// A `tracing_subscriber::fmt::MakeWriter` that appends every formatted
+    /// event to a shared buffer — the same pattern
+    /// `graph::metrics::tests::CapturingWriter` and
+    /// `ingest::tests::CapturingWriter` already use.
+    #[derive(Clone)]
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("CapturingWriter mutex poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_log_and_cooldown() {
+        // AC4: a blocked `Miss` starts the hourly cooldown and logs kind
+        // `blocked_address` with no DID and no host.
+        // `run_resolver` stamps the failed attempt with the real clock
+        // (`store::unix_now()`, this file's own doc comment on
+        // `run_resolver`), so this test judges the cooldown against that
+        // same clock rather than an arbitrary fixed epoch.
+        let did = "did:web:blocked.example";
+        let cache = Arc::new(KeyCache::new(10));
+        let now = crate::store::unix_now();
+        assert!(cache.should_send_miss(did, now), "first miss for this DID enqueues a fetch");
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::fmt().json().with_writer(CapturingWriter(buf.clone())).finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        resolve_one(
+            ResolveRequest::Miss { did: did.to_string(), token: "unused".to_string() },
+            FakeFetcher::once(Err(FetchError::Blocked)),
+            Arc::clone(&cache),
+        )
+        .await;
+
+        drop(dispatch);
+        let output = String::from_utf8(buf.lock().expect("CapturingWriter mutex poisoned").clone())
+            .expect("captured log output must be valid UTF-8");
+        assert!(output.contains("blocked_address"), "log line must name blocked_address: {output}");
+        assert!(!output.contains(did), "no DID may appear in the line: {output}");
+        assert!(!output.contains("blocked.example"), "no host may appear in the line: {output}");
+
+        assert!(
+            !cache.should_send_miss(did, now + 1),
+            "a blocked Miss must start the hourly cooldown like any other failure"
+        );
+        assert!(cache.should_send_miss(did, now + 3601), "the cooldown ends after an hour");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_loopback_host_blocked() {
+        // AC5: a live did:web fetch of a public name that resolves to
+        // 127.0.0.1 is blocked. `localtest.me` is a well-known public DNS
+        // name whose records all resolve to 127.0.0.1. Run by hand:
+        // `cargo test --all-features -- --ignored auth::did::tests::live_loopback_host_blocked`.
+        let fetcher = HttpDidFetcher::new("https://plc.directory".to_string());
+        let result = fetcher.fetch("did:web:localtest.me").await;
+        assert!(
+            matches!(result, Err(FetchError::Blocked)),
+            "a did:web host resolving to 127.0.0.1 must be blocked, got {result:?}"
+        );
     }
 }

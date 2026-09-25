@@ -106,6 +106,9 @@ the name.
 | `UPSTAGE_D2_REFRESH_AGE_H` | `24` | How long a shared follows list is kept |
 | `UPSTAGE_GRAPH_RPS` | `8` | PDS client rate. The PDS limit is 10 each second for each IP |
 | `UPSTAGE_PDS_URL` | `https://bsky.social` | PDS for the session and the graph calls |
+| `UPSTAGE_RESOLVER_MISSES_PER_MIN` | `30` | Global cap on `did` resolver `Miss` fetches sent in one wall-clock minute |
+| `UPSTAGE_GRAPH_LRU_EVICT_PER_MIN` | `1` | Most LRU circle evictions in one wall-clock minute |
+| `UPSTAGE_GRAPH_LRU_PROTECT_MIN` | `60` | A circle with a request this recently is never an LRU eviction victim. `0` disables the protection |
 
 `BSKY_HANDLE` and `BSKY_APP_PASSWORD` become required for `upstage run`
 when `UPSTAGE_PERSONALISE` is `true`.
@@ -145,6 +148,34 @@ The resolver task:
   most `2 × UPSTAGE_MAX_VIEWERS` entries.
 - After a token that was put in the queue verifies, the resolver adds a
   first build for that viewer to the graph queue.
+
+A `did:web` fetch goes out on a second `reqwest::Client`, built with a
+`dns_resolver` (`auth/dns.rs`'s `PublicOnlyResolver`) and `no_proxy()`. The
+resolver looks the host up with `tokio::net::lookup_host` and fails the
+lookup unless every returned address is public: not private, loopback,
+link-local, or any other range in the IANA special-purpose registries
+(an IPv6 address that carries an IPv4 address is judged by the carried
+address). `reqwest` connects only to the addresses this resolver
+returns, so the checked address is always the connected address — a
+second DNS answer for the same name (DNS rebinding) cannot change the
+target, because there is no second lookup. `no_proxy()` is set because a
+proxy from `HTTPS_PROXY` would look the name up itself, bypassing the
+check. A blocked fetch is `auth::did::FetchError::Blocked`, a fetch
+failure like any other: one `blocked_address` warning naming no DID, host
+or address, and, for a `Miss`, the hourly per-DID cooldown starts. The
+`did:plc` client is unchanged, because `UPSTAGE_PLC_URL` is operator-set
+and trusted.
+
+`auth::KeyCache` also holds a global budget of `UPSTAGE_RESOLVER_MISSES_PER_MIN`
+`Miss` fetches for each wall-clock minute (`now / 60`), spent only after
+the per-DID checks above pass — a DID already in flight or in its hourly
+cooldown costs nothing. Once the budget for the minute is spent, a `Miss`
+is refused the same way a full resolver channel refuses one: no in-flight
+mark and no cooldown, so the next request for that DID tries again. The
+first refusal in a minute writes one `auth.miss_limited` warning naming no
+DID; at most one line each minute. A `Refetch` (a stale cached key, or a
+signature failure) never spends this budget — it keeps its own
+story 05 hourly-per-DID limit.
 
 `jti` is not tracked. A token used again only gets the same viewer's
 feed.
@@ -210,8 +241,19 @@ The scheduler runs each minute:
   `UPSTAGE_GRAPH_IDLE_EVICT_D` is removed from memory and SQLite.
 - **LRU eviction.** When a first build would take the count above
   `UPSTAGE_MAX_VIEWERS`, the viewer with the oldest `last_request_at` is
-  removed first. Each removal writes one `graph.evicted` log line with
-  the reason and no DID.
+  removed first, but only among circles whose effective `last_request_at`
+  is older than `UPSTAGE_GRAPH_LRU_PROTECT_MIN` minutes — a circle with a
+  request more recent than that is never a target, however full the
+  store is. At most `UPSTAGE_GRAPH_LRU_EVICT_PER_MIN` LRU evictions run
+  in one wall-clock minute; an idle eviction never counts against this
+  budget. When every remaining circle is protected, or the minute's
+  budget is spent, the first build is refused instead: no circle is
+  created, no job is queued, and no cooldown is set, so the very next
+  request for that viewer tries again from scratch, the same as story
+  06's cap refusal. Each real removal still writes one `graph.evicted`
+  log line with the reason and no DID; the first refusal in a minute
+  writes one `graph.lru_refused` line naming the reason (`protected` or
+  `budget`) and no DID.
 
 A refresh builds a new circle and replaces the old one in one step. If a
 refresh fails part of the way, the old circle stays (PRD edge case).

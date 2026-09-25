@@ -886,14 +886,18 @@ fn start_graph_subsystem(
         }
     };
 
-    let graph_handle =
-        match crate::graph::GraphHandle::from_store(&graph_store, cfg.max_viewers as usize) {
-            Ok(handle) => handle,
-            Err(err) => {
-                tracing::error!(error = %err, "ingest: could not load circles from the store");
-                return None;
-            }
-        };
+    let graph_handle = match crate::graph::GraphHandle::from_store_with_lru_limits(
+        &graph_store,
+        cfg.max_viewers as usize,
+        cfg.graph_lru_protect_min,
+        cfg.graph_lru_evict_per_min,
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::error!(error = %err, "ingest: could not load circles from the store");
+            return None;
+        }
+    };
 
     let credentials = crate::appview::pds::Credentials { handle, app_password };
     let pds_client = match crate::appview::pds::PdsClient::from_config(cfg, credentials) {
@@ -1120,6 +1124,7 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
             cfg.max_viewers as usize * 2,
             auth_cfg.clone(),
             first_build_hook,
+            cfg.resolver_misses_per_min,
         );
         http_config.auth = Some(crate::http::AuthHandle { cache, resolver_tx, cfg: auth_cfg });
     }

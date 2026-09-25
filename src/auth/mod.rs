@@ -23,6 +23,7 @@
 #![allow(dead_code)]
 
 mod did;
+mod dns;
 mod jwt;
 mod keys;
 
@@ -110,15 +111,19 @@ const RESOLVER_CHANNEL_CAPACITY: usize = 1024;
 /// again for the life of the process. `max_entries` is `2 *
 /// UPSTAGE_MAX_VIEWERS` (BC16), computed by the caller. `first_build_hook`
 /// is `Some` only once the graph subsystem has started (BC18, BC22); the
-/// resolver runs the same either way. The returned `Sender` and `KeyCache`
-/// go into `http::AuthHandle`.
+/// resolver runs the same either way. `misses_per_min` is
+/// `UPSTAGE_RESOLVER_MISSES_PER_MIN` (launch-blockers spec.md BC11 to
+/// BC16), the global cap on `Miss` fetches the returned cache sends in one
+/// wall-clock minute. The returned `Sender` and `KeyCache` go into
+/// `http::AuthHandle`.
 pub fn spawn_resolver(
     plc_url: String,
     max_entries: usize,
     auth_cfg: AuthConfig,
     first_build_hook: Option<FirstBuildHook>,
+    misses_per_min: u32,
 ) -> (mpsc::Sender<ResolveRequest>, std::sync::Arc<KeyCache>) {
-    let cache = std::sync::Arc::new(KeyCache::new(max_entries));
+    let cache = std::sync::Arc::new(KeyCache::new_with_miss_budget(max_entries, misses_per_min));
     let (tx, rx) = mpsc::channel(RESOLVER_CHANNEL_CAPACITY);
     let fetcher = did::HttpDidFetcher::new(plc_url);
     let resolver_cache = std::sync::Arc::clone(&cache);
@@ -193,23 +198,38 @@ pub fn verify(
             key
         }
         did::Lookup::Missing => {
-            // BC9: `should_send_miss` enqueues a `Miss` only when one for
+            // BC9: `try_send_miss` enqueues a `Miss` only when one for
             // this DID is not already in flight and the hourly cooldown
             // since the last attempt has passed — not on every request
             // for a DID that never resolves. When the channel is full,
-            // `try_send` drops the message; `miss_send_dropped` clears
-            // the in-flight mark `should_send_miss` just set, so a
-            // dropped send does not lock the DID out until the cooldown
-            // would otherwise allow another attempt.
-            if cache.should_send_miss(&checked.viewer_did, now)
-                && resolver_tx
-                    .try_send(ResolveRequest::Miss {
-                        did: checked.viewer_did.clone(),
-                        token: token.to_string(),
-                    })
-                    .is_err()
-            {
-                cache.miss_send_dropped(&checked.viewer_did);
+            // `try_send` drops the message; `miss_send_dropped` removes
+            // the `MissState` `try_send_miss` just created (review round
+            // 2, defect AU), so the dropped send costs nothing and the
+            // very next request for the same DID enqueues it again at
+            // once, rather than either locking it out until the cooldown
+            // or leaving unprunable bookkeeping behind that could crowd
+            // out a new DID. Launch-blockers spec.md BC16: a refusal
+            // caused by the global miss budget, and only that reason,
+            // logs one rate-limited `auth.miss_limited` warning naming no
+            // DID.
+            match cache.try_send_miss(&checked.viewer_did, now) {
+                did::MissAttempt::Send => {
+                    if resolver_tx
+                        .try_send(ResolveRequest::Miss {
+                            did: checked.viewer_did.clone(),
+                            token: token.to_string(),
+                        })
+                        .is_err()
+                    {
+                        cache.miss_send_dropped(&checked.viewer_did);
+                    }
+                }
+                did::MissAttempt::RefusedBudget => {
+                    if cache.note_miss_limited(now) {
+                        tracing::warn!("auth.miss_limited");
+                    }
+                }
+                did::MissAttempt::RefusedPerDid => {}
             }
             return Err(AuthError::KeyUnknown);
         }
@@ -570,5 +590,66 @@ mod tests {
 
         assert_eq!(verify(&token, NOW + 10, &cache, &cfg(), &tx), Err(AuthError::Signature));
         assert!(rx.try_recv().is_err(), "second failure within the hour must not enqueue again");
+    }
+
+    /// Captures everything a `tracing` subscriber writes to a shared
+    /// buffer, the same pattern `auth::did::tests::CapturingWriter`,
+    /// `graph::metrics::tests::CapturingWriter` and
+    /// `ingest::tests::CapturingWriter` already use.
+    #[derive(Clone)]
+    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("CapturingWriter mutex poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn miss_limited_log() {
+        // AC8; BC16: once the miss budget for a minute is spent, further
+        // refused misses in that same minute write exactly one
+        // `auth.miss_limited` warning, naming no DID.
+        let cache = KeyCache::new_with_miss_budget(10, 1);
+        let (tx, _rx) = channel();
+        let dids: Vec<String> =
+            ('a'..='e').map(|c| format!("did:plc:{}", c.to_string().repeat(24))).collect();
+        let tokens: Vec<String> =
+            dids.iter().map(|did| sign_token(did, "ES256K", 60, |_msg| vec![0u8; 64])).collect();
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::fmt().json().with_writer(CapturingWriter(buf.clone())).finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        for token in &tokens {
+            assert_eq!(verify(token, NOW, &cache, &cfg(), &tx), Err(AuthError::KeyUnknown));
+        }
+
+        drop(dispatch);
+        let output = String::from_utf8(buf.lock().expect("CapturingWriter mutex poisoned").clone())
+            .expect("captured log output must be valid UTF-8");
+        assert_eq!(
+            output.matches("auth.miss_limited").count(),
+            1,
+            "exactly one auth.miss_limited line for the minute: {output}"
+        );
+        for did in &dids {
+            assert!(!output.contains(did), "no DID may appear in the line: {output}");
+        }
     }
 }
