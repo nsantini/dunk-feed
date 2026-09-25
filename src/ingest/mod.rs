@@ -540,6 +540,15 @@ pub enum IngestError {
     /// either way.
     #[error("the {task} task panicked")]
     TaskPanicked { task: &'static str },
+    /// `cfg.personalise` is `true` and `BSKY_HANDLE` or `BSKY_APP_PASSWORD`
+    /// is missing, or empty once trimmed (story 11 launch, BC2). `run`
+    /// checks this first, through `Config::bsky_credentials`, before
+    /// `Store::open` and before any network call, so a launch with the
+    /// switch on and no credentials never creates the database file. The
+    /// same variable name and message shape as `PublishError::MissingCredentials`,
+    /// since both read `Config::bsky_credentials`.
+    #[error("missing or empty environment variable {var}")]
+    MissingCredentials { var: &'static str },
 }
 
 /// Sends one `Op` to the writer, mapping the only error `WriterHandle::send`
@@ -843,13 +852,15 @@ impl<S: crate::graph::build::GraphSource + Send + Sync> crate::graph::build::Gra
 /// Starts the graph subsystem — a second `Store` connection, the
 /// `GraphHandle` loaded from it (BC19), the worker task and the scheduler
 /// task (network-feed story 06; the scheduler replaces story 06's own
-/// touch-flush task, story 09 BC15) — when `cfg.bsky_handle` and
-/// `cfg.bsky_app_password` are both set. Returns the loaded `GraphHandle`
-/// (slice 4.0: `run` attaches it to `AppState::graph`, BC4) alongside the
-/// hook `run` wires into the resolver so a verified viewer with no circle
-/// gets a first build (BC22). Returns `None`, logging one `error` line,
-/// when either credential is missing (BC18) or any step here fails: `run`
-/// itself never fails over this, since a verified viewer just keeps
+/// touch-flush task, story 09 BC15) — from the `credentials` its caller
+/// already checked (story 11 launch, BC2b: `run` calls
+/// `Config::bsky_credentials` first and passes the result down, so this
+/// function no longer has a "credentials missing" case of its own to log).
+/// Returns the loaded `GraphHandle` (slice 4.0: `run` attaches it to
+/// `AppState::graph`, BC4) alongside the hook `run` wires into the resolver
+/// so a verified viewer with no circle gets a first build (BC22). Returns
+/// `None`, logging one `error` line, when a later step here fails: `run`
+/// itself never fails over that, since a verified viewer just keeps
 /// getting empty pages either way (BC4's "no graph" case).
 /// `viewer_lists` is cloned into the worker's drop-lists callback
 /// (`graph::queue::DropListsFn`), so a freshly built circle's cached list
@@ -866,18 +877,8 @@ fn start_graph_subsystem(
     cfg: &Config,
     viewer_lists: std::sync::Arc<crate::http::viewer::ViewerLists>,
     snapshot: crate::scorer::snapshot::SnapshotHandle,
+    credentials: crate::appview::pds::Credentials,
 ) -> Option<(std::sync::Arc<crate::graph::GraphHandle>, crate::auth::FirstBuildHook)> {
-    let (handle, app_password) = match (&cfg.bsky_handle, &cfg.bsky_app_password) {
-        (Some(handle), Some(app_password)) => (handle.clone(), app_password.clone()),
-        _ => {
-            tracing::error!(
-                "ingest: UPSTAGE_PERSONALISE is true but BSKY_HANDLE or BSKY_APP_PASSWORD \
-                 is not set; the graph worker will not start and verified viewers get empty pages"
-            );
-            return None;
-        }
-    };
-
     let graph_store = match crate::store::Store::open(cfg) {
         Ok(store) => store,
         Err(err) => {
@@ -899,7 +900,6 @@ fn start_graph_subsystem(
         }
     };
 
-    let credentials = crate::appview::pds::Credentials { handle, app_password };
     let pds_client = match crate::appview::pds::PdsClient::from_config(cfg, credentials) {
         Ok(client) => client,
         Err(err) => {
@@ -1004,6 +1004,16 @@ fn start_graph_subsystem(
 /// not raised, since the first task's own result (success or
 /// `IngestError`) is the one this function returns (BC29).
 pub async fn run(cfg: &Config) -> Result<(), IngestError> {
+    // Story 11 launch, BC2, BC3: checked first, before `Store::open` and
+    // before any network call, so a launch with the switch on and a
+    // missing or blank credential never creates the database file. `None`
+    // when the switch is off: no credential read at all.
+    let credentials = cfg
+        .personalise
+        .then(|| cfg.bsky_credentials())
+        .transpose()
+        .map_err(|var| IngestError::MissingCredentials { var })?;
+
     let store = crate::store::Store::open(cfg)?;
 
     // Round 1 finding 2 (BC38, BC39): `evict_tx`'s clone goes to the
@@ -1114,8 +1124,12 @@ pub async fn run(cfg: &Config) -> Result<(), IngestError> {
         // `first_build_hook` stays `None` otherwise, so the resolver task
         // below runs the same either way, and `graph_handle` stays `None`
         // (BC4's "no graph" case: verified viewers get empty pages).
-        let subsystem =
-            start_graph_subsystem(cfg, std::sync::Arc::clone(&viewer_lists), snapshot.clone());
+        let subsystem = start_graph_subsystem(
+            cfg,
+            std::sync::Arc::clone(&viewer_lists),
+            snapshot.clone(),
+            credentials.clone().expect("checked at the top of run when cfg.personalise is true"),
+        );
         let first_build_hook = subsystem.as_ref().map(|(_, hook)| std::sync::Arc::clone(hook));
         graph_handle = subsystem.map(|(handle, _)| handle);
 
@@ -2804,6 +2818,55 @@ mod tests {
             .to_string()
     }
 
+    // --- run: credential check ------------------------------------------
+
+    /// A `Config` with the switch on (the default, story 11) and
+    /// `UPSTAGE_DB_PATH` pointed at a fresh, not-yet-created temp file, so
+    /// `run_requires_credentials_when_personalised` can assert no database
+    /// file was created. `handle` and `app_password` are `None` unless
+    /// `pairs` overrides `BSKY_HANDLE` / `BSKY_APP_PASSWORD`.
+    fn test_config_personalised_with_db(db_path: &str, pairs: &[(&str, &str)]) -> Config {
+        let mut map: std::collections::HashMap<String, String> =
+            pairs.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
+        map.insert("UPSTAGE_HOSTNAME".to_string(), "feed.example.com".to_string());
+        map.insert("UPSTAGE_PUBLISHER_DID".to_string(), "did:plc:abc".to_string());
+        map.insert("UPSTAGE_DB_PATH".to_string(), db_path.to_string());
+        crate::config::load(move |name| map.get(name).cloned()).expect("test config should load")
+    }
+
+    // AC2, BC2, BC3: the switch on and a missing or blank credential fails
+    // before `Store::open` and before any network call, naming the
+    // variable; `BSKY_HANDLE` is checked before `BSKY_APP_PASSWORD`, the
+    // same order `publish::preflight` uses.
+    #[tokio::test]
+    async fn run_requires_credentials_when_personalised() {
+        let cases: [(&[(&str, &str)], &str); 4] = [
+            (&[], "BSKY_HANDLE"),
+            (&[("BSKY_HANDLE", "upstage.bsky.social")], "BSKY_APP_PASSWORD"),
+            (&[("BSKY_HANDLE", "   "), ("BSKY_APP_PASSWORD", "secret")], "BSKY_HANDLE"),
+            (
+                &[("BSKY_HANDLE", "upstage.bsky.social"), ("BSKY_APP_PASSWORD", "   ")],
+                "BSKY_APP_PASSWORD",
+            ),
+        ];
+
+        for (pairs, expected_var) in cases {
+            let path = temp_db_path("run-requires-credentials");
+            let cfg = test_config_personalised_with_db(&path, pairs);
+            assert!(cfg.personalise, "the switch defaults to true (story 11)");
+
+            let err = run(&cfg).await.unwrap_err();
+            match err {
+                IngestError::MissingCredentials { var } => assert_eq!(var, expected_var),
+                other => panic!("expected MissingCredentials({expected_var}), got {other:?}"),
+            }
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "the credential check must run before Store::open creates {path}"
+            );
+        }
+    }
+
     /// A `Config` with `BSKY_HANDLE` and `BSKY_APP_PASSWORD` set, and
     /// `UPSTAGE_DB_PATH` pointed at a fresh temp file, for
     /// `start_graph_subsystem_with_credentials_starts_the_worker`.
@@ -2820,32 +2883,15 @@ mod tests {
         crate::config::load(lookup).expect("test config should load")
     }
 
-    #[test]
-    fn start_graph_subsystem_without_credentials_returns_none() {
-        // BC18: the switch is on (implicitly, by calling this at all — the
-        // caller in `run` only calls it inside `if cfg.personalise`) but
-        // `BSKY_HANDLE`/`BSKY_APP_PASSWORD` are missing: no worker starts,
-        // and the caller gets no hook to wire into the resolver.
-        let cfg = test_config();
-        assert!(cfg.bsky_handle.is_none());
-        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new(
-            cfg.follows_me_depth as usize,
-        ));
-        assert!(start_graph_subsystem(
-            &cfg,
-            viewer_lists,
-            crate::scorer::snapshot::SnapshotHandle::new()
-        )
-        .is_none());
-    }
-
     #[tokio::test]
     async fn start_graph_subsystem_with_credentials_starts_the_worker() {
-        // BC19 (the load half): with credentials present, the graph store
-        // opens, the (empty) circle index loads without error, and a hook
-        // comes back for the caller to wire into the resolver.
+        // BC19 (the load half): given the credentials its caller already
+        // checked, the graph store opens, the (empty) circle index loads
+        // without error, and a hook comes back for the caller to wire into
+        // the resolver.
         let path = temp_db_path("start-graph");
         let cfg = test_config_with_graph(&path);
+        let credentials = cfg.bsky_credentials().expect("test_config_with_graph sets both");
 
         let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new(
             cfg.follows_me_depth as usize,
@@ -2854,6 +2900,7 @@ mod tests {
             &cfg,
             viewer_lists,
             crate::scorer::snapshot::SnapshotHandle::new(),
+            credentials,
         );
         assert!(subsystem.is_some(), "credentials present: a graph handle and hook must come back");
 
@@ -2877,6 +2924,7 @@ mod tests {
                 .unwrap();
         }
         let cfg = test_config_with_graph(&path);
+        let credentials = cfg.bsky_credentials().expect("test_config_with_graph sets both");
 
         let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new(
             cfg.follows_me_depth as usize,
@@ -2885,6 +2933,7 @@ mod tests {
             &cfg,
             viewer_lists,
             crate::scorer::snapshot::SnapshotHandle::new(),
+            credentials,
         );
         assert!(subsystem.is_some());
 

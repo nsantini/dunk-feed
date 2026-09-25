@@ -127,9 +127,10 @@ pub struct Config {
     /// (`UPSTAGE_GRAPH_IDLE_EVICT_D`, story 09 spec.md BC9, BC18, BC18a).
     /// `0` is rejected, the same rule as `graph_refresh_age_h`.
     pub graph_idle_evict_d: u32,
-    /// `UPSTAGE_PERSONALISE` (network-feed story 05, BC22): `false` by
-    /// default (story 05's `## Non-goals`; story 11 flips the default).
-    /// `getFeedSkeleton` (`src/http/skeleton.rs`) reads `Authorization` and
+    /// `UPSTAGE_PERSONALISE` (network-feed story 05, BC22): `true` by
+    /// default (story 11 launch: viewers get the network feed unless an
+    /// operator opts out). `false` is the kill switch back to the story 01
+    /// global feed. `getFeedSkeleton` (`src/http/skeleton.rs`) reads `Authorization` and
     /// calls `auth::verify` only when this is `true`; `run`
     /// (`src/ingest/mod.rs`) builds the DID key cache and starts the
     /// resolver task only then too.
@@ -178,6 +179,31 @@ impl Config {
     /// `did:web` identity.
     pub fn did_web(&self) -> String {
         format!("did:web:{}", self.hostname)
+    }
+
+    /// Reads `bsky_handle` and `bsky_app_password` and builds
+    /// [`crate::appview::pds::Credentials`] from them, shared by
+    /// `publish::preflight` (BC4a) and `ingest::run` (BC2) so the blank
+    /// rule lives in one place (story 11 Approach: "Rejected: a second trim
+    /// check in `ingest/`"). `BSKY_HANDLE` is checked before
+    /// `BSKY_APP_PASSWORD`, the same order `publish::preflight` used before
+    /// this method existed. Missing, or present but empty once trimmed,
+    /// returns the variable's name so each caller builds its own error
+    /// variant with its own message.
+    pub fn bsky_credentials(&self) -> Result<crate::appview::pds::Credentials, &'static str> {
+        let handle = self
+            .bsky_handle
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .ok_or("BSKY_HANDLE")?;
+        let app_password = self
+            .bsky_app_password
+            .as_ref()
+            .filter(|value| !value.expose().trim().is_empty())
+            .cloned()
+            .ok_or("BSKY_APP_PASSWORD")?;
+        Ok(crate::appview::pds::Credentials { handle, app_password })
     }
 }
 
@@ -494,7 +520,7 @@ fn drop_labels(
 
 /// Parses `UPSTAGE_PERSONALISE` (BC22): after trim, exactly `true` or
 /// `false`, case-sensitive. Unset or empty (after trim) is `default`
-/// (`false`); anything else is `Invalid`.
+/// (`true`, story 11); anything else is `Invalid`.
 fn personalise_or_default(
     lookup: &impl Fn(&str) -> Option<String>,
     name: &'static str,
@@ -584,7 +610,7 @@ pub fn load(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, ConfigErr
     // Read once, ahead of the struct literal: BC23's default reads
     // `hostname` directly, before `Config::did_web` exists to call.
     let hostname = required(&lookup, "UPSTAGE_HOSTNAME")?;
-    let personalise = personalise_or_default(&lookup, "UPSTAGE_PERSONALISE", false)?;
+    let personalise = personalise_or_default(&lookup, "UPSTAGE_PERSONALISE", true)?;
     let service_did = service_did_or_default(&lookup, "UPSTAGE_SERVICE_DID", &hostname);
     let plc_url = plc_url_or_default(&lookup, "UPSTAGE_PLC_URL", "https://plc.directory")?;
     let max_viewers = max_viewers_or_default(&lookup, "UPSTAGE_MAX_VIEWERS", 1000)?;
@@ -884,6 +910,44 @@ mod tests {
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.bsky_handle, Some("upstage.bsky.social".to_string()));
         assert_eq!(config.bsky_app_password.as_ref().map(Secret::expose), Some("secret"));
+    }
+
+    #[test]
+    fn bsky_credentials_builds_credentials_when_both_are_set() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("BSKY_HANDLE", "upstage.bsky.social"));
+        pairs.push(("BSKY_APP_PASSWORD", "secret"));
+        let config = load(env(&pairs)).unwrap();
+        let credentials = config.bsky_credentials().unwrap();
+        assert_eq!(credentials.handle, "upstage.bsky.social");
+        assert_eq!(credentials.app_password.expose(), "secret");
+    }
+
+    #[test]
+    fn bsky_credentials_names_the_first_missing_variable() {
+        // BSKY_HANDLE is checked first, matching publish::preflight's order.
+        let config = load(env(&required_pair())).unwrap();
+        assert_eq!(config.bsky_credentials(), Err("BSKY_HANDLE"));
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("BSKY_HANDLE", "upstage.bsky.social"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.bsky_credentials(), Err("BSKY_APP_PASSWORD"));
+    }
+
+    #[test]
+    fn bsky_credentials_treats_a_blank_value_as_missing() {
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("BSKY_HANDLE", "   "));
+        pairs.push(("BSKY_APP_PASSWORD", "secret"));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.bsky_credentials(), Err("BSKY_HANDLE"));
+
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("BSKY_HANDLE", "upstage.bsky.social"));
+        pairs.push(("BSKY_APP_PASSWORD", "   "));
+        let config = load(env(&pairs)).unwrap();
+        assert_eq!(config.bsky_credentials(), Err("BSKY_APP_PASSWORD"));
     }
 
     #[test]
@@ -1563,14 +1627,16 @@ mod tests {
 
     #[test]
     fn personalise() {
-        // BC22 to BC25: defaults.
+        // BC1, BC23 to BC25: defaults. Story 11 flips the personalise
+        // default to true; `personalise_default_true` below covers that
+        // case on its own.
         let config = load(env(&required_pair())).unwrap();
-        assert!(!config.personalise);
+        assert!(config.personalise);
         assert_eq!(config.service_did, "did:web:feed.example.com");
         assert_eq!(config.plc_url, "https://plc.directory");
         assert_eq!(config.max_viewers, 1000);
 
-        // BC22: exactly "true" or "false" after trim.
+        // BC1a: exactly "true" or "false" after trim.
         let mut pairs = required_pair().to_vec();
         pairs.push(("UPSTAGE_PERSONALISE", "true"));
         assert!(load(env(&pairs)).unwrap().personalise);
@@ -1579,10 +1645,11 @@ mod tests {
         pairs.push(("UPSTAGE_PERSONALISE", "false"));
         assert!(!load(env(&pairs)).unwrap().personalise);
 
-        // Whitespace-only is unset, not Invalid.
+        // Whitespace-only is unset, not Invalid, so it falls back to the
+        // default (true).
         let mut pairs = required_pair().to_vec();
         pairs.push(("UPSTAGE_PERSONALISE", "  "));
-        assert!(!load(env(&pairs)).unwrap().personalise);
+        assert!(load(env(&pairs)).unwrap().personalise);
 
         for bad in ["True", "FALSE", "yes", "1"] {
             let mut pairs = required_pair().to_vec();
@@ -1650,6 +1717,18 @@ mod tests {
         let mut pairs = required_pair().to_vec();
         pairs.push(("UPSTAGE_MAX_VIEWERS", "500"));
         assert_eq!(load(env(&pairs)).unwrap().max_viewers, 500);
+    }
+
+    #[test]
+    fn personalise_default_true() {
+        // AC1, BC1: unset defaults to true (story 11 launch).
+        let config = load(env(&required_pair())).unwrap();
+        assert!(config.personalise);
+
+        // BC1: blank after trim also falls back to the default, true.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("UPSTAGE_PERSONALISE", "   "));
+        assert!(load(env(&pairs)).unwrap().personalise);
     }
 
     #[test]

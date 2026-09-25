@@ -834,6 +834,74 @@ mod tests {
         assert_eq!(json["feed"][0]["post"], "at://q/1");
     }
 
+    /// A `Config` with `UPSTAGE_PERSONALISE` set explicitly to `false`
+    /// (story 11's kill switch), separate from `test_config` so this test
+    /// stays a regression check on the switch-off behaviour itself rather
+    /// than on `test_config`'s own default.
+    fn test_config_switch_off(http_addr: &str) -> crate::config::Config {
+        let mut pairs: HashMap<String, String> = HashMap::new();
+        pairs.insert("UPSTAGE_HOSTNAME".to_string(), "feed.example.com".to_string());
+        pairs.insert("UPSTAGE_PUBLISHER_DID".to_string(), "did:plc:abc".to_string());
+        pairs.insert("UPSTAGE_HTTP_ADDR".to_string(), http_addr.to_string());
+        pairs.insert("UPSTAGE_PERSONALISE".to_string(), "false".to_string());
+        crate::config::load(move |name| pairs.get(name).cloned())
+            .expect("test config must be valid")
+    }
+
+    // AC3, BC5: with the switch off, the same snapshot rows produce the
+    // exact story 01 global output — body, cursor and headers — that
+    // `config::load`'s old `false` default gave every viewer before this
+    // story flipped it to `true`. A short page carries a cursor (BC8); the
+    // last page omits it, same as `happy_path_returns_the_shape_and_omits_cursor_on_the_last_page`.
+    #[tokio::test]
+    async fn switch_off_equals_global() {
+        let items = vec![item("at://q/1", "cid1", 3.0, 4.5), item("at://q/2", "cid2", 2.0, 1.0)];
+        let global = ids(&items);
+
+        let cfg = test_config_switch_off("127.0.0.1:0");
+        let state = test_state(cfg);
+        state.snapshot.swap(Arc::new(items), Arc::new(global));
+        let app = router(state);
+
+        // A short page: cursor is present, and every field matches the
+        // pre-launch global shape byte for byte.
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}&limit=1");
+        let response =
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "public, max-age=30");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["feed"],
+            serde_json::json!([{ "post": "at://q/1", "feedContext": "r=4.5" }])
+        );
+        assert!(json["cursor"].is_string(), "a short page carries a cursor");
+
+        // The full page: cursor is omitted, same as the story 01 shape.
+        let items = vec![item("at://q/1", "cid1", 3.0, 4.5), item("at://q/2", "cid2", 2.0, 1.0)];
+        let global = ids(&items);
+        let cfg = test_config_switch_off("127.0.0.1:0");
+        let state = test_state(cfg);
+        state.snapshot.swap(Arc::new(items), Arc::new(global));
+        let app = router(state);
+        let uri = format!("/xrpc/app.bsky.feed.getFeedSkeleton?feed={FEED_URI}");
+        let response =
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "public, max-age=30");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["feed"],
+            serde_json::json!([
+                { "post": "at://q/1", "feedContext": "r=4.5" },
+                { "post": "at://q/2", "feedContext": "r=1.0" },
+            ])
+        );
+        assert!(json.get("cursor").is_none(), "the last page must omit cursor");
+    }
+
     #[test]
     fn bearer_token_case_insensitive_scheme() {
         // Review round 1, defect G.

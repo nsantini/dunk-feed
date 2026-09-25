@@ -301,6 +301,11 @@ mod tests {
             "UPSTAGE_HOSTNAME" => Some("feed.example.com".to_string()),
             "UPSTAGE_PUBLISHER_DID" => Some("did:plc:abc".to_string()),
             "UPSTAGE_DB_PATH" => Some("/no/such/directory/upstage.db".to_string()),
+            // Story 11 launch flips the default to true; this test is about
+            // `Store::open`, not credentials, so it keeps the old
+            // switch-off behaviour explicitly rather than also setting
+            // BSKY_HANDLE/BSKY_APP_PASSWORD.
+            "UPSTAGE_PERSONALISE" => Some("false".to_string()),
             _ => None,
         };
         let config = crate::config::load(lookup).expect("minimal config loads");
