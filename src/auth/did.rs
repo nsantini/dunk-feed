@@ -222,10 +222,14 @@ impl KeyCache {
     /// than on the bool `should_send_miss` collapses it to, so a refusal
     /// caused by the global miss budget — and only that reason — can drive
     /// the rate-limited `auth.miss_limited` line (BC16). The per-DID
-    /// checks (BC13) run first and, on their own, spend nothing from the
-    /// budget; the budget is spent only once they have all passed (BC11),
-    /// and a refusal there (BC12) leaves no in-flight mark and no cooldown,
-    /// the same as a dropped send on a full resolver channel.
+    /// checks (BC13) run first, against any `MissState` already on record,
+    /// and on their own spend nothing from the budget. Review round 1,
+    /// defect AR: `misses` gets a new entry only once the budget has also
+    /// passed — a budget refusal (BC12) must leave no `MissState` behind,
+    /// or a flood of budget-refused DIDs would fill `misses` up to
+    /// `max_entries` with bookkeeping `prune_misses` can never clear
+    /// (`last_attempted` stays `None`), permanently refusing every
+    /// legitimate new DID with `RefusedPerDid` instead.
     pub(super) fn try_send_miss(&self, did: &str, now: i64) -> MissAttempt {
         let mut misses = self.misses.lock().expect("KeyCache mutex poisoned");
         if !misses.contains_key(did) && misses.len() >= self.max_entries {
@@ -234,22 +238,24 @@ impl KeyCache {
                 return MissAttempt::RefusedPerDid;
             }
         }
-        let state = misses.entry(did.to_string()).or_insert(MissState {
-            in_flight: false,
-            last_attempted: None,
-            first_seen: now,
-        });
-        if state.in_flight {
-            return MissAttempt::RefusedPerDid;
-        }
-        if let Some(last) = state.last_attempted {
-            if now - last < REFETCH_COOLDOWN_SECS {
+        if let Some(state) = misses.get(did) {
+            if state.in_flight {
                 return MissAttempt::RefusedPerDid;
+            }
+            if let Some(last) = state.last_attempted {
+                if now - last < REFETCH_COOLDOWN_SECS {
+                    return MissAttempt::RefusedPerDid;
+                }
             }
         }
         if !self.spend_miss_budget(now) {
             return MissAttempt::RefusedBudget;
         }
+        let state = misses.entry(did.to_string()).or_insert(MissState {
+            in_flight: false,
+            last_attempted: None,
+            first_seen: now,
+        });
         state.in_flight = true;
         MissAttempt::Send
     }
@@ -951,6 +957,44 @@ mod tests {
         // The budget is untouched: a miss for an unrelated DID still gets
         // its one unit in this same minute.
         assert!(refetch_cache.should_send_miss("did:plc:eeeeeeeeeeeeeeeeeeeeeeee", 4));
+    }
+
+    #[test]
+    fn miss_budget_refusal_leaves_no_entry() {
+        // Review round 1, defect AR: a budget refusal must not leave a
+        // `MissState` behind. Without the fix, four budget-refused DIDs
+        // plus the one sent DID would fill `misses` to `max_entries` (4)
+        // with entries `prune_misses` can never clear (their
+        // `last_attempted` is `None`), so a brand new DID in the next
+        // minute would still be refused by the per-DID cap instead of
+        // getting its budget-backed `Send`.
+        let cache = KeyCache::new_with_miss_budget(4, 1);
+        assert!(
+            cache.try_send_miss("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", 0) == MissAttempt::Send,
+            "the one unit of budget for this minute is spent on the first DID"
+        );
+        for did in [
+            "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+            "did:plc:cccccccccccccccccccccccc",
+            "did:plc:dddddddddddddddddddddddd",
+            "did:plc:eeeeeeeeeeeeeeeeeeeeeeee",
+        ] {
+            assert_eq!(
+                cache.try_send_miss(did, 0),
+                MissAttempt::RefusedBudget,
+                "budget already spent this minute"
+            );
+        }
+
+        // A new minute resets the budget. If the four refusals above had
+        // left `MissState` entries behind, `misses` would already be at
+        // its cap of 4 and this brand new DID would be refused per-DID
+        // instead.
+        assert_eq!(
+            cache.try_send_miss("did:plc:ffffffffffffffffffffffff", 60),
+            MissAttempt::Send,
+            "a budget refusal must leave no bookkeeping for prior DIDs to crowd out a new one"
+        );
     }
 
     #[tokio::test]

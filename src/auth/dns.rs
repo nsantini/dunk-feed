@@ -7,6 +7,17 @@
 //! 6to4 form, BC3) is judged by the carried address, so `::ffff:a.b.c.d`
 //! cannot smuggle a private `a.b.c.d` past the IPv6-shaped ranges above it.
 //!
+//! Review round 1, defect AT widens the blocked list beyond BC1 to BC3's
+//! own text with five more IANA special-purpose ranges: the IPv4
+//! `192.88.99.0/24` (6to4 relay anycast), and the IPv6 `64:ff9b:1::/48`
+//! (local-use NAT64, blocked whole — unlike `64:ff9b::/96` above it, this
+//! prefix is not judged by a carried IPv4 address), `100::/64`
+//! (discard-only), `2001::/23` (IETF protocol assignments, which holds
+//! `2001::/32` Teredo, `2001:2::/48`, `2001:10::/28` and `2001:20::/28`)
+//! and `3fff::/20` (IETF protocol assignments, documentation). Each is
+//! blocked under the same standing rule as BC1 to BC3: not globally
+//! routable, so a public host has no reason to publish one.
+//!
 //! [`PublicOnlyResolver`] is a `reqwest::dns::Resolve` over a [`LookupHost`]
 //! seam: production resolves through `tokio::net::lookup_host`, and the
 //! module's own tests resolve through a canned [`LookupHost`], so `did.rs`'s
@@ -37,10 +48,11 @@ pub(super) fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// BC1: the IPv4 special-purpose ranges from the IANA registry.
+/// BC1, review round 1 defect AT: the IPv4 special-purpose ranges from the
+/// IANA registry, including `192.88.99.0/24` (6to4 relay anycast).
 fn is_public_v4(ip: Ipv4Addr) -> bool {
     let bits = u32::from(ip);
-    const RANGES: [(u32, u32); 14] = [
+    const RANGES: [(u32, u32); 15] = [
         (0x00000000, 8),  // 0.0.0.0/8
         (0x0a000000, 8),  // 10.0.0.0/8
         (0x64400000, 10), // 100.64.0.0/10
@@ -49,6 +61,7 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         (0xac100000, 12), // 172.16.0.0/12
         (0xc0000000, 24), // 192.0.0.0/24
         (0xc0000200, 24), // 192.0.2.0/24
+        (0xc0586300, 24), // 192.88.99.0/24 (6to4 relay anycast)
         (0xc0a80000, 16), // 192.168.0.0/16
         (0xc6120000, 15), // 198.18.0.0/15
         (0xc6336400, 24), // 198.51.100.0/24
@@ -79,6 +92,15 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         return is_public_v4(embedded);
     }
     let segments = ip.segments();
+    // 64:ff9b:1::/48: local-use NAT64. Blocked whole, unlike `64:ff9b::/96`
+    // above (`v4_in_v6`): review round 1, defect AT.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+        return false;
+    }
+    // 100::/64: discard-only (review round 1, defect AT).
+    if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0 {
+        return false;
+    }
     // fc00::/7: unique local.
     if segments[0] & 0xfe00 == 0xfc00 {
         return false;
@@ -99,8 +121,15 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if segments[0] == 0x2001 && segments[1] == 0x0db8 {
         return false;
     }
-    // 2001::/32: Teredo.
-    if segments[0] == 0x2001 && segments[1] == 0x0000 {
+    // 2001::/23: IETF protocol assignments (review round 1, defect AT),
+    // which holds `2001::/32` Teredo, `2001:2::/48`, `2001:10::/28` and
+    // `2001:20::/28` — the top 7 bits of the second segment are 0.
+    if segments[0] == 0x2001 && segments[1] & 0xfe00 == 0 {
+        return false;
+    }
+    // 3fff::/20: IETF protocol assignments, documentation (review round 1,
+    // defect AT) — the top 4 bits of the second segment are 0.
+    if segments[0] == 0x3fff && segments[1] & 0xf000 == 0 {
         return false;
     }
     true
@@ -278,6 +307,8 @@ mod tests {
             "239.255.255.255", // 224.0.0.0/4
             "240.0.0.0",
             "255.255.255.255", // 240.0.0.0/4
+            "192.88.99.0",
+            "192.88.99.255", // 192.88.99.0/24 (review round 1, defect AT)
         ];
         for addr in blocked_v4 {
             let ip: Ipv4Addr = addr.parse().unwrap();
@@ -308,6 +339,8 @@ mod tests {
             "203.0.114.0",     // just past 203.0.113.0/24
             "223.255.255.255", // just before 224.0.0.0/4
             "8.8.8.8",         // an ordinary public address
+            "192.88.98.255",   // just before 192.88.99.0/24
+            "192.88.100.0",    // just past 192.88.99.0/24
         ];
         for addr in just_outside_v4 {
             let ip: Ipv4Addr = addr.parse().unwrap();
@@ -329,7 +362,13 @@ mod tests {
             "2001:db8::",
             "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", // 2001:db8::/32
             "2001::",
-            "2001:0:ffff:ffff:ffff:ffff:ffff:ffff", // 2001::/32 (Teredo)
+            "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", // 2001::/23 (holds Teredo, review round 1 defect AT)
+            "64:ff9b:1::",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", // 64:ff9b:1::/48, local-use NAT64 (defect AT)
+            "100::",
+            "100::ffff:ffff:ffff:ffff", // 100::/64, discard-only (defect AT)
+            "3fff::",
+            "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", // 3fff::/20 (defect AT)
         ];
         for addr in blocked_v6 {
             let ip: Ipv6Addr = addr.parse().unwrap();
@@ -358,9 +397,28 @@ mod tests {
         assert!(is_public(IpAddr::V6("2001:0db9::".parse().unwrap())), "just past 2001:db8::/32");
         assert!(
             is_public(IpAddr::V6("2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
-            "just before 2001::/32"
+            "just before 2001::/23"
         );
-        assert!(is_public(IpAddr::V6("2001:1::".parse().unwrap())), "just past 2001::/32");
+        assert!(is_public(IpAddr::V6("2001:200::".parse().unwrap())), "just past 2001::/23");
+        assert!(
+            is_public(IpAddr::V6("64:ff9b:0:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
+            "just before 64:ff9b:1::/48"
+        );
+        assert!(is_public(IpAddr::V6("64:ff9b:2::".parse().unwrap())), "just past 64:ff9b:1::/48");
+        assert!(
+            is_public(IpAddr::V6("ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
+            "just before 100::/64"
+        );
+        assert!(is_public(IpAddr::V6("100:0:0:1::".parse().unwrap())), "just past 100::/64");
+        assert!(
+            is_public(IpAddr::V6("3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap())),
+            "just before 3fff::/20"
+        );
+        assert!(is_public(IpAddr::V6("3fff:1000::".parse().unwrap())), "just past 3fff::/20");
+        assert!(
+            !is_public(IpAddr::V6("::ffff:169.254.169.254".parse().unwrap())),
+            "mapped link-local (AWS metadata service)"
+        );
 
         // BC3: IPv6 carrying an IPv4 address, judged by the carried
         // address.

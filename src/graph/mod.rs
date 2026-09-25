@@ -455,14 +455,23 @@ impl GraphHandle {
         // BC18: the victim is picked only from circles whose effective
         // `last_request_at` is older than `lru_protect_min` minutes: a
         // circle with a request inside that window is never a target, no
-        // matter how full the store is.
+        // matter how full the store is. Review round 1, defect AS: at
+        // `lru_protect_min == 0` this must be story 09's plain LRU pick
+        // with no window at all — the filter below is skipped outright
+        // rather than reduced to `now - effective >= 0`, because that
+        // comparison would still exclude a circle whose effective
+        // `last_request_at` is later than `now` (a touch recorded ahead of
+        // this check), when protection off means every circle is a
+        // candidate regardless of its clock.
         let protect_secs = i64::from(self.lru_protect_min) * 60;
         while state.circles.len() >= self.max_viewers {
             let victim = state
                 .circles
                 .iter()
                 .map(|(v, c)| (v.clone(), self.effective_last_request_at(v, c)))
-                .filter(|(_, effective)| now - *effective >= protect_secs)
+                .filter(|(_, effective)| {
+                    self.lru_protect_min == 0 || now - *effective >= protect_secs
+                })
                 .min_by_key(|(_, effective)| *effective)
                 .map(|(v, _)| v);
             let victim = match victim {
@@ -1278,6 +1287,49 @@ mod tests {
         assert!(handle.get(&old).is_none(), "the circle outside the window is evicted");
         assert!(handle.get(&recent).is_some(), "the circle inside the window survives");
         assert!(handle.get(&newcomer).is_some(), "the new viewer still gets a circle");
+    }
+
+    #[test]
+    fn lru_protect_zero_is_story09_pick() {
+        // Review round 1, defect AS, finding 2: with `lru_protect_min ==
+        // 0` the LRU pick must apply no window filter at all, even to a
+        // circle whose effective `last_request_at` is later than `now` (a
+        // touch recorded ahead of the eviction check) — that circle is
+        // still a candidate, the plain story 09 pick. With protection
+        // above 0, the same future-dated circle counts as inside the
+        // window and is never picked.
+        let store = migrated_store();
+        let handle =
+            GraphHandle::from_store_with_lru_limits(&store, 1, 0, u32::MAX).expect("store loads");
+        let existing = ViewerDid("did:plc:existing".to_string());
+        handle.enqueue_first_build(existing.clone(), 1_000);
+        handle.record_touch(&existing, 5_000); // effective last_request_at is now ahead of `now` below.
+
+        let newcomer = ViewerDid("did:plc:new".to_string());
+        handle.enqueue_first_build(newcomer.clone(), 2_000);
+
+        assert!(handle.get(&existing).is_none(), "protect_min 0 picks the only circle regardless");
+        assert!(handle.get(&newcomer).is_some(), "the newcomer still gets a circle");
+
+        let protected_store = migrated_store();
+        let protected_handle =
+            GraphHandle::from_store_with_lru_limits(&protected_store, 1, 60, u32::MAX)
+                .expect("store loads");
+        let existing2 = ViewerDid("did:plc:existing2".to_string());
+        protected_handle.enqueue_first_build(existing2.clone(), 1_000);
+        protected_handle.record_touch(&existing2, 5_000);
+
+        let newcomer2 = ViewerDid("did:plc:new2".to_string());
+        protected_handle.enqueue_first_build(newcomer2.clone(), 2_000);
+
+        assert!(
+            protected_handle.get(&existing2).is_some(),
+            "a future-dated touch counts as inside the protection window"
+        );
+        assert!(
+            protected_handle.get(&newcomer2).is_none(),
+            "refused: the only circle is protected"
+        );
     }
 
     #[test]
