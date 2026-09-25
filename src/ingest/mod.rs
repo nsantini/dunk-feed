@@ -2909,6 +2909,43 @@ mod tests {
         let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 
+    // Review round 1, finding 4: a padded, non-blank credential is trimmed
+    // by `Config::bsky_credentials` (config::tests::bsky_credentials_trims_
+    // whitespace covers the trimming itself), so it must reach the graph
+    // subsystem as a working, trimmed value rather than failing the
+    // credential check or leaking whitespace downstream. This runs `run`'s
+    // credential check (BC2) the way `run_requires_credentials_when_
+    // personalised` does, but for a padded value that should succeed, and
+    // then drives `start_graph_subsystem` with the result, the same way
+    // `start_graph_subsystem_with_credentials_starts_the_worker` does.
+    #[tokio::test]
+    async fn padded_credentials_are_trimmed_before_the_graph_subsystem_starts() {
+        let path = temp_db_path("padded-credentials");
+        let cfg = test_config_personalised_with_db(
+            &path,
+            &[("BSKY_HANDLE", " upstage.bsky.social "), ("BSKY_APP_PASSWORD", "abcd-efgh \r")],
+        );
+
+        let credentials = cfg.bsky_credentials().expect("a padded, non-blank value is not missing");
+        assert_eq!(credentials.handle, "upstage.bsky.social");
+        assert_eq!(credentials.app_password.expose(), "abcd-efgh");
+
+        let viewer_lists = std::sync::Arc::new(crate::http::viewer::ViewerLists::new(
+            cfg.follows_me_depth as usize,
+        ));
+        let subsystem = start_graph_subsystem(
+            &cfg,
+            viewer_lists,
+            crate::scorer::snapshot::SnapshotHandle::new(),
+            credentials,
+        );
+        assert!(subsystem.is_some(), "a trimmed, non-blank credential must start the subsystem");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
     #[tokio::test]
     async fn start_graph_subsystem_reenqueues_a_building_d1_row() {
         // BC19: a `building_d1` row already in the database at startup

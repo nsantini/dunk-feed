@@ -142,9 +142,11 @@ Pass the container path, `/avatar.png`, not the host path.
 ## The network feed and the kill switch
 
 `UPSTAGE_PERSONALISE` defaults to `true`. A viewer who sends a valid
-service JWT gets a feed built from their own follow graph; every other
-request, and the whole feed when the switch is `false`, gets the plain
-global feed from `01`.
+service JWT gets a feed built from their own follow graph. With the
+switch `true`, every other request gets an empty page, `{"feed":[]}`,
+with `Cache-Control: private, no-store`, never the global feed. Only
+with the switch `false` does the whole service serve the plain global
+feed from `01`.
 
 With the switch `true`, `upstage run` reads `BSKY_HANDLE` and
 `BSKY_APP_PASSWORD` before it opens the database or makes any network
@@ -168,7 +170,7 @@ same "restart to apply" rule as the `01` variables above.
 | `UPSTAGE_D2_REFRESH_AGE_H` | `24` | Hours a shared follows-list cache entry stays fresh |
 | `UPSTAGE_GRAPH_RPS` | `8.0` | Graph client (PDS) rate limit, requests per second |
 | `UPSTAGE_PDS_URL` | `https://bsky.social` | PDS the session and every graph call go against |
-| `UPSTAGE_RESOLVER_MISSES_PER_MIN` | `30` | Global cap on `did` resolver `Miss` fetches sent in one wall-clock minute. Past the cap, a resolve fails closed and the request gets the global feed |
+| `UPSTAGE_RESOLVER_MISSES_PER_MIN` | `30` | Global cap on `did` resolver `Miss` fetches sent in one wall-clock minute. Past the cap, a resolve fails closed and the request gets the empty personalised page, not the global feed |
 | `UPSTAGE_GRAPH_LRU_EVICT_PER_MIN` | `1` | Most LRU circle evictions in one wall-clock minute. Past the cap, a first build that would need one more eviction is refused instead |
 | `UPSTAGE_GRAPH_LRU_PROTECT_MIN` | `60` | Minutes since a circle's last request that make it immune to LRU eviction. `0` disables the protection |
 
@@ -319,9 +321,11 @@ Logged at most once a minute, `warn` level, one JSON line, `event:
 "auth.miss_limited"`, no DID. Fires on the first `did:plc` or `did:web`
 resolver miss refused after `UPSTAGE_RESOLVER_MISSES_PER_MIN` fetches have
 already gone out in the current wall-clock minute. A refused resolve
-fails closed: that request gets the global feed, not an error. Frequent
-lines mean either real traffic growth or an attacker sending many unknown
-DIDs; raise the budget only after you have ruled out the second.
+fails closed: that request gets the empty personalised page (`{"feed":[]}`,
+`Cache-Control: private, no-store`), not an error and not the global
+feed. Frequent lines mean either real traffic growth or an attacker
+sending many unknown DIDs; raise the budget only after you have ruled
+out the second.
 
 ### `graph.lru_refused`
 
@@ -369,6 +373,14 @@ docker compose -f <file> up -d --build
 The Jetstream cursor is checkpointed to SQLite. A restart under 36 hours
 resumes with no gap. A restart over 36 hours loses the events in between,
 because Jetstream's own retention window ends at 36 hours.
+
+This release flips the `UPSTAGE_PERSONALISE` default to `true` (see "The
+network feed and the kill switch" above). An `.env` copied from an older
+`.env.example` still holds `UPSTAGE_PERSONALISE=false`, so an upgrade in
+place keeps serving the plain global feed until you remove that line or
+set it to `true`. Before you remove the line or flip it, set
+`BSKY_HANDLE` and `BSKY_APP_PASSWORD` in `.env`, or `upstage run` refuses
+to start.
 
 `compose.yaml` pins `cloudflared` to a specific tag, `2026.9.1` today,
 instead of `latest`. This keeps an unrelated upgrade, such as an Upstaged

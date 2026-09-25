@@ -189,19 +189,24 @@ impl Config {
     /// `BSKY_APP_PASSWORD`, the same order `publish::preflight` used before
     /// this method existed. Missing, or present but empty once trimmed,
     /// returns the variable's name so each caller builds its own error
-    /// variant with its own message.
+    /// variant with its own message. The returned `Credentials` holds the
+    /// trimmed handle and the trimmed app password (review round 1, finding
+    /// 4): an operator's `.env` line can carry trailing whitespace or a
+    /// stray `\r`, and neither the PDS session request nor a DID comparison
+    /// should ever see it.
     pub fn bsky_credentials(&self) -> Result<crate::appview::pds::Credentials, &'static str> {
         let handle = self
             .bsky_handle
             .as_ref()
-            .filter(|value| !value.trim().is_empty())
-            .cloned()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
             .ok_or("BSKY_HANDLE")?;
         let app_password = self
             .bsky_app_password
             .as_ref()
-            .filter(|value| !value.expose().trim().is_empty())
-            .cloned()
+            .map(|value| value.expose().trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(Secret::new)
             .ok_or("BSKY_APP_PASSWORD")?;
         Ok(crate::appview::pds::Credentials { handle, app_password })
     }
@@ -948,6 +953,21 @@ mod tests {
         pairs.push(("BSKY_APP_PASSWORD", "   "));
         let config = load(env(&pairs)).unwrap();
         assert_eq!(config.bsky_credentials(), Err("BSKY_APP_PASSWORD"));
+    }
+
+    #[test]
+    fn bsky_credentials_trims_whitespace() {
+        // Review round 1, finding 4: a value read straight from `.env` can
+        // carry surrounding whitespace, or a stray `\r` left by a
+        // Windows-edited file. Neither should reach the PDS session
+        // request or a downstream DID comparison.
+        let mut pairs = required_pair().to_vec();
+        pairs.push(("BSKY_HANDLE", " upstage.bsky.social"));
+        pairs.push(("BSKY_APP_PASSWORD", "abcd-efgh \r"));
+        let config = load(env(&pairs)).unwrap();
+        let credentials = config.bsky_credentials().unwrap();
+        assert_eq!(credentials.handle, "upstage.bsky.social");
+        assert_eq!(credentials.app_password.expose(), "abcd-efgh");
     }
 
     #[test]
