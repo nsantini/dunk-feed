@@ -202,13 +202,16 @@ pub fn verify(
             // this DID is not already in flight and the hourly cooldown
             // since the last attempt has passed — not on every request
             // for a DID that never resolves. When the channel is full,
-            // `try_send` drops the message; `miss_send_dropped` clears
-            // the in-flight mark `try_send_miss` just set, so a dropped
-            // send does not lock the DID out until the cooldown would
-            // otherwise allow another attempt. Launch-blockers spec.md
-            // BC16: a refusal caused by the global miss budget, and only
-            // that reason, logs one rate-limited `auth.miss_limited`
-            // warning naming no DID.
+            // `try_send` drops the message; `miss_send_dropped` removes
+            // the `MissState` `try_send_miss` just created (review round
+            // 2, defect AU), so the dropped send costs nothing and the
+            // very next request for the same DID enqueues it again at
+            // once, rather than either locking it out until the cooldown
+            // or leaving unprunable bookkeeping behind that could crowd
+            // out a new DID. Launch-blockers spec.md BC16: a refusal
+            // caused by the global miss budget, and only that reason,
+            // logs one rate-limited `auth.miss_limited` warning naming no
+            // DID.
             match cache.try_send_miss(&checked.viewer_did, now) {
                 did::MissAttempt::Send => {
                     if resolver_tx

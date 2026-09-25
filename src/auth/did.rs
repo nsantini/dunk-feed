@@ -310,17 +310,22 @@ impl KeyCache {
         });
     }
 
-    /// Clears `did`'s in-flight mark without starting the hourly cooldown
-    /// (BC9): `verify`'s `Missing` arm (`mod.rs`) calls this when
-    /// `try_send` drops the `Miss` because the resolver channel was full,
-    /// so the very next request for the same DID can enqueue it again at
-    /// once, rather than waiting as if a real attempt had run and
-    /// finished.
+    /// Removes `did`'s `MissState` entirely (review round 2, defect AU;
+    /// engineer override in spec.md `## Answers from the engineer`):
+    /// `verify`'s `Missing` arm (`mod.rs`) calls this when `try_send` drops
+    /// the `Miss` because the resolver channel was full, so the dropped
+    /// send costs nothing and the very next request for the same DID
+    /// enqueues it again at once, the same as if no `MissState` had ever
+    /// been created for it. Clearing the in-flight mark alone was not
+    /// enough: the resolver fetches one DID at a time with a 10 s timeout,
+    /// so a run of slow `did:web` hosts can fill the 1024-slot channel, and
+    /// a left-behind entry with `last_attempted: None` would still count
+    /// against [`Self::try_send_miss`]'s `max_entries` bound on `misses`
+    /// forever, since [`Self::prune_misses`] never removes an entry whose
+    /// `last_attempted` is `None`.
     pub(super) fn miss_send_dropped(&self, did: &str) {
         let mut misses = self.misses.lock().expect("KeyCache mutex poisoned");
-        if let Some(state) = misses.get_mut(did) {
-            state.in_flight = false;
-        }
+        misses.remove(did);
     }
 
     /// Marks `did`'s outstanding `Miss` fetch as finished successfully
@@ -806,6 +811,30 @@ mod tests {
         assert!(cache.should_send_miss(did, 0));
         cache.miss_send_dropped(did);
         assert!(cache.should_send_miss(did, 1), "a dropped send must not start the cooldown");
+    }
+
+    #[test]
+    fn dropped_sends_leave_no_entry() {
+        // Review round 2, defect AU: a dropped send must remove `did`'s
+        // `MissState` entirely, not just clear its in-flight mark, so it
+        // never counts against `try_send_miss`'s `max_entries` bound on
+        // `misses`. Four DIDs each fill the cap of 4, and each is then
+        // dropped; if any left a `MissState` behind, `misses` would still
+        // be full and a brand new fifth DID would be refused per-DID
+        // instead of getting `Send`.
+        let cache = KeyCache::new(4);
+        for i in 0..4u32 {
+            let did = format!("did:plc:{i:024}");
+            assert!(cache.should_send_miss(&did, 0), "DID {i} gets its one outstanding Miss");
+            cache.miss_send_dropped(&did);
+        }
+        assert_eq!(cache.misses.lock().unwrap().len(), 0, "every dropped send left no entry");
+
+        let fifth = "did:plc:444444444444444444444444";
+        assert!(
+            cache.should_send_miss(fifth, 1),
+            "no bookkeeping was left behind to crowd out a new DID"
+        );
     }
 
     #[test]
