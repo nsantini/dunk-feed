@@ -569,6 +569,30 @@ pub async fn one_pass<S: PostSource + ProfileSource>(
     Ok(counters)
 }
 
+/// Runs one pass at `now`, then marks the health clock with `finished_at()`
+/// (BC25, BC34): after the pass has fully committed and swapped its
+/// snapshot in, matching TECH-DESIGN section 7.2 step 7's order. The mark
+/// is the time the pass ended, not `now`: a pass can take minutes, and a
+/// start-time mark makes `/healthz` report 503 as soon as a pass longer
+/// than `cfg.health_max_lag_s` ends. `finished_at` is a parameter so tests
+/// can pin the end time.
+#[allow(clippy::too_many_arguments)]
+async fn pass_then_mark_health<S: PostSource + ProfileSource>(
+    store: &Store,
+    source: &S,
+    cfg: &Config,
+    evict_tx: &mpsc::UnboundedSender<Vec<String>>,
+    now: i64,
+    do_reverify: bool,
+    snapshot: &SnapshotHandle,
+    health: &HealthState,
+    finished_at: impl FnOnce() -> i64,
+) -> Result<(), ScorerError> {
+    one_pass(store, source, cfg, evict_tx, now, do_reverify, snapshot).await?;
+    health.set_scorer_pass(finished_at());
+    Ok(())
+}
+
 /// The scorer task loop: one pass per tick of `cfg.scorer_interval_s`,
 /// re-verifying whenever `cfg.reverify_interval_s` has elapsed since the
 /// last re-verify (the first tick always re-verifies, though there is
@@ -604,11 +628,18 @@ where
                 if do_reverify {
                     last_reverify = now;
                 }
-                one_pass(&store, &source, &cfg, &evict_tx, now, do_reverify, &snapshot).await?;
-                // BC25, BC34: recorded after the pass has fully committed
-                // and swapped its snapshot in, matching TECH-DESIGN section
-                // 7.2 step 7's order.
-                health.set_scorer_pass(now);
+                pass_then_mark_health(
+                    &store,
+                    &source,
+                    &cfg,
+                    &evict_tx,
+                    now,
+                    do_reverify,
+                    &snapshot,
+                    &health,
+                    unix_now,
+                )
+                .await?;
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -1246,6 +1277,37 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(source.call_count(), 0, "no pass ran after shutdown");
+    }
+
+    // The health clock holds the time a pass ended, not the time it began.
+    // A 540s pass that began at `now` must report age 0 when it ends, not
+    // 540 (which is past the 300s default and flips `/healthz` to 503).
+    #[tokio::test]
+    async fn health_clock_marks_the_end_of_the_pass() {
+        let (store, _writer) = test_store_with_writer().await;
+        let cfg = cfg(&[]);
+        let source = FakeSource::new(vec![]);
+        let (evict_tx, _evict_rx) = mpsc::unbounded_channel();
+        let snapshot = SnapshotHandle::new();
+        let health = HealthState::new();
+        let now = 1_700_100_000;
+        let ended = now + 540;
+
+        pass_then_mark_health(
+            &store,
+            &source,
+            &cfg,
+            &evict_tx,
+            now,
+            true,
+            &snapshot,
+            &health,
+            || ended,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(health.last_pass_age_s(ended), Some(0));
     }
 
     // AC8, BC33, BC34: the snapshot handle reads empty before the first
